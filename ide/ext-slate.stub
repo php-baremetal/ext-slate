@@ -1,0 +1,412 @@
+<?php
+// php-baremetal/ext-slate 1.0.0 — IDE helper, not loaded at runtime.
+
+namespace Baremetal\Slate {
+    /**
+     * Draws scenes on a display panel and keeps them up to date: only what changed is composed again, band by
+     * band, at the panel's pace. One Slate runs at a time; it takes the panel from the display object (its
+     * drawing methods throw until the Slate goes) and gives it back when it is destroyed.
+     *
+     * Changes to elements are collected while PHP runs and handed to the compositor when the script returns to
+     * the event loop (after each listener, or after each loop()), when show() is called, and by commit(): the
+     * changes of one listener appear together, in the same frame.
+     */
+    final class Slate
+    {
+        /**
+         * Takes the panel of $display and starts the compositor; with $touch, the active scene gets its touch
+         * events through Scene::onTouch().
+         *
+         * @param \Baremetal\Output\Display $display A display whose driver has the band path.
+         * @param \Baremetal\Input\Touch|null $touch The touch device of the same screen, or null.
+         * @throws \LogicException When another Slate runs, the panel has no band path ("Slate: <Class> has no band
+         *     path") or another renderer holds it.
+         * @throws \RuntimeException When the compositor cannot start (memory for its buffers, or its task).
+         */
+        public function __construct(\Baremetal\Output\Display $display, ?\Baremetal\Input\Touch $touch = null) {}
+
+        /**
+         * A Slate on the board's own display (and touch screen, when the board has one): among the loaded driver
+         * classes, the one display driver (and touch driver) with a static onboard() method is used.
+         *
+         * @throws \LogicException When the board has no display block, or no driver or several drivers with
+         *     onboard() are loaded: build it with new Slate($display, $touch) then.
+         */
+        public static function onboard(): Slate {}
+
+        /**
+         * Shows a scene: onLeave() of the scene shown until now, build() the first time the scene is shown, then
+         * onEnter(). The change is sent to the compositor at once.
+         *
+         * @throws \RuntimeException When the compositor has failed (the panel stopped answering) or is out of
+         *     memory.
+         */
+        public function show(Scene $s): void {}
+
+        /**
+         * The scene shown now, or null before the first show().
+         */
+        public function scene(): ?Scene {}
+
+        /**
+         * Sends the changes made so far to the compositor now. Needed only by a script that never returns to an
+         * event loop (a script without listeners or loop()).
+         *
+         * @throws \RuntimeException When the compositor has failed.
+         */
+        public function commit(): void {}
+    }
+
+    /**
+     * A screen of the application. Extend it: add the components in build(), react in onEnter(), onLeave(),
+     * onTouch() and in your own methods and listeners. A plain Scene works too: (new Scene())->add(...).
+     */
+    class Scene
+    {
+        /**
+         * Adds elements on top of the scene's elements (the last one added is drawn on top).
+         *
+         * @throws \LogicException When an element already belongs to a group or a scene.
+         */
+        public function add(Element ...$e): static {}
+
+        /**
+         * Takes elements out of the scene; they stay usable and can be added again.
+         */
+        public function remove(Element ...$e): static {}
+
+        /**
+         * Builds the scene's components; called once, before the scene is shown the first time.
+         */
+        protected function build(): void {}
+
+        /**
+         * Called each time the scene is shown.
+         */
+        public function onEnter(): void {}
+
+        /**
+         * Called when another scene replaces this one.
+         */
+        public function onLeave(): void {}
+
+        /**
+         * Called for each touch event of the Slate's touch device while this scene is shown (Pressed, Moved,
+         * Released, Gesture).
+         */
+        public function onTouch(\Baremetal\Input\TouchEvent $e): void {}
+    }
+
+    /**
+     * The base of the elements. Properties are read and written as usual (not by reference); a write of a wrong
+     * value throws \ValueError naming the property and its limit, and the old value stays.
+     *
+     * Colors: 0xRRGGBB is opaque, 0xAARRGGBB with AA from 01 to FF translucent; 0x00RRGGBB is opaque too, so a
+     * transparent fill or border is null. A component of your own extends Group, not Element.
+     */
+    abstract class Element
+    {
+        /** Horizontal position, relative to the parent group (pixels; fractions are drawn anti-aliased). */
+        public int|float $x;
+
+        /** Vertical position, relative to the parent group. */
+        public int|float $y;
+
+        /** false hides the element (and, for a group, its children). */
+        public bool $visible;
+
+        /** 0 (transparent) to 1 (opaque); a group's opacity applies to the group as a whole. */
+        public float $opacity;
+
+        /**
+         * Sets several properties at once, by name: $el->set(x: 10, opacity: 0.5).
+         *
+         * @throws \ValueError When a value is out of range.
+         * @throws \Error When a name is not a property.
+         */
+        public function set(mixed ...$props): static {}
+    }
+
+    /**
+     * A group of elements, whose positions are relative to the group's (x, y). With clip, the children are cut to
+     * the box (0, 0, w, h); with cache, the group is kept as an image and redrawn only when something inside it
+     * changes; blur (in pixels, as CSS blur) and shadow make it cached as well. Extend it to build a component of
+     * your own.
+     */
+    class Group extends Element
+    {
+        /** The clip box's width (for clip). */
+        public int|float $w;
+
+        /** The clip box's height (for clip). */
+        public int|float $h;
+
+        /** Cut the children to the box (0, 0, w, h); needs w and h greater than 0. */
+        public bool $clip;
+
+        /** Keep the group as an image (in PSRAM) and redraw it only when its content changes. */
+        public bool $cache;
+
+        /** Blur of the group, in pixels (how far the softness reaches); 0: none. */
+        public int $blur;
+
+        /** A drop shadow of the group's content, or null. */
+        public ?Shadow $shadow;
+
+        /**
+         * @throws \ValueError When a value is out of range, clip without a box, or blur > 0 when the blur effect
+         *     is not built in.
+         */
+        public function __construct(int|float $x = 0, int|float $y = 0, int|float $w = 0, int|float $h = 0,
+                                    float $opacity = 1.0, bool $clip = false, bool $cache = false, int $blur = 0,
+                                    ?Shadow $shadow = null) {}
+
+        /**
+         * Adds elements on top of the group's children.
+         *
+         * @throws \LogicException When an element already belongs to a group, or would contain itself.
+         */
+        public function add(Element ...$e): static {}
+
+        /**
+         * Takes elements out of the group; they stay usable.
+         */
+        public function remove(Element ...$e): static {}
+    }
+
+    /**
+     * A rectangle with rounded corners (radius 0: square corners), filled and optionally bordered.
+     */
+    final class RoundRect extends Element
+    {
+        public int|float $w;
+        public int|float $h;
+
+        /** Corner radius, at most half the shorter side. */
+        public int|float $radius;
+
+        /** 0xRRGGBB, 0xAARRGGBB, a gradient, or null (no fill). */
+        public int|float|Gradient|null $fill;
+
+        /** Border width, drawn inside the outline; 0: none. */
+        public int|float $border;
+
+        /** Border color, or null (no border). */
+        public int|float|null $borderColor;
+
+        /** A drop shadow, or null. */
+        public ?Shadow $shadow;
+
+        public function __construct(int|float $x, int|float $y, int|float $w, int|float $h, int|float $radius = 0,
+                                    int|float|Gradient|null $fill = null, int|float $border = 0,
+                                    int|float|null $borderColor = null, ?Shadow $shadow = null) {}
+    }
+
+    /**
+     * A disc; $x and $y are its centre (the constructor's $cx and $cy).
+     */
+    final class Circle extends Element
+    {
+        public int|float $r;
+
+        /** 0xRRGGBB, 0xAARRGGBB, a gradient, or null (no fill). */
+        public int|float|Gradient|null $fill;
+
+        public int|float $border;
+        public int|float|null $borderColor;
+        public ?Shadow $shadow;
+
+        public function __construct(int|float $cx, int|float $cy, int|float $r, int|float|Gradient|null $fill = null,
+                                    int|float $border = 0, int|float|null $borderColor = null,
+                                    ?Shadow $shadow = null) {}
+    }
+
+    /**
+     * A stroke along a circle, from $from to $to degrees (0 = 3 o'clock, clockwise); $x and $y are its centre.
+     * For progress bars and gauges.
+     */
+    final class Arc extends Element
+    {
+        public int|float $r;
+        public int|float $from;
+        public int|float $to;
+
+        /** Stroke width. */
+        public int|float $width;
+
+        /** 0xRRGGBB, 0xAARRGGBB or a gradient. */
+        public int|float|Gradient $color;
+
+        public Caps $caps;
+
+        public function __construct(int|float $cx, int|float $cy, int|float $r, int|float $from, int|float $to,
+                                    int|float $width, int|float|Gradient $color, Caps $caps = Caps::Round) {}
+    }
+
+    /**
+     * A segment from ($x, $y) (the constructor's $x0, $y0) to ($x1, $y1), relative to the parent.
+     */
+    final class Line extends Element
+    {
+        public int|float $x1;
+        public int|float $y1;
+        public int|float $width;
+
+        /** 0xRRGGBB or 0xAARRGGBB. */
+        public int|float $color;
+
+        public Caps $caps;
+
+        public function __construct(int|float $x0, int|float $y0, int|float $x1, int|float $y1, int|float $width = 1,
+                                    int|float $color = 0xFFFFFF, Caps $caps = Caps::Butt) {}
+    }
+
+    /**
+     * One line of text in a font of the firmware; ($x, $y) is the top of the line, at its left end, centre or
+     * right end depending on $align.
+     */
+    final class Text extends Element
+    {
+        public string $text;
+
+        /** The name of a font of the firmware (extra.baremetal.fonts). */
+        public string $font;
+
+        /** 0xRRGGBB or 0xAARRGGBB. */
+        public int|float $color;
+
+        public Align $align;
+
+        /** Cut the text to this many pixels (no ellipsis); 0: no limit. */
+        public int $maxWidth;
+
+        /**
+         * @throws \ValueError When the font is not in the firmware.
+         */
+        public function __construct(int|float $x, int|float $y, string $text, string $font = 'default',
+                                    int|float $color = 0xFFFFFF, Align $align = Align::Left, int $maxWidth = 0) {}
+    }
+
+    /**
+     * Pixels of your own: draw with the primitives below (colors 0xRRGGBB), then call dirty() to show what
+     * changed.
+     */
+    final class Canvas extends Element
+    {
+        /** Width in pixels (1 to 1024); a new size clears the canvas. */
+        public int $w;
+
+        /** Height in pixels (1 to 1024). */
+        public int $h;
+
+        public function __construct(int|float $x, int|float $y, int $w, int $h) {}
+
+        /** Fills the canvas with one color. */
+        public function clear(int $color = 0): void {}
+
+        public function pixel(int $x, int $y, int $color): void {}
+
+        public function line(int $x0, int $y0, int $x1, int $y1, int $color): void {}
+
+        public function rect(int $x, int $y, int $w, int $h, int $color): void {}
+
+        public function fillRect(int $x, int $y, int $w, int $h, int $color): void {}
+
+        public function circle(int $cx, int $cy, int $r, int $color): void {}
+
+        public function fillCircle(int $cx, int $cy, int $r, int $color): void {}
+
+        /**
+         * One line of text, ($x, $y) the top of the line; $bg null keeps what is under the text.
+         *
+         * @return int The width of the text in pixels.
+         */
+        public function text(int $x, int $y, string $s, int $color, ?int $bg = null, string $font = 'default'): int {}
+
+        /**
+         * Sends what was drawn since the last dirty() to the screen (at the next frame).
+         */
+        public function dirty(): void {}
+    }
+
+    /**
+     * The ends of an Arc or a Line.
+     */
+    enum Caps: string
+    {
+        /** Square ends, at the end points. */
+        case Butt = 'butt';
+
+        /** Rounded ends, half a disc past the end points. */
+        case Round = 'round';
+    }
+
+    /**
+     * What a Text's x is: its left end, its centre or its right end.
+     */
+    enum Align: string
+    {
+        case Left = 'left';
+        case Center = 'center';
+        case Right = 'right';
+    }
+
+    /**
+     * A gradient fill: LinearGradient or RadialGradient. Needs the gradients effect (slate-effects).
+     */
+    abstract class Gradient
+    {
+        /** The stops as given: [[position 0..1, color], ...] or [[position, color, alpha 0..1], ...]. */
+        public readonly array $stops;
+    }
+
+    /**
+     * A linear gradient across the element's box.
+     */
+    final class LinearGradient extends Gradient
+    {
+        /** Direction in degrees: 0 left to right, 90 top to bottom. */
+        public readonly float $angle;
+
+        /**
+         * @param array $stops 2 to 16 stops [position 0..1, color 0xRRGGBB or 0xAARRGGBB] or [position, color,
+         *     alpha 0.0..1.0] (the alpha replaces the color's: [1.0, 0xFFFFFF, 0.0] is transparent).
+         * @throws \ValueError When the gradients effect is not built in, or a stop is wrong.
+         */
+        public function __construct(array $stops, float $angle = 0.0) {}
+    }
+
+    /**
+     * A radial gradient: centre ($cx, $cy) and radius $r as fractions of the element's box.
+     */
+    final class RadialGradient extends Gradient
+    {
+        public readonly float $cx;
+        public readonly float $cy;
+        public readonly float $r;
+
+        /**
+         * @param array $stops 2 to 16 stops [position 0..1, color 0xRRGGBB or 0xAARRGGBB] or [position, color,
+         *     alpha 0.0..1.0] (the alpha replaces the color's: [1.0, 0xFFFFFF, 0.0] is transparent).
+         * @throws \ValueError When the gradients effect is not built in, or a value is wrong.
+         */
+        public function __construct(array $stops, float $cx = 0.5, float $cy = 0.5, float $r = 0.5) {}
+    }
+
+    /**
+     * A drop shadow: offset ($dx, $dy), blur in pixels (how far the softness reaches, as in CSS) and color
+     * (usually translucent, e.g. 0x80000000). Needs the shadows effect (slate-effects).
+     */
+    final class Shadow
+    {
+        public readonly int $dx;
+        public readonly int $dy;
+        public readonly int $blur;
+        public readonly int|float $color;
+
+        /**
+         * @throws \ValueError When the shadows effect is not built in, or a value is out of range.
+         */
+        public function __construct(int $dx, int $dy, int $blur, int|float $color) {}
+    }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "php-baremetal/ext-slate",
+  "description": "Slate for php-baremetal: a retained-mode 2D scene graph and compositor for display panels, with a software graphics layer. Platform-neutral.",
+  "type": "bm-ext",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Gianfrancesco Aurecchia",
+      "email": "gianfri@php-baremetal.com"
+    }
+  ],
+  "require": {
+    "php": ">=8.3",
+    "php-baremetal/bm-common": "^1.1",
+    "php-baremetal/ext-display": "^1.1",
+    "php-baremetal/ext-events": "^1.2",
+    "php-baremetal/ext-input": "^1.0"
+  },
+  "extra": {
+    "baremetal": {
+      "module": "slate",
+      "priority": 120,
+      "ide-stubs": ["ide/ext-slate.stub"],
+      "options": {
+        "slate-effects": {"type": "set", "values": ["gradients", "shadows", "blur"], "default": ["gradients", "shadows", "blur"], "description": "Graphic effects compiled into Slate; an effect left out is not built and the PHP API that uses it throws."},
+        "slate-debug": {"type": "bool", "default": false, "description": "Builds Slate's profiler: frames per second on screen and a line of timings per second on the console."}
+      }
+    }
+  }
+}
