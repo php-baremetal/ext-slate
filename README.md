@@ -55,3 +55,26 @@ $home->temp->text = '93 °C';   // drawn at the next frame
 - [Performance](docs/usage/performance.md)
 - [Debug](docs/usage/debug.md)
 - [C API of the graphics layer](docs/reference/c-api.md)
+
+## AI usage
+
+Unlike the other packages of the php-baremetal ecosystem, where AI is a tool on top of human engineering, this one
+was built largely by AI. It is not laziness. A compositor like Slate is a huge amount of work for a single
+maintainer: anti-aliased rasterisation, alpha blending and gradients with exact rounding, blur and shadows,
+dirty-area tracking, caching, a render task racing the panel's scan line, all tuned to a microcontroller's few
+hundred kilobytes of fast memory. It also needs specialised knowledge of computer graphics and real-time
+rendering that cannot be learned in a reasonable time alongside everything else the project needs.
+
+Could one person do it all by hand? Sure: give them ten years, no day job and a lifetime supply of coffee.
+`¯\_(ツ)_/¯`
+
+So an AI assistant wrote most of the code, tests and documentation, and did much of the design and performance
+work under the maintainer's direction. The maintainer set the requirements, made the design and trade-off
+decisions, and checked the results: host tests that compare every frame pixel by pixel with a full redraw, and
+runs on real hardware. This exception applies to this package only: the details are in
+**[AI_USAGE.md](AI_USAGE.md)**.
+
+Not for you? No worries at all — nobody's forcing it on you, and a free, open-source project you
+didn't spend a minute or a cent on owes you no explanation anyway. Take it or leave it, no hard feelings.
+
+— Written with Claude (Opus 5.5, by Anthropic)
