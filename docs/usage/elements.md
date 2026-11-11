@@ -1,12 +1,13 @@
 ---
 eyebrow: 'ext-slate · PHP API'
-lede:    'RoundRect, Circle, Arc, Line, Text, Group and Canvas: constructors, properties, colors, and a component of your own built from them.'
+lede:    'RoundRect, Circle, Arc, Line, Text, Group, Canvas and Image: constructors, properties, colors, and a component of your own built from them.'
 see_also:
   - { href: './scenes.md', meta: 'API' }
+  - { href: './images.md', meta: 'API' }
   - { href: './effects-and-options.md', meta: 'API' }
   - { href: 'package:php-baremetal/ext-display', meta: 'Extension', label: 'ext-display' }
 prev: { label: 'Scenes and pages', href: './scenes.md' }
-next: { label: 'Effects and build options', href: './effects-and-options.md' }
+next: { label: 'Images', href: './images.md' }
 ---
 
 # Elements
@@ -176,12 +177,23 @@ $plot->dirty();
 ```
 <!-- @endcode-block -->
 
+## Image
+
+<!-- @method name="Image::__construct(int|float $x, int|float $y, string $src, float $opacity = 1.0)" -->
+
+A picture from a file of the board, `$src` an absolute path to a `.sli` file (the project's PNG assets, converted
+by phpbm) or a `.png` decoded on the board: `new Image(0, 0, '/app/assets/ui/bg.sli')`. It is loaded in the
+background and drawn once it is there, at (`$x`, `$y`) rounded to whole pixels, times `$opacity`. Properties:
+`$src`, and read-only `$w`, `$h`, `$loaded`; `wait(int $timeout_ms = 5000): bool` waits for it. Loading, events,
+preloading and errors are in [Images](./images.md).
+
 ## Enums
 
 | Enum | Cases |
 | --- | --- |
 | `Caps: string` | `Butt` (`'butt'`), `Round` (`'round'`) |
 | `Align: string` | `Left` (`'left'`), `Center` (`'center'`), `Right` (`'right'`) |
+| `ImageError: string` | `NotFound` (`'not-found'`), `Unreadable` (`'unreadable'`), `BadFormat` (`'bad-format'`), `Unsupported` (`'unsupported'`), `NoMemory` (`'no-memory'`), see [Images](./images.md) |
 
 `Caps::from('round')` and `Align::tryFrom($name)` read them from strings.
 
@@ -189,11 +201,11 @@ $plot->dirty();
 
 | Thrown | When |
 | --- | --- |
-| `\ValueError` | A value out of range: `Baremetal\Slate\RoundRect::$opacity must be between 0 and 1`, `...::$w must be between 0 and 32767`, `...::$x must be a finite number between -32767 and 32767`, `...::$fill must be a color, 0xRRGGBB or 0xAARRGGBB, or a gradient`, `...::$clip needs $w and $h greater than 0 (the clip box)`, an unknown font. The old value stays. |
+| `\ValueError` | A value out of range: `Baremetal\Slate\RoundRect::$opacity must be between 0 and 1`, `...::$w must be between 0 and 32767`, `...::$x must be a finite number between -32767 and 32767`, `...::$fill must be a color, 0xRRGGBB or 0xAARRGGBB, or a gradient`, `...::$clip needs $w and $h greater than 0 (the clip box)`, an unknown font, an image path (`Baremetal\Slate\Image::$src must be an absolute path`, `...::$src must end in .sli or .png`). The old value stays. |
 | `\TypeError` | A value of the wrong type (PHP's own message for typed properties). |
 | `\LogicException` | A second parent, or a group that would contain itself. |
 | `\RuntimeException` | The compositor failed (`Slate: the panel did not finish a band within 2000 ms`, `Slate: the panel refused the bands (error 0x..)`) or is out of memory for the changes. |
-| `\Error` | `unset()` of a property, a reference to one (`Cannot take a reference to ...`), `foreach` by reference over an element (`Cannot iterate ... by reference`), `clone` of an element, `set()` with an unknown name. |
+| `\Error` | A write of a read-only property (`Image::$w`, `$h`, `$loaded`), `unset()` of a property, a reference to one (`Cannot take a reference to ...`), `foreach` by reference over an element (`Cannot iterate ... by reference`), `clone` of an element, `set()` with an unknown name. |
 
 Write properties directly or with `set()`. `array_walk()`, `ArrayObject` and `ArrayIterator` over an element write
 its properties without these checks: the compositor then refuses the change when the element is shown (with

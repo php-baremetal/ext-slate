@@ -3,7 +3,8 @@
 Slate is a retained-mode 2D scene graph and compositor for php-baremetal display panels: you describe a scene of
 shapes, text and pixels once, change the properties of its elements, and Slate redraws only what changed, band
 by band, at the pace of the panel, with anti-aliased edges, alpha blending and optional gradients, soft shadows
-and blur. A screen that does not change costs nothing.
+and blur, and images loaded in the background from flash or the microSD card. A screen that does not change costs
+nothing.
 
 It needs a panel driver with the band path of ext-display 1.1 (on the esp32 SDK, esp32-display-st77916 1.2 or
 later), ext-events 1.2 and ext-input 1.0. Platform-neutral: no HAL of its own.
@@ -44,6 +45,7 @@ $home->temp->text = '93 °C';   // drawn at the next frame
 | Option | Values | Default |
 | --- | --- | --- |
 | `slate-effects` | set of `gradients`, `shadows`, `blur` | all three |
+| `slate-images` | set of `png` (formats decoded on the board; `.sli` always) | `png` |
 | `slate-debug` | `true` / `false` | `false` |
 
 ## Documentation
@@ -51,6 +53,7 @@ $home->temp->text = '93 °C';   // drawn at the next frame
 - [Overview](docs/overview.md)
 - [Scenes and pages](docs/usage/scenes.md)
 - [Elements](docs/usage/elements.md)
+- [Images](docs/usage/images.md)
 - [Effects and build options](docs/usage/effects-and-options.md)
 - [Performance](docs/usage/performance.md)
 - [Debug](docs/usage/debug.md)

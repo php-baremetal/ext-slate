@@ -1,6 +1,6 @@
 ---
 eyebrow: 'Package · Extension'
-lede:    'A retained-mode 2D scene graph for display panels: describe a scene of shapes, text and pixels once, change properties, and Slate redraws only what changed, band by band, at the pace of the panel.'
+lede:    'A retained-mode 2D scene graph for display panels: describe a scene of shapes, text, images and pixels once, change properties, and Slate redraws only what changed, band by band, at the pace of the panel.'
 see_also:
   - { href: './usage/scenes.md', meta: 'API' }
   - { href: './usage/elements.md', meta: 'API' }
@@ -15,7 +15,7 @@ next: { label: 'Scenes and pages', href: './usage/scenes.md' }
 # Slate
 
 Slate draws user interfaces on a display panel. A script describes **scenes** made of **elements** (rounded
-rectangles, circles, arcs, lines, text, groups and canvases with pixels of their own) and then only changes
+rectangles, circles, arcs, lines, text, images, groups and canvases with pixels of their own) and then only changes
 their properties: `$label->text = '92 °C'`, `$bar->to = 180`. A compositor task of its own works out which part
 of the screen changed and composes only that, with anti-aliased edges, alpha blending and, when they are built,
 gradients, soft shadows and blur, and sends it to the panel in bands of rows. A screen that does not change
@@ -23,8 +23,9 @@ costs nothing: no frame is composed.
 
 - `Baremetal\Slate\Slate`: takes the panel of a display and shows one scene at a time.
 - `Baremetal\Slate\Scene`: a screen of the application; a page is a class that extends it.
-- `Element` and its classes `RoundRect`, `Circle`, `Arc`, `Line`, `Text`, `Group`, `Canvas`.
-- `Caps` and `Align` (enums), `LinearGradient`, `RadialGradient`, `Shadow`.
+- `Element` and its classes `RoundRect`, `Circle`, `Arc`, `Line`, `Text`, `Group`, `Canvas`, `Image`.
+- `Images::preload()` and `Preload`, the events `ImageLoaded`, `ImageFailed`, `PreloadProgress`, `PreloadDone`.
+- `Caps`, `Align` and `ImageError` (enums), `LinearGradient`, `RadialGradient`, `Shadow`.
 
 ## Requirements
 
@@ -37,8 +38,10 @@ ext-slate is platform-neutral C: it has no HAL of its own.
 | `php-baremetal/ext-input` `^1.0` | The touch events forwarded to the scene. |
 | `php-baremetal/bm-common` `^1.1` | The board's blocks, for `Slate::onboard()`. |
 
-On the board the compositor task runs on core 0, while PHP runs on core 1; elements, texts and element caches
-live in external RAM (PSRAM), the bands of the frame in internal RAM from the panel driver.
+On the board the compositor task runs on core 0, while PHP runs on core 1; elements, texts, element caches and
+images live in external RAM (PSRAM), the bands of the frame in internal RAM from the panel driver. Images are read
+with the C standard I/O by a loader task of their own, from the paths where phpbm puts the project's assets
+(`/app/...` in flash, `/sdcard/...` on the microSD card, see [Images](./usage/images.md)).
 
 ## Install
 
@@ -147,8 +150,11 @@ Touch events reach `Scene::onTouch()` in the `event-driven` runtime, where ext-e
   A driver that marked the panel failed, or that refuses every band for 4 frames in a row, gives
   `Slate: the panel refused the bands (error 0x..)` the same way.
 - The compositor never calls PHP: a component of your own is a `Group` of the built-in elements.
-- The screen's background is black: for another colour, put a full-screen `RoundRect` at the bottom of the scene.
+- The screen's background is black: for another colour, put a full-screen `RoundRect` (or an `Image`) at the bottom
+  of the scene.
+- Images are loaded in the background; until an image is there its element draws nothing. A bad or missing file
+  raises `ImageFailed` and never breaks the screen.
 
-See [Scenes and pages](./usage/scenes.md), [Elements](./usage/elements.md),
+See [Scenes and pages](./usage/scenes.md), [Elements](./usage/elements.md), [Images](./usage/images.md),
 [Effects and build options](./usage/effects-and-options.md), [Performance](./usage/performance.md) and
 [Debug](./usage/debug.md).

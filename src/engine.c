@@ -9,6 +9,7 @@
 #include "debug.h"
 #include "engine.h"
 #include "halpool.h"
+#include "images.h"
 #include "scene.h"
 #include "slate_config.h"
 
@@ -115,6 +116,7 @@ struct slate_engine {
     int retry_frames;              /* frames in a row that had failed pushes */
     int64_t dirty_since_us;        /* with TE: the task started waiting for a pulse (fallback) */
     int64_t prev_scene_us;         /* start of the last scene frame (fps) */
+    uint32_t images_seen;          /* slate_images_done() when the image elements were last synced */
     float fps;
 #if SLATE_DEBUG
     slate_debug_t dbg;
@@ -775,6 +777,24 @@ static void apply_all(slate_engine_t *e)
     }
 }
 
+/* Images that finished loading since the last look: the IMAGE elements whose image is READY now show it, and their
+   boxes are dirty (slate_el_image_sync). The loader's listener kicks the task (images.h). */
+static void sync_images(slate_engine_t *e)
+{
+    uint32_t done = slate_images_done();
+    if (done == e->images_seen) {
+        return;
+    }
+    e->images_seen = done;
+    for (uint32_t i = 0; i < e->map_cap; i++) {
+        slate_el_t *el = e->map[i].el;
+        if (el && el->kind == SLATE_EL_IMAGE && el->u.image.im && !el->u.image.sli &&
+            slate_image_state(el->u.image.im) == SLATE_IMAGE_READY) {
+            slate_el_image_sync(el, dirty_for(e, el), e->w, e->h);
+        }
+    }
+}
+
 /* ---- debug: the statistics line and the FPS counter ---- */
 
 #if SLATE_DEBUG
@@ -1038,6 +1058,7 @@ static void run(slate_engine_t *e)
         swap(&e->kick_flag, 0);
         bool pulse = swap(&e->vsync_flag, 0) != 0;
         apply_all(e);
+        sync_images(e);
         if (swap(&e->redraw_flag, 0) && e->drawn) {
             dirty_all(e);   /* the panel lost its picture: the whole screen again */
         }

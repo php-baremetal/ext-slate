@@ -64,6 +64,7 @@ between the pulse that starts a frame and the refresh that shows it.
 | Gradients | A color is computed for every pixel (integer steps and a dither). |
 | `Text` | Proportional to the glyph pixels; anti-aliased fonts (2 or 4 bits per pixel) blend their edges. |
 | Shadows and blur | Expensive to build (a blur of the image), cheap to reuse: they are kept in a cache and rebuilt only when what they depend on changes. |
+| `Image` | An opaque `.sli` image at opacity 1 is copied run by run (a run of one color is a fill) and hides what is under it, like an opaque fill: a full-screen background image costs about what a copy of the screen costs. Transparent runs are skipped; semi-transparent pixels (anti-aliased edges, shadows drawn into the image) are blended; at an `$opacity` below 1 every pixel is blended. The image is read from external RAM in order, as a cache is. |
 | `Canvas::dirty()` | The changed rectangle is copied to the compositor; send small rectangles when only a part changed. A canvas lives twice, in PHP memory and in the compositor's (2 bytes per pixel each, at most 2 MB for 1024 x 1024), plus a copy of the rectangle in flight at each `dirty()`. |
 
 So: prefer opaque backgrounds for large areas, keep translucent elements small, and give heavy content a cache.
@@ -94,6 +95,48 @@ The caches together stay under a budget: half of the largest block of external R
 at most 2 MB. Past it, the elements that do not fit are drawn directly, and a group drawn that way loses its
 blur and shadow until memory frees up. On a board without PSRAM the budget is 0: nothing is cached, shadows and
 group blur are not drawn, and internal RAM stays free for the bands, Wi-Fi and DMA.
+
+## Images
+
+An image is read from external RAM by the band that needs its rows, and only the runs inside the part being
+redrawn are drawn. A still image is part of the underlay like other elements; an opaque one at opacity 1 counts
+as cheap (a copy), so a full-screen background image alone does not make an underlay. When an image finishes
+loading, only its box is composed again; until then it draws and covers nothing.
+
+Loading happens in a task of low priority, one image at a time: PHP and the frames go on meanwhile. A `.sli` is
+read as it is: its load time is the time to read the file (from flash, or from the microSD card). A PNG decoded on
+the board costs much more time and, for a moment, about twice its `.sli` size in memory (see
+[Images](./images.md#memory)): convert the project's images with phpbm (the assets of `composer.json`) and keep
+on-board PNG for files that arrive otherwise. To show a page without waiting for its images, preload them while
+the page before is shown (`Images::preload()`).
+
+### Loading times
+
+Measured on an ESP32-S3 at 240 MHz with PSRAM, the microSD card on an SPI bus at 20 MHz (the board of the
+`06-display/slate-images` example), the time the loading task takes for one image:
+
+| Image | From flash | From the microSD |
+| --- | --- | --- |
+| `.sli`, an icon of 72 x 72 (8.6 KB) | 2.4 ms | not measured |
+| `.sli`, a photo of 360 x 360 (241 KB) | 24.5 ms (about 10 MB/s) | 168 ms (about 1.4 MB/s) |
+| PNG, an RGBA icon of 72 x 72 (3.7 KB) | 11.2 ms | 16.9 ms |
+| PNG, an RGBA picture of 160 x 100 (5.0 KB) | not measured | 35.8 ms |
+| PNG, an RGB photo of 360 x 360 (39.9 KB) | 303 ms | 348 ms |
+
+A `.sli` costs the time to read its bytes. A PNG costs its decoding, about 2.2 µs per pixel whatever its
+compression (from 3 to 8 ms per KB of PNG file for these images), plus the read. A `wait()` returns 2 to 5 ms
+after the image is ready.
+
+What this means for a page change, with a 360 x 360 photo from the microSD as background and an icon from flash:
+
+| | From `show()` to the complete page |
+| --- | --- |
+| Images not in memory | about 200 ms: the first frame (23 ms) shows the page without them, a second frame adds them when they are loaded |
+| Images preloaded (`Images::preload()`) | 27 ms: one frame of 20.5 ms, with everything |
+
+A full-screen opaque `.sli` with an icon and a line of text over it takes about 20 ms to compose. Elements moving
+over a still photo are cheap: with a 360 x 360 photo, four icons, six translucent dots and an icon moving at
+60 Hz, the frames come at 60 per second (frame 14 ms, composing 4.2 ms, medians over 20 s).
 
 ## The underlay
 
@@ -132,7 +175,7 @@ to the panel: below it the drawing hides behind the transfer.
 | One opaque `RoundRect` | 12.6 ms | 4.7 ms |
 | A full-screen `RoundRect` at half alpha over an opaque one | 14.5 ms | 13.2 ms |
 | A full-screen `LinearGradient` (two stops) | 12.9 ms | 5.5 ms |
-| A `Circle` of radius 180 with a `RadialGradient` | 42.4 ms | 42.2 ms |
+| A `Circle` of radius 180 with a `RadialGradient` | 42 to 43 ms | 42 to 43 ms |
 | A `Circle` of radius 170 | 13.2 ms | 7.2 ms |
 | A `RoundRect` 320 x 320 with radius 40 | 12.9 ms | 5.9 ms |
 | 16 lines of `Text` | 13.3 ms | 10.2 ms |

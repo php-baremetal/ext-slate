@@ -1,5 +1,5 @@
 <?php
-// php-baremetal/ext-slate 1.0.0 — IDE helper, not loaded at runtime.
+// php-baremetal/ext-slate 1.1.0 — IDE helper, not loaded at runtime.
 
 namespace Baremetal\Slate {
     /**
@@ -327,6 +327,169 @@ namespace Baremetal\Slate {
          * Sends what was drawn since the last dirty() to the screen (at the next frame).
          */
         public function dirty(): void {}
+    }
+
+    /**
+     * An image from a file: a .sli (converted by phpbm from the project's PNG assets: the fast path) or a .png
+     * decoded on the board (needs png in slate-images). The image is loaded in the background as soon as the
+     * Image is made or $src changes; until then the element draws nothing. Images are shared by path: Images of
+     * the same file use one copy, loaded once; it stays in memory while an Image or a Preload holds it.
+     *
+     * $w, $h and $loaded change when ImageLoaded is delivered (or in wait()). A file that cannot be loaded raises
+     * ImageFailed and the element stays empty.
+     */
+    final class Image extends Element
+    {
+        /**
+         * The file: an absolute path ending in .sli or .png (in any case), e.g. '/app/assets/ui/bg.sli' for an
+         * asset in flash or '/sdcard/assets/photos/beans.sli' for one on the microSD card. A new path loads that
+         * image (at once when it is in memory already).
+         */
+        public string $src;
+
+        /** The image's width in pixels; 0 until it is loaded (or when it failed). */
+        public readonly int $w;
+
+        /** The image's height in pixels; 0 until it is loaded (or when it failed). */
+        public readonly int $h;
+
+        /** true once the image is loaded. */
+        public readonly bool $loaded;
+
+        /**
+         * @throws \RuntimeException When there is no memory even for the image's record ("Slate: no memory for the
+         *     image <path>").
+         * @throws \Exception In the web-server runtime (from ext-events: images raise events).
+         * @throws \ValueError When $src is not an absolute path ("Baremetal\Slate\Image::$src must be an absolute
+         *     path"), does not end in .sli or .png ("Baremetal\Slate\Image::$src must end in .sli or .png"), is a
+         *     .png while png is not built ("png is not built in: add it to slate-images in composer.json"), or
+         *     $opacity is out of 0..1.
+         */
+        public function __construct(int|float $x, int|float $y, string $src, float $opacity = 1.0) {}
+
+        /**
+         * Waits until the image is loaded, at most $timeout_ms milliseconds; no other event is delivered
+         * meanwhile. $w, $h and $loaded are updated.
+         *
+         * @return bool true when the image is loaded; false on timeout or when it failed.
+         * @throws \ValueError When $timeout_ms is negative.
+         */
+        public function wait(int $timeout_ms = 5000): bool {}
+    }
+
+    /**
+     * Images loaded ahead of time: the next page's images, so that its Image elements are ready at once.
+     */
+    final class Images
+    {
+        private function __construct() {}
+
+        /**
+         * Starts loading every path (the ones in memory already are counted at once) and keeps the images in
+         * memory while the returned Preload lives. PreloadProgress follows each image loaded, PreloadDone the
+         * last one finished (also when every image was in memory already): exactly one per Preload.
+         *
+         * @param list<string> $paths Absolute paths ending in .sli or .png.
+         * @throws \ValueError When a path is not absolute, does not end in .sli or .png, or is a .png while png is
+         *     not built.
+         * @throws \TypeError When an entry is not a string.
+         * @throws \RuntimeException When there is no memory even for an image's record.
+         * @throws \Exception In the web-server runtime (from ext-events: images raise events).
+         */
+        public static function preload(array $paths): Preload {}
+    }
+
+    /**
+     * The images of Images::preload(), held in memory while this object lives. Its properties change when the
+     * events are delivered (or in wait()).
+     */
+    final class Preload
+    {
+        /** The images loaded so far. */
+        public readonly int $loaded;
+
+        /** The number of paths. */
+        public readonly int $total;
+
+        /** true when every image is loaded or failed. */
+        public readonly bool $done;
+
+        private function __construct() {}
+
+        /**
+         * Waits until no image is still loading, at most $timeout_ms milliseconds; no other event is delivered
+         * meanwhile.
+         *
+         * @return bool true when every image is loaded; false on timeout or when one failed.
+         * @throws \ValueError When $timeout_ms is negative.
+         */
+        public function wait(int $timeout_ms = 5000): bool {}
+    }
+
+    /**
+     * An image finished loading (once per file, however many Image elements show it).
+     */
+    final class ImageLoaded extends \Baremetal\Event
+    {
+        /** The path, as given to Image or Images::preload(). */
+        public readonly string $path;
+
+        public readonly int $w;
+        public readonly int $h;
+    }
+
+    /**
+     * An image could not be loaded; the elements that show it stay empty. A later Image or $src of the same path
+     * tries again.
+     */
+    final class ImageFailed extends \Baremetal\Event
+    {
+        public readonly string $path;
+        public readonly ImageError $error;
+
+        /** What went wrong, in words. */
+        public readonly string $message;
+    }
+
+    /**
+     * One more image of a Preload is loaded.
+     */
+    final class PreloadProgress extends \Baremetal\Event
+    {
+        /** Images of the Preload loaded so far. */
+        public readonly int $loaded;
+
+        public readonly int $total;
+    }
+
+    /**
+     * Every image of a Preload is loaded or failed.
+     */
+    final class PreloadDone extends \Baremetal\Event
+    {
+        /** @var list<string> The paths that could not be loaded (empty when all were). */
+        public readonly array $failed;
+    }
+
+    /**
+     * Why an image could not be loaded.
+     */
+    enum ImageError: string
+    {
+        /** No such file. */
+        case NotFound = 'not-found';
+
+        /** The file could not be read. */
+        case Unreadable = 'unreadable';
+
+        /** Not a valid .sli or PNG: a damaged or truncated file, or another format under that name. */
+        case BadFormat = 'bad-format';
+
+        /** A valid PNG that is not decoded on the board (16 bits per channel, interlaced): convert it with phpbm. */
+        case Unsupported = 'unsupported';
+
+        /** Not enough memory for the image. */
+        case NoMemory = 'no-memory';
     }
 
     /**

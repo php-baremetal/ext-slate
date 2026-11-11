@@ -59,6 +59,12 @@
    (BM_HAL_MEM_EXTERNAL_ONLY): on a board without PSRAM the budget is 0, nothing is cached and every element is
    drawn directly, so internal RAM is left to the bands, Wi-Fi and DMA.
 
+   Images. An IMAGE element shows its image from the first wake-up after the image is READY (images.h): at every
+   wake-up, after the batches, when slate_images_done() changed the task syncs its IMAGE elements
+   (slate_el_image_sync: the box of each one that shows its image now is dirty, the next frame draws it). The image
+   store's listener (set by the PHP layer) kicks the task (slate_engine_kick) when an image is done. Image memory
+   is not part of the cache budget.
+
    One engine at a time (the compositor and the rasterizers are not reentrant). */
 #ifndef SLATE_ENGINE_H
 #define SLATE_ENGINE_H

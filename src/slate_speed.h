@@ -1,5 +1,6 @@
-/* slate_speed.h - included first by Slate's pixel code (gfx_sw.c, raster.c, cache.c, compose.c) and by the code that
-   applies every change (scene.c, dirty.c): that code is compiled optimized for speed (-O2) whatever optimization the
+/* slate_speed.h - included first by Slate's pixel code (gfx_sw.c, raster.c, cache.c, compose.c, sli.c,
+   sli_enc.c, png.c, inflate.c) and by the
+   code that applies every change (scene.c, dirty.c): that code is compiled optimized for speed (-O2) whatever optimization the
    project builds with. Firmware projects are often built for size (-Os), which makes the per-pixel loops several
    times slower; the rest of the package (the PHP API, the engine) keeps the project's setting. GCC only: other compilers keep the project's setting.
    Its functions also start on 64-byte boundaries: some targets are built without the alignment of loop bodies

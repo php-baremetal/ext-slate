@@ -1,11 +1,12 @@
 ---
 eyebrow: 'ext-slate · PHP API'
-lede:    'Gradients, drop shadows and group blur, each built only when the slate-effects option lists it; slate-debug builds the profiler.'
+lede:    'Gradients, drop shadows and group blur, each built only when the slate-effects option lists it; slate-images chooses the image formats decoded on the board; slate-debug builds the profiler.'
 see_also:
   - { href: './elements.md', meta: 'API' }
+  - { href: './images.md', meta: 'API' }
   - { href: './performance.md', meta: 'API' }
   - { href: './debug.md', meta: 'API' }
-prev: { label: 'Elements', href: './elements.md' }
+prev: { label: 'Images', href: './images.md' }
 next: { label: 'Performance', href: './performance.md' }
 ---
 
@@ -69,6 +70,7 @@ Set in `extra.baremetal.options` of the project:
 | Option | Values | Default |
 | --- | --- | --- |
 | `slate-effects` | a list of `gradients`, `shadows`, `blur` | all three |
+| `slate-images` | a list of `png` | `png` |
 | `slate-debug` | `true` or `false` | `false` |
 
 An effect that is not in `slate-effects` is not compiled into the firmware (it saves its code), and the PHP
@@ -79,6 +81,13 @@ that would use it throws `\ValueError`:
 | `gradients` | `new LinearGradient(...)`, `new RadialGradient(...)` | `gradients is not built in: add it to slate-effects in composer.json` |
 | `shadows` | `new Shadow(...)` | `shadows is not built in: add it to slate-effects in composer.json` |
 | `blur` | `$group->blur = 6` (any value above 0) | `blur is not built in: add it to slate-effects in composer.json` |
+
+`slate-images` lists the image formats decoded on the board. `.sli` images are always supported: they are what
+phpbm makes of the project's PNG assets (see [Images](./images.md)). With `png` (the default) a `.png` path is
+decoded on the board too; without it the PNG decoder is not compiled (about 15 to 20 KB of firmware saved), and a
+`.png` path throws `\ValueError` `png is not built in: add it to slate-images in composer.json` (in `new Image`,
+a write of `$src` and `Images::preload()`). A project whose images are all assets can leave it out:
+`"slate-images": []`.
 
 `slate-debug` builds the profiler: the frames per second on screen and a line of timings per second on the
 console (see [Debug](./debug.md)). Without it the profiler is not compiled.

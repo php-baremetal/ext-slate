@@ -13,6 +13,8 @@
      TEXT       (x, y) top of the line (rounded to whole pixels), text, font, color (solid argb only), align,
                 max_width
      CANVAS     box (x, y, w, h) rounded to whole pixels; its own RGB565 buffer (opaque), see slate_canvas_*
+     IMAGE      top-left (x, y) rounded to whole pixels; image (images.h, a reference held): drawn once the engine
+                has seen it READY (slate_el_image_sync), its size the file's (0 x 0 before, or failed, or none)
      GROUP      origin (x, y); opacity, clip (to the box (0, 0, w, h) of the group, in its own coordinates; w or
                 h <= 0: clip ignored), cache, blur, shadow
    Common: x, y, visible, opacity (0..1, a multiplier of the colours' alpha; a group's opacity applies to the
@@ -48,7 +50,14 @@
 
    Opaque. e->opaque is true when the element covers its interior with fully opaque pixels: a ROUNDRECT or
    CIRCLE with a solid fill of alpha 255 (or a gradient whose stops are all alpha 255, when gradients are built)
-   and opacity 1, or a CANVAS with opacity 1. The compositor uses it to skip what is underneath (compose.h). */
+   and opacity 1, or a CANVAS with opacity 1, or an IMAGE that is shown (sync), opaque (the .sli flag) and at
+   opacity 1. The compositor uses it to skip what is underneath (compose.h).
+
+   Images. An IMAGE element holds a reference to its image (taken by slate_el_set, dropped when the image changes
+   and by slate_el_free) and the image's pixels once seen READY (u.image.sli: what the compositor draws). The
+   image becomes READY in the loader task, at any moment: the element shows it only from slate_el_image_sync on
+   (the engine calls it when images finished loading), which marks its box dirty, so a frame never shows an image
+   that its dirty set does not cover. slate_el_set of an image that is READY already shows it at once. */
 #ifndef SLATE_SCENE_H
 #define SLATE_SCENE_H
 
@@ -59,6 +68,7 @@
 #include "dirty.h"
 #include "raster.h"
 #include "slate_gfx.h"
+#include "sli.h"
 
 #define SLATE_AA_MARGIN 1
 #define SLATE_BLUR_EXTENT(r) (3 * (r))
@@ -71,6 +81,7 @@ typedef enum {
     SLATE_EL_LINE,
     SLATE_EL_TEXT,
     SLATE_EL_CANVAS,
+    SLATE_EL_IMAGE,
 } slate_el_kind_t;
 
 /* Properties, with the value type slate_el_set expects (a value of another type is refused). */
@@ -101,6 +112,7 @@ typedef enum {
     SLATE_PROP_CACHE,         /* BOOL: GROUP */
     SLATE_PROP_BLUR,          /* NUM: GROUP blur radius, whole pixels, 0..SLATE_BLUR_RADIUS_MAX */
     SLATE_PROP_SHADOW,        /* SHADOW: ROUNDRECT, CIRCLE, GROUP */
+    SLATE_PROP_IMAGE,         /* IMAGE: IMAGE (NULL: none); a reference is taken */
 } slate_prop_t;
 
 typedef enum {
@@ -112,6 +124,7 @@ typedef enum {
     SLATE_VAL_TEXT,
     SLATE_VAL_FONT,
     SLATE_VAL_SHADOW,
+    SLATE_VAL_IMAGE,
 } slate_val_type_t;
 
 /* A drop shadow: offset (dx, dy) in pixels, blur radius (box radius, 0..SLATE_BLUR_RADIUS_MAX) and straight
@@ -119,6 +132,8 @@ typedef enum {
    coverage (its fill alpha does not matter, like a CSS box-shadow), for a GROUP from the alpha of its composed
    content (like a CSS drop-shadow). */
 typedef struct { int16_t dx, dy, blur; uint32_t argb; } slate_shadow_t;
+
+struct slate_image;   /* images.h */
 
 typedef struct {
     slate_val_type_t type;
@@ -131,6 +146,7 @@ typedef struct {
         const char *text;
         const struct display_font_entry *font;
         slate_shadow_t shadow;
+        struct slate_image *image;         /* IMAGE: the receiver takes its own reference */
     } v;
 } slate_value_t;
 
@@ -143,6 +159,11 @@ static inline slate_value_t slate_v_text(const char *s) { slate_value_t v = { SL
 static inline slate_value_t slate_v_font(const struct display_font_entry *f)
 {
     slate_value_t v = { SLATE_VAL_FONT, { .font = f } };
+    return v;
+}
+static inline slate_value_t slate_v_image(struct slate_image *im)
+{
+    slate_value_t v = { SLATE_VAL_IMAGE, { .image = im } };
     return v;
 }
 /* dx, dy clamped to +-32767, blur to 0..SLATE_BLUR_RADIUS_MAX */
@@ -182,9 +203,13 @@ typedef struct {
     int16_t bx0, by0, bx1, by1;              /* slate_text_bbox at (0, 0) */
 } slate_text_t;
 typedef struct { uint16_t *px; int16_t w, h; } slate_canvas_t;   /* w x h RGB565 native, stride w; NULL: empty */
+typedef struct {
+    struct slate_image *im;   /* a reference held; NULL: none */
+    const slate_sli_t *sli;   /* im's pixels once seen READY (slate_el_image_sync); NULL: nothing drawn */
+} slate_image_el_t;
 
 /* The fields are read by the compositor; change them only through the functions below. The struct is a common
-   header plus the data of its kind (u.g, u.shape, u.arc, u.line, u.text, u.canvas). */
+   header plus the data of its kind (u.g, u.shape, u.arc, u.line, u.text, u.canvas, u.image). */
 struct slate_el {
     slate_el_t *parent, *prev, *next;
     struct slate_cache *cache;           /* NULL until the compositor needs one */
@@ -205,6 +230,7 @@ struct slate_el {
         slate_line_t line;
         slate_text_t text;
         slate_canvas_t canvas;
+        slate_image_el_t image;
     } u;
 };
 
@@ -273,5 +299,9 @@ bool slate_el_has_shadow(const slate_el_t *e);
    owner; after writing call slate_canvas_dirty (r in the canvas's own pixels, clipped to it; NULL = whole). */
 uint16_t *slate_canvas_px(slate_el_t *e, int *w, int *h);
 void slate_canvas_dirty(slate_el_t *e, const slate_rect_t *r, slate_dirty_t *d, int sw, int sh);
+
+/* Image: when e is an IMAGE whose image is READY but not shown yet, shows it (its box and the opaque flag change)
+   and adds its box to d, as any change does; true then. false (nothing done) otherwise. */
+bool slate_el_image_sync(slate_el_t *e, slate_dirty_t *d, int sw, int sh);
 
 #endif

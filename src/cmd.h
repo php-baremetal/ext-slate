@@ -10,7 +10,8 @@
    Elements are named by ids the PHP task assigns (uint32, 0 = none); the engine maps them to its elements.
    Everything a command points to is copied into the batch at push (texts, the gradient and its stops, the scene
    name, canvas pixels): the caller's memory may go as soon as push returns. Fonts are kept by pointer (entries
-   of display_fonts[], which live as long as the firmware).
+   of display_fonts[], which live as long as the firmware); an image (SET of SLATE_VAL_IMAGE) by a reference
+   taken at push and given back when the batch is released or freed (images.h).
 
    Threading: slate_cmdbuf_new, slate_cmdbuf_free, slate_cmd_push, slate_cmd_deliver and slate_cmd_pending belong
    to one task (PHP's); slate_cmd_take and slate_cmd_release to another (the compositor's). The two sides only

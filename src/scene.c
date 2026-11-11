@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "cache.h"
+#include "images.h"
 #include "scene.h"
 #include "slate_config.h"
 
@@ -126,7 +127,7 @@ void slate_el_place(const slate_el_t *e, float *pox, float *poy)
 
 slate_el_t *slate_el_new(slate_el_kind_t kind)
 {
-    if (kind < SLATE_EL_GROUP || kind > SLATE_EL_CANVAS) {
+    if (kind < SLATE_EL_GROUP || kind > SLATE_EL_IMAGE) {
         return NULL;
     }
     slate_el_t *e = slate_scene_mem(sizeof *e);
@@ -201,6 +202,9 @@ void slate_el_free(slate_el_t *e)
         break;
     case SLATE_EL_CANVAS:
         slate_scene_mem_free(e->u.canvas.px);
+        break;
+    case SLATE_EL_IMAGE:
+        slate_image_put(e->u.image.im);
         break;
     default:
         break;
@@ -356,6 +360,11 @@ static frect_t content_ext(slate_el_t *e)
             c = (frect_t){ e->x, e->y, e->x + (float)e->u.canvas.w, e->y + (float)e->u.canvas.h };
         }
         break;
+    case SLATE_EL_IMAGE:
+        if (e->u.image.sli) {
+            c = (frect_t){ e->x, e->y, e->x + (float)e->u.image.sli->w, e->y + (float)e->u.image.sli->h };
+        }
+        break;
     case SLATE_EL_GROUP: {
         const slate_group_t *g = &e->u.g;
         for (slate_el_t *k = g->first; k; k = k->next) {
@@ -494,6 +503,9 @@ static void derive(slate_el_t *e)
     case SLATE_EL_CANVAS:
         e->opaque = e->alpha == 255 && e->u.canvas.px != NULL;
         break;
+    case SLATE_EL_IMAGE:
+        e->opaque = e->alpha == 255 && e->u.image.sli && e->u.image.sli->opaque;
+        break;
     default:
         e->opaque = false;
         break;
@@ -568,7 +580,7 @@ void slate_el_remove(slate_el_t *child, slate_dirty_t *d, int sw, int sh)
 
 #define K(kind) (1u << (kind))
 #define K_ALL (K(SLATE_EL_GROUP) | K(SLATE_EL_ROUNDRECT) | K(SLATE_EL_CIRCLE) | K(SLATE_EL_ARC) | K(SLATE_EL_LINE) | \
-               K(SLATE_EL_TEXT) | K(SLATE_EL_CANVAS))
+               K(SLATE_EL_TEXT) | K(SLATE_EL_CANVAS) | K(SLATE_EL_IMAGE))
 #define K_SHAPE (K(SLATE_EL_ROUNDRECT) | K(SLATE_EL_CIRCLE))
 
 static unsigned prop_kinds(slate_prop_t p)
@@ -598,6 +610,8 @@ static unsigned prop_kinds(slate_prop_t p)
         return K(SLATE_EL_GROUP);
     case SLATE_PROP_SHADOW:
         return K_SHAPE | K(SLATE_EL_GROUP);
+    case SLATE_PROP_IMAGE:
+        return K(SLATE_EL_IMAGE);
     }
     return 0;
 }
@@ -617,6 +631,8 @@ static bool type_ok(slate_prop_t p, slate_val_type_t t)
         return t == SLATE_VAL_FONT;
     case SLATE_PROP_SHADOW:
         return t == SLATE_VAL_SHADOW;
+    case SLATE_PROP_IMAGE:
+        return t == SLATE_VAL_IMAGE;
     default:
         return t == SLATE_VAL_NUM;
     }
@@ -947,6 +963,18 @@ bool slate_el_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slat
         own_shadow = true;
         break;
     }
+    case SLATE_PROP_IMAGE: {
+        slate_image_el_t *m = &e->u.image;
+        if (v->v.image == m->im) {
+            return true;
+        }
+        slate_image_ref(v->v.image);
+        slate_image_put(m->im);
+        m->im = v->v.image;
+        m->sli = m->im ? slate_image_sli(m->im) : NULL;   /* ready already: shown at once */
+        own_content = true;
+        break;
+    }
     }
     if (!changed) {
         return true;
@@ -1040,4 +1068,27 @@ void slate_canvas_dirty(slate_el_t *e, const slate_rect_t *r, slate_dirty_t *d, 
         box = slate_rect_and(box, (slate_rect_t){ X + c.x0, Y + c.y0, X + c.x1, Y + c.y1 });
     }
     dirty(d, through_ancestors(e, box), sw, sh);
+}
+
+/* ---- image ---- */
+
+bool slate_el_image_sync(slate_el_t *e, slate_dirty_t *d, int sw, int sh)
+{
+    if (!e || e->kind != SLATE_EL_IMAGE || !e->u.image.im || e->u.image.sli) {
+        return false;
+    }
+    const slate_sli_t *sli = slate_image_sli(e->u.image.im);
+    if (!sli) {
+        return false;   /* loading, or failed: nothing to show */
+    }
+    slate_rect_t before = d ? slate_el_dirty_rect(e) : EMPTY;   /* empty: nothing was shown */
+    e->u.image.sli = sli;
+    derive(e);
+    slate_cache_stale(e, true, false);
+    touch(e);
+    slate_cache_stale_up(e);
+    dirty_images(e, d, sw, sh);
+    dirty(d, before, sw, sh);
+    dirty(d, slate_el_dirty_rect(e), sw, sh);
+    return true;
 }

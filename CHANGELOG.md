@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.1.0
+
+- Added: the PHP API of images. `Image` (`new Image($x, $y, $src, opacity: 1.0)`), an element that draws a `.sli`
+  file or a `.png` decoded on the board, loaded in the background: `$src` (an absolute path ending in `.sli` or
+  `.png`, in any case; checked at once with `\ValueError` `Baremetal\Slate\Image::$src must be an absolute path`,
+  `Baremetal\Slate\Image::$src must end in .sli or .png`, or `png is not built in: add it to slate-images in
+  composer.json`), read-only `$w`, `$h`, `$loaded` (updated when the event is delivered, or by `wait()`),
+  `wait(int $timeout_ms = 5000): bool` (blocks without delivering other events; false on timeout or failure). Images
+  of one path are loaded once and shared; an `Image` of a path in memory is ready at once; the path of a failed image
+  is loaded again by the next `Image` or `$src` of it. `Images::preload(array $paths): Preload` keeps the images in
+  memory while the `Preload` lives (`$loaded`, `$total`, `$done`, `wait()`). The events `ImageLoaded` (`$path`, `$w`,
+  `$h`), `ImageFailed` (`$path`, `$error`, `$message`), `PreloadProgress` (`$loaded`, `$total`) and `PreloadDone`
+  (`$failed`) on the bus of ext-events, and the enum `ImageError` (`NotFound`, `Unreadable`, `BadFormat`,
+  `Unsupported`, `NoMemory`). The store's listener wakes the compositor when an image is done, so it is drawn
+  without waiting for another change; in `init-loop` (no events) the properties still follow at the end of each
+  `loop()`. Every Preload gets exactly one PreloadDone, also when a burst of images overflows the event pool (the
+  images whose events were dropped are caught up at the return to the event loop, and a refused PreloadDone is
+  raised again). Docs: `docs/usage/images.md` (assets, board paths `/app/...` and `/sdcard/...`, memory of on-board PNG),
+  the `slate-images` option, performance; IDE stub 1.1.0.
+- Added: .sli images, Slate's run-length image format (written by phpbm image:convert): a reader that checks a whole
+  file once (header, row table, every command, padding, the opaque flag) and a drawer that composes the image band
+  by band with the graphics layer's fill and copy entries, at any opacity and clip (`src/sli.h`: `slate_sli_open`,
+  `slate_sli_draw`).
+- Added: PNG files decoded on the board into .sli images, byte for byte what phpbm image:convert writes for the
+  same file (`src/png.h`: `slate_png_to_sli`): colour types grey, RGB, palette, grey+alpha and RGBA at 8 bits
+  (grey and palettes also at 1, 2 and 4), `tRNS`, the five filters, image data in any number of IDAT chunks, every
+  CRC and the Adler-32 checked; 16-bit and interlaced images are reported as unsupported. The file is read as a
+  stream through a small inflate written for Slate (`src/inflate.h`, no third-party code): the 32 KB window, two
+  rows and the result, never the whole image. The .sli encoder is a C API of its own (`src/sli_enc.h`: new, row, finish, abort), and the
+  load errors are `slate_img_err_t` in `src/sli.h`.
+- Added: the build option `slate-images` (set of `png`, default `["png"]`): without `png` the PNG decoder and the
+  inflate code are not built; .sli images are always supported.
+- Added: the image store and its loader task (`src/images.h`): images shared by path with counted references
+  (`slate_image_get`, `slate_image_ref`, `slate_image_put`, from any task), loaded one at a time by a low-priority
+  task of the events HAL that starts with the first request and ends when nothing is left to load (6 KB of stack,
+  only while it runs), read with the C standard I/O (.sli as it is, .png decoded) into external RAM, outside the
+  cache budget; LOADING, then READY (immutable) or FAILED with `slate_img_err_t`; a listener called once for
+  every image done, from the task (or from `slate_image_get` when the task cannot start: NO_MEMORY); an image dropped while it loads is freed at the end, one dropped while it waits is never
+  loaded; a failed image leaves the store, so the next request of its path loads it again. The extension (`.png`,
+  `.sli`) is matched in any case.
+- Added: the IMAGE scene element (`SLATE_EL_IMAGE`, property `SLATE_PROP_IMAGE` with `slate_v_image`): drawn at its
+  rounded position with `slate_sli_draw_ops` (the table of the buffer it goes into, so also inside groups with
+  opacity, caches and blur), times its opacity; an opaque image at opacity 1 covers what is under it; a still image
+  that blends makes the underlay worth keeping. Nothing is drawn or covered until the engine sees the image ready
+  (`slate_el_image_sync`): then only its box is composed again. Commands carrying an image hold a reference.
+
 ## 1.0.0
 
 - First release: the PHP API `Baremetal\Slate` (`Slate`, `Scene`, the elements `RoundRect`, `Circle`, `Arc`,

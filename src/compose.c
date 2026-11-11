@@ -8,6 +8,7 @@
 #include "compose.h"
 #include "raster.h"
 #include "slate_config.h"
+#include "sli.h"
 
 #define OCC_MAX 8          /* occluders kept per band */
 #define ONES 64            /* canvas with opacity: alpha row chunk */
@@ -293,6 +294,11 @@ static slate_rect_t opaque_rect(const slate_el_t *e, float pox, float poy)
         r = (slate_rect_t){ X, Y, X + e->u.canvas.w, Y + e->u.canvas.h };
         break;
     }
+    case SLATE_EL_IMAGE: {   /* opaque: shown, and every pixel of the file opaque */
+        int X = iround(x), Y = iround(y);
+        r = (slate_rect_t){ X, Y, X + e->u.image.sli->w, Y + e->u.image.sli->h };
+        break;
+    }
     default:
         return EMPTY;
     }
@@ -338,6 +344,16 @@ static void draw_canvas(cx_t *cx, slate_buf_t *buf, const slate_el_t *e, float x
             int n = imin(ONES, c->w - i);
             cx->ops->copy_a(buf, X + i, Y + j, c->px + (size_t)j * c->w + i, ones, n, 1, n, a, cl);
         }
+    }
+}
+
+/* An image at its rounded position, times a, through the table of the buffer (an offscreen strip has its own). */
+static void draw_image(cx_t *cx, slate_buf_t *buf, const slate_el_t *e, float x, float y, slate_rect_t clip,
+                       uint8_t a)
+{
+    const slate_sli_t *im = e->u.image.sli;
+    if (im) {
+        slate_sli_draw_ops(cx->ops, buf, im, iround(x) - buf->ox, iround(y) - buf->oy, a, to_buf(buf, clip));
     }
 }
 
@@ -689,6 +705,8 @@ static void draw_item(cx_t *cx, slate_buf_t *buf, const item_t *it)
     }
     if (e->kind == SLATE_EL_CANVAS) {
         draw_canvas(cx, buf, e, it->pox + e->x, it->poy + e->y, it->clip, e->alpha);
+    } else if (e->kind == SLATE_EL_IMAGE) {
+        draw_image(cx, buf, e, it->pox + e->x, it->poy + e->y, it->clip, e->alpha);
     } else {
         draw_shape(buf, e, it->pox, it->poy, it->clip, e->alpha, false);
     }
@@ -922,7 +940,8 @@ static bool under_ok(const slate_el_t *e)
     return !(e->kind == SLATE_EL_GROUP && offscreen(e)) && !slate_el_has_shadow(e);
 }
 
-/* Items that are cheap to draw again: a solid fill, a canvas copy. P made only of them is not worth an underlay. */
+/* Items that are cheap to draw again: a solid fill, a canvas copy, an opaque image at opacity 1 (copies and fills
+   from its runs). P made only of them is not worth an underlay; an image that blends is. */
 static bool under_cheap(const slate_el_t *e)
 {
     switch (e->kind) {
@@ -930,6 +949,8 @@ static bool under_cheap(const slate_el_t *e)
         return !e->u.shape.fill.grad && !(e->u.shape.border > 0);
     case SLATE_EL_CANVAS:
         return true;
+    case SLATE_EL_IMAGE:
+        return !e->u.image.sli || e->opaque;   /* not shown (loading, failed, none): draws nothing */
     default:
         return false;
     }

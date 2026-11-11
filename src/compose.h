@@ -18,10 +18,13 @@
       ROUNDRECT: its box shrunk inward to whole pixels and then by ceil(radius) on the two sides that have the
       corners (the wider of the two cross-shaped rectangles), and by the border on every side when the border
       colour is not opaque; CIRCLE: the square inscribed in the circle of radius r - 0.5 (minus a non-opaque
-      border); CANVAS: its box. Up to 8 occluders (the largest) are kept per band;
+      border); CANVAS: its box; IMAGE: its box (opaque only when its .sli says that every pixel is, which
+      slate_sli_open checked). Up to 8 occluders (the largest) are kept per band;
    4. fills the background (target->background) unless covered (or copies the underlay, see below), then draws
       the items bottom to top: shapes and
-      text through raster.h (opaque spans are plain fills, only edges blend), a canvas as a copy, a group:
+      text through raster.h (opaque spans are plain fills, only edges blend), a canvas as a copy, an image with
+      slate_sli_draw_ops (only its rows in the band and its runs in the area drawn: fills and copies, copy_a for
+      the semi-transparent runs and for every run below opacity 1; nothing until it is shown, scene.h), a group:
       - with cache, shadow or blur: its cached image (cache.h) copied with copy_a times its opacity, over its
         shadow (fill_mask of the blurred alpha); without cache memory it falls back to the next two cases;
       - with opacity < 1: composed offscreen (RGB565 + A8, premultiplied) in strips taken from
@@ -45,7 +48,8 @@
    them (nothing above culls them then), writes the result into the image and marks it valid, then draws the rest.
    The same pixels either way: a shape drawn band by band gives the pixels of one drawn whole. A change to P (or to
    the scene, the background colour, the screen size) defines P again with an empty image. Only when P holds
-   something that costs more to draw than to copy (a gradient, an arc, a line, text, a border); the image
+   something that costs more to draw than to copy (a gradient, an arc, a line, text, a border, an image that
+   blends: with alpha or below opacity 1); the image
    (w x h x 2 bytes plus a bit per pair of columns per row) comes from cache_alloc and is given back when an
    element's cache needs the memory (the underlay then stays off until another scene is shown).
 

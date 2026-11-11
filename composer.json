@@ -23,6 +23,7 @@
       "ide-stubs": ["ide/ext-slate.stub"],
       "options": {
         "slate-effects": {"type": "set", "values": ["gradients", "shadows", "blur"], "default": ["gradients", "shadows", "blur"], "description": "Graphic effects compiled into Slate; an effect left out is not built and the PHP API that uses it throws."},
+        "slate-images": {"type": "set", "values": ["png"], "default": ["png"], "description": "Image formats decoded on the board; .sli images are always supported."},
         "slate-debug": {"type": "bool", "default": false, "description": "Builds Slate's profiler: frames per second on screen and a line of timings per second on the console."}
       }
     }

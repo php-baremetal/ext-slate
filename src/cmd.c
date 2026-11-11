@@ -4,6 +4,7 @@
 #include "bm_events_hal.h"
 #include "cmd.h"
 #include "halpool.h"
+#include "images.h"
 
 #define KEEP_BATCHES 4          /* empty batches kept for reuse */
 #define KEEP_BYTES 16384        /* a batch whose payload grew past this goes back without its payload memory */
@@ -33,9 +34,21 @@ static void *mem(size_t n)
     return bm_hal_alloc(n, BM_HAL_MEM_EXTERNAL);
 }
 
+/* The image references the batch's commands hold (taken at push), given back. */
+static void drop_images(batch_t *bt)
+{
+    for (size_t i = 0; i < bt->n; i++) {
+        if (bt->cmds[i].kind == SLATE_CMD_SET && bt->cmds[i].v.type == SLATE_VAL_IMAGE) {
+            slate_image_put(bt->cmds[i].v.v.image);
+        }
+    }
+    bt->n = 0;
+}
+
 static void batch_free(batch_t *bt)
 {
     if (bt) {
+        drop_images(bt);
         bm_hal_free(bt->cmds);
         bm_hal_free(bt->bytes);
         bm_hal_free(bt);
@@ -183,6 +196,9 @@ slate_cmd_result_t slate_cmd_push(slate_cmdbuf_t *b, const slate_cmd_t *c)
         memcpy(bt->bytes + goff, &g, sizeof g);
         d->v.v.paint.grad = (const void *)(uintptr_t)(goff + 1);
     }
+    if (c->kind == SLATE_CMD_SET && c->v.type == SLATE_VAL_IMAGE) {
+        slate_image_ref(c->v.v.image);   /* the image lives while the command does */
+    }
     if (data) {
         d->data = put(bt, c->data, data);
     } else if (d->kind == SLATE_CMD_SHOW || d->kind == SLATE_CMD_PIXELS) {
@@ -272,7 +288,7 @@ void slate_cmd_release(slate_cmdbuf_t *b)
         return;
     }
     b->taken = NULL;
-    bt->n = 0;
+    drop_images(bt);
     bt->used = 0;
     if (bt->bcap > KEEP_BYTES) {
         bm_hal_free(bt->bytes);   /* a big canvas update: not kept */

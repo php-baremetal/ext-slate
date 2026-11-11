@@ -13,7 +13,8 @@
 
 /*
  * The elements: abstract Element (x, y, visible, opacity, set()), Group (add, remove), RoundRect, Circle, Arc,
- * Line, Text and Canvas (its drawing methods are in php_slate_canvas.c). See php_slate.h for the model.
+ * Line, Text, Canvas (its drawing methods are in php_slate_canvas.c) and Image (its image, wait() and the events
+ * are in php_slate_images.c). See php_slate.h for the model.
  *
  * Properties are declared, typed public properties. The object handlers route a write of a Slate property through
  * sl_assign(): PHP checks the type (and coerces, as for any typed property), the value is validated here
@@ -40,7 +41,7 @@
 #include "slate_config.h"
 
 zend_class_entry *sl_element_ce, *sl_group_ce, *sl_roundrect_ce, *sl_circle_ce, *sl_arc_ce, *sl_line_ce,
-    *sl_text_ce, *sl_canvas_ce;
+    *sl_text_ce, *sl_canvas_ce, *sl_image_ce;
 
 static zend_object_handlers sl_handlers;
 static uint32_t s_next_id;
@@ -65,6 +66,7 @@ typedef enum {
     PT_BLUR,      /* int, CSS px 0..765 */
     PT_PIXELS,    /* int, 0..32767 */
     PT_CSIZE,     /* int, a canvas side 1..1024 */
+    PT_SRC,       /* string: an image's path (php_slate_images.c checks it and holds the image) */
 } sl_ptype_t;
 
 typedef struct {
@@ -137,6 +139,9 @@ static const sl_pdef_t canvas_defs[] = {
     { "w", SLATE_PROP_W, PT_CSIZE },
     { "h", SLATE_PROP_H, PT_CSIZE },
 };
+static const sl_pdef_t image_defs[] = {
+    { "src", SLATE_PROP_IMAGE, PT_SRC },
+};
 
 #define N(a) (int)(sizeof(a) / sizeof((a)[0]))
 
@@ -147,7 +152,7 @@ static zend_class_entry *s_base_ce[SL_BASE_COUNT];
 static const uint8_t s_kind[SL_BASE_COUNT + 1] = {
     [SL_GROUP] = SLATE_EL_GROUP, [SL_ROUNDRECT] = SLATE_EL_ROUNDRECT, [SL_CIRCLE] = SLATE_EL_CIRCLE,
     [SL_ARC] = SLATE_EL_ARC, [SL_LINE] = SLATE_EL_LINE, [SL_TEXT] = SLATE_EL_TEXT, [SL_CANVAS] = SLATE_EL_CANVAS,
-    [SL_SCENE] = SLATE_EL_GROUP, [SL_BASE_COUNT] = SLATE_EL_GROUP,
+    [SL_IMAGE] = SLATE_EL_IMAGE, [SL_SCENE] = SLATE_EL_GROUP, [SL_BASE_COUNT] = SLATE_EL_GROUP,
 };
 
 static zend_string *s_gradient_name, *s_shadow_name, *s_caps_name, *s_align_name;
@@ -380,6 +385,12 @@ static bool to_value(sl_obj_t *o, const sl_prop_t *p, zval *v, slate_value_t *ou
         }
         *out = slate_v_num((float)d);
         return true;
+    case PT_SRC:
+        if (check && !sl_image_src_ok(v)) {
+            return false;
+        }
+        *out = slate_v_image(o->im);   /* sl_assign binds the new path's image after the checks */
+        return true;
     }
     return false;
 }
@@ -444,6 +455,19 @@ static zend_result sl_assign(sl_obj_t *o, const sl_prop_t *p, zval *value)
     /* The same value again (the same number, string or enum case, or the same gradient or shadow object, which are
        immutable) changes nothing: no SET, so nothing is redrawn and the compositor is not woken. */
     bool same = Z_TYPE(old) != IS_ARRAY && zend_is_identical(&old, slot);
+    /* An image's path: the image of the new path (or of the same one again, when it failed: a file written or a
+       card mounted since). */
+    if (p->def->type == PT_SRC && (!same || sl_image_failed(o))) {
+        if (!sl_image_bind(o, Z_STR_P(slot))) {
+            zval tmp;
+            ZVAL_COPY_VALUE(&tmp, slot);
+            ZVAL_COPY_VALUE(slot, &old);
+            zval_ptr_dtor(&tmp);
+            return FAILURE;
+        }
+        v = slate_v_image(o->im);
+        same = false;
+    }
     zval_ptr_dtor(&old);
     /* A canvas resized: the PHP buffer is cleared here, and the engine clears its own copy when the SET of W or H
        arrives (scene.h), so no pixels need to be sent again. */
@@ -558,6 +582,7 @@ static void sl_free_obj(zend_object *obj)
         efree(o->px);
         o->px = NULL;
     }
+    sl_image_unbind(o);
     zend_object_std_dtor(obj);
 }
 
@@ -592,6 +617,7 @@ static void default_of(int base, const sl_pdef_t *d, zval *out)
         ZVAL_NULL(out);
         return;
     case PT_TEXT:
+    case PT_SRC:
         ZVAL_EMPTY_STRING(out);
         return;
     case PT_FONT:
@@ -650,6 +676,9 @@ zend_object *sl_obj_create(zend_class_entry *ce)
         zval *slot = prop_slot(o, p);
         zval_ptr_dtor(slot);
         default_of(o->base, p->def, slot);
+    }
+    if (o->base == SL_IMAGE) {
+        sl_image_init(o);
     }
     return &o->std;
 }
@@ -799,6 +828,7 @@ static const char *const line_args[] = { "x", "y", "x1", "y1", "width", "color",
 static const char *const text_args[] = { "x", "y", "text", "font", "color", "align", "maxWidth" };
 static const char *const group_args[] = { "x", "y", "w", "h", "opacity", "clip", "cache", "blur", "shadow" };
 static const char *const canvas_args[] = { "x", "y", "w", "h" };
+static const char *const image_args[] = { "x", "y", "src", "opacity" };
 
 PHP_METHOD(SlateRoundRect, __construct)
 {
@@ -833,6 +863,11 @@ PHP_METHOD(SlateGroup, __construct)
 PHP_METHOD(SlateCanvas, __construct)
 {
     construct(INTERNAL_FUNCTION_PARAM_PASSTHRU, canvas_args, 4, 4);
+}
+
+PHP_METHOD(SlateImage, __construct)
+{
+    construct(INTERNAL_FUNCTION_PARAM_PASSTHRU, image_args, 3, 4);
 }
 
 /* ---- Element::set(), Group::add(), Group::remove() ---- */
@@ -1038,6 +1073,7 @@ static zend_type type_of(uint8_t t)
         return (zend_type)ZEND_TYPE_INIT_CLASS(s_gradient_name, 1, T_NUM);
     case PT_TEXT:
     case PT_FONT:
+    case PT_SRC:
         return (zend_type)ZEND_TYPE_INIT_CODE(IS_STRING, 0, 0);
     case PT_CAPS:
         return (zend_type)ZEND_TYPE_INIT_CLASS(s_caps_name, 0, 0);
@@ -1132,6 +1168,8 @@ void sl_elements_register(void)
     sl_line_ce = leaf("Baremetal\\Slate\\Line", line_methods, line_defs, N(line_defs), true);
     sl_text_ce = leaf("Baremetal\\Slate\\Text", text_methods, text_defs, N(text_defs), true);
     sl_canvas_ce = leaf("Baremetal\\Slate\\Canvas", sl_canvas_method_table(), canvas_defs, N(canvas_defs), true);
+    sl_image_ce = leaf("Baremetal\\Slate\\Image", sl_image_method_table(), image_defs, N(image_defs), true);
+    sl_image_class(sl_image_ce);
 
     s_base_ce[SL_GROUP] = sl_group_ce;
     s_base_ce[SL_ROUNDRECT] = sl_roundrect_ce;
@@ -1140,6 +1178,7 @@ void sl_elements_register(void)
     s_base_ce[SL_LINE] = sl_line_ce;
     s_base_ce[SL_TEXT] = sl_text_ce;
     s_base_ce[SL_CANVAS] = sl_canvas_ce;
+    s_base_ce[SL_IMAGE] = sl_image_ce;
 
     table(SL_GROUP, group_defs, N(group_defs));
     table(SL_ROUNDRECT, roundrect_defs, N(roundrect_defs));
@@ -1148,6 +1187,7 @@ void sl_elements_register(void)
     table(SL_LINE, line_defs, N(line_defs));
     table(SL_TEXT, text_defs, N(text_defs));
     table(SL_CANVAS, canvas_defs, N(canvas_defs));
+    table(SL_IMAGE, image_defs, N(image_defs));
 }
 
 void sl_elements_scene(zend_class_entry *scene_ce)

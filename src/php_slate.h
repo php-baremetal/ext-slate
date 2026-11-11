@@ -50,6 +50,7 @@ typedef enum {
     SL_LINE,
     SL_TEXT,
     SL_CANVAS,
+    SL_IMAGE,
     SL_SCENE,
     SL_BASE_COUNT
 } sl_base_t;
@@ -68,6 +69,7 @@ struct sl_obj {
     uint16_t *px;           /* a canvas: cw x ch RGB565 native, emalloc */
     int cw, ch;
     int dx0, dy0, dx1, dy1; /* a canvas: the rectangle changed since the last dirty() (dx0 >= dx1: none) */
+    struct slate_image *im; /* an Image: its image in the store (a reference held); NULL: none */
     zend_object std;
 };
 
@@ -87,7 +89,7 @@ extern sl_state_t sl_g;
 /* Class entries. */
 extern zend_class_entry *sl_slate_ce, *sl_scene_ce, *sl_element_ce, *sl_group_ce, *sl_roundrect_ce, *sl_circle_ce,
     *sl_arc_ce, *sl_line_ce, *sl_text_ce, *sl_canvas_ce, *sl_caps_ce, *sl_align_ce, *sl_gradient_ce,
-    *sl_linear_ce, *sl_radial_ce, *sl_shadow_ce;
+    *sl_linear_ce, *sl_radial_ce, *sl_shadow_ce, *sl_image_ce;
 
 /* php_slate.c: pushes a command into the pending batch of the running engine (nothing without one). Throws
    \RuntimeException and returns false when the engine has failed (slate_engine_error()) or refused the command
@@ -135,6 +137,29 @@ const zend_function_entry *sl_canvas_method_table(void);
 bool sl_canvas_resize(sl_obj_t *o, int w, int h);
 /* Sends the pixels of the rectangle to the engine (realized canvases only). */
 bool sl_canvas_send(sl_obj_t *o, int x0, int y0, int x1, int y1);
+
+/* php_slate_images.c: Image (its methods and its image), Images, Preload, the events ImageLoaded, ImageFailed,
+   PreloadProgress, PreloadDone and the enum ImageError; the store's listener. */
+void sl_images_register(void);
+const zend_function_entry *sl_image_method_table(void);
+/* After the Image class is registered with its readonly properties w, h, loaded: their slots. */
+void sl_image_class(zend_class_entry *ce);
+/* A new Image object: w = h = 0, loaded = false. */
+void sl_image_init(sl_obj_t *o);
+/* Checks a value of Image::$src: false with the \ValueError of the Global rules (absolute, .sli or .png in any
+   case, png built). */
+bool sl_image_src_ok(const zval *v);
+/* Image::$src was set to path: the image of the path (a reference), w, h and loaded from its state now, and an
+   ImageFailed when the store gives it back failed already. false with an exception (no memory, no event source). */
+bool sl_image_bind(sl_obj_t *o, zend_string *path);
+/* The Image goes: its reference is dropped. */
+void sl_image_unbind(sl_obj_t *o);
+/* Whether the image of o failed (a write of the same $src tries again). */
+bool sl_image_failed(const sl_obj_t *o);
+/* The engine the store's listener kicks (NULL: none; waits until no listener uses the old one). PHP task. */
+void sl_images_engine(slate_engine_t *e);
+/* The end of the request: images in flight dropped, the events and the registries gone. */
+void sl_images_rshutdown(void);
 
 /* The short name of a class ("Gauge" for App\Gauge). */
 const char *sl_short_name(zend_class_entry *ce);

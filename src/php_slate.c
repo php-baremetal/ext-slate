@@ -191,6 +191,7 @@ static void sl_stop(sl_slate_t *s)
             s->hook = false;
         }
         __atomic_store_n(&s_vsync_engine, NULL, __ATOMIC_RELEASE);
+        sl_images_engine(NULL);   /* no image listener kicks the engine after */
         slate_engine_t *e = s->engine;
         const char *err = slate_engine_error(e);
         s->engine = NULL;
@@ -264,6 +265,7 @@ static bool sl_start(sl_slate_t *s, zend_object *display, zend_object *touch)
         return false;
     }
     __atomic_store_n(&s_vsync_engine, e, __ATOMIC_RELEASE);
+    sl_images_engine(e);   /* an image that finishes loading wakes it */
     GC_ADDREF(display);
     s->display = display;
     s->engine = e;
@@ -605,6 +607,7 @@ PHP_MINIT_FUNCTION(slate)
     sl_effects_register();
     sl_elements_register();
     sl_scene_register();
+    sl_images_register();
 
     memcpy(&slate_handlers, zend_get_std_object_handlers(), sizeof slate_handlers);
     slate_handlers.offset = XtOffsetOf(sl_slate_t, std);
@@ -630,6 +633,7 @@ PHP_RSHUTDOWN_FUNCTION(slate)
     if (sl_g.slate) {
         sl_stop(slate_of(sl_g.slate));
     }
+    sl_images_rshutdown();
     return SUCCESS;
 }
 
@@ -641,6 +645,7 @@ PHP_MINFO_FUNCTION(slate)
     php_info_print_table_row(2, "gradients", SLATE_HAS_GRADIENTS ? "built" : "not built");
     php_info_print_table_row(2, "shadows", SLATE_HAS_SHADOWS ? "built" : "not built");
     php_info_print_table_row(2, "blur", SLATE_HAS_BLUR ? "built" : "not built");
+    php_info_print_table_row(2, "png", SLATE_HAS_PNG ? "built" : "not built");
     php_info_print_table_row(2, "debug", SLATE_DEBUG ? "on" : "off");
     php_info_print_table_end();
 }
@@ -663,6 +668,6 @@ zend_module_entry slate_module_entry = {
     NULL,
     PHP_RSHUTDOWN(slate),
     PHP_MINFO(slate),
-    "1.0.0",
+    "1.1.0",
     STANDARD_MODULE_PROPERTIES
 };
