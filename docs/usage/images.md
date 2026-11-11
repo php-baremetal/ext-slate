@@ -169,7 +169,7 @@ Wrong paths throw at once, when the element is made or `$src` is written (the ol
 | `\ValueError` | `png is not built in: add it to slate-images in composer.json` |
 | `\TypeError` | `Baremetal\Slate\Images::preload(): Argument #1 ($paths) must contain only strings, <type> given` |
 
-Two more errors are thrown at once:
+Three more errors are thrown at once:
 
 | Thrown | When |
 | --- | --- |
@@ -177,9 +177,8 @@ Two more errors are thrown at once:
 | `\Exception` | `<function>() is not available in the web-server runtime: event sources need the event-driven runtime` (from ext-events): the first image of a request in the `web-server` runtime, since images raise events. |
 | `\RuntimeException` | `Slate: cannot load images: the table of ext-events' idle hooks is full`: other extensions took the four hooks ext-events keeps. |
 
- Whether a file really is what its name
-says is known only when it is read: the errors of loading come as `ImageFailed`, with `$error` of the enum
-`ImageError: string`:
+Whether a file really is what its name says is known only when it is read: the errors of loading come as
+`ImageFailed`, with `$error` of the enum `ImageError: string`:
 
 | Case | Value | Meaning |
 | --- | --- | --- |
@@ -187,7 +186,7 @@ says is known only when it is read: the errors of loading come as `ImageFailed`,
 | `Unreadable` | `'unreadable'` | The file could not be read. |
 | `BadFormat` | `'bad-format'` | Not a valid `.sli` or PNG: a damaged or truncated file, or another format under that name. |
 | `Unsupported` | `'unsupported'` | A valid PNG that is not decoded on the board: 16 bits per channel or interlaced. phpbm converts those: make it an asset. |
-| `NoMemory` | `'no-memory'` | Not enough memory for the image. |
+| `NoMemory` | `'no-memory'` | Not enough memory for the image: the external RAM left outside PHP is used up (on the esp32 SDK, raise its `firmware-reserve` option, see [Memory](#memory)). |
 
 A failed image is tried again by the next `Image` (or `$src`) of its path: a file written later, or a card
 mounted later, then loads.
@@ -197,13 +196,38 @@ mounted later, then loads.
 - Images live in external RAM (PSRAM), outside the budget of the element caches: a `.sli` file takes its own size
   (about 2 bytes per opaque pixel, less for runs of one color and for transparent parts, up to 3 bytes for
   semi-transparent pixels). On a board without PSRAM they take internal RAM.
+- That external RAM is not PHP's `memory_limit`: it is the part the SDK leaves to the rest of the firmware, shared
+  with the element caches (whose budget is half of the largest free block when the Slate starts), the network and
+  other native extensions. On the esp32 SDK its size is the `firmware-reserve` option (in KB, default `1024`): PHP
+  takes the rest of the PSRAM. With the default, about 1066 KB were free after the start on an ESP32-S3 with 8 MB
+  of PSRAM, of which the caches may take up to half: enough for a few photos of 360 x 360 (about 250 KB each), not
+  for a full-screen background on a larger panel.
+- To make room, raise `firmware-reserve`: `memory_limit` shrinks by as much (in steps of 256 KB; the reserve is at
+  most 4096 KB and at most a quarter of the free PSRAM). The caches' budget grows with it (half of the largest free
+  block), so in the worst case an image needs about twice its size of extra reserve. Keep only the images of the current
+  page and the next in memory (an image is freed when no `Image` shows it and no `Preload` holds it), and convert
+  PNG files with phpbm instead of decoding them on the board. For example, an opaque 1024 x 600 background is a
+  `.sli` of about 1.2 MB: on a board with 32 MB of PSRAM, a reserve of 3072 KB leaves it room next to the caches
+  (see the excerpt after this list).
 - Images are loaded one at a time, in the order they were asked for, by a task of low priority that exists only
   while there is something to load (6 KB of stack); PHP and the compositor go on meanwhile.
 - A PNG is decoded row by row straight into a `.sli`: never the whole image as pixels, but at the end of the
-  decoding the result is held twice for a moment, so the peak is about twice the `.sli` size (an 800 x 480 photo:
-  about 770 KB of `.sli`, about 1.5 MB of PSRAM at the peak), plus about 37 KB while it decodes. Converted by
-  phpbm, the same image costs only its `.sli` size, and loads faster.
+  decoding the result is held twice for a moment, so the peak is about twice the `.sli` size, plus about 37 KB
+  while it decodes. An 800 x 480 photo is about 770 KB of `.sli` and about 1.5 MB of PSRAM at the peak: more than
+  the default `firmware-reserve` leaves, so it fails with `no-memory` unless the reserve is raised to about
+  `3328` in the worst case (on a board with enough PSRAM). Converted by phpbm, the same image costs only its `.sli` size, and loads
+  faster.
 - PNG decoded on the board: grey, grey with alpha, RGB, RGBA and palettes (with or without `tRNS`) at 8 bits, grey
   and palettes also at 1, 2 and 4 bits; at most 32767 x 32767 pixels, and what fits in memory. Colors are reduced
   to the panel's 16 bits with the same ordered dither as gradients: the result is the same `.sli` phpbm writes,
   byte for byte.
+
+<!-- @code-block language="json" label="composer.json (excerpt)" -->
+```json
+"extra": {
+  "baremetal": {
+    "options": { "firmware-reserve": 3072 }
+  }
+}
+```
+<!-- @endcode-block -->

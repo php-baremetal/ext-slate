@@ -358,7 +358,8 @@ namespace Baremetal\Slate {
 
         /**
          * @throws \RuntimeException When there is no memory even for the image's record ("Slate: no memory for the
-         *     image <path>").
+         *     image <path>"), or when the table of ext-events' idle hooks is full ("Slate: cannot load images: the
+         *     table of ext-events' idle hooks is full").
          * @throws \Exception In the web-server runtime (from ext-events: images raise events).
          * @throws \ValueError When $src is not an absolute path ("Baremetal\Slate\Image::$src must be an absolute
          *     path"), does not end in .sli or .png ("Baremetal\Slate\Image::$src must end in .sli or .png"), is a
@@ -393,7 +394,9 @@ namespace Baremetal\Slate {
          * @throws \ValueError When a path is not absolute, does not end in .sli or .png, or is a .png while png is
          *     not built.
          * @throws \TypeError When an entry is not a string.
-         * @throws \RuntimeException When there is no memory even for an image's record.
+         * @throws \RuntimeException When there is no memory even for an image's record, or when the table of
+         *     ext-events' idle hooks is full ("Slate: cannot load images: the table of ext-events' idle hooks is
+         *     full").
          * @throws \Exception In the web-server runtime (from ext-events: images raise events).
          */
         public static function preload(array $paths): Preload {}

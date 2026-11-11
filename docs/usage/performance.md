@@ -94,7 +94,9 @@ sub-pixel position and anti-aliasing.
 The caches together stay under a budget: half of the largest block of external RAM found when the Slate starts,
 at most 2 MB. Past it, the elements that do not fit are drawn directly, and a group drawn that way loses its
 blur and shadow until memory frees up. On a board without PSRAM the budget is 0: nothing is cached, shadows and
-group blur are not drawn, and internal RAM stays free for the bands, Wi-Fi and DMA.
+group blur are not drawn, and internal RAM stays free for the bands, Wi-Fi and DMA. Images are outside this budget but
+in the same external RAM, the part the SDK leaves outside PHP (on the esp32 SDK, the `firmware-reserve` option):
+see [Images](./images.md#memory).
 
 ## Images
 

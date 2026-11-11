@@ -17,7 +17,7 @@
   without waiting for another change; in `init-loop` (no events) the properties still follow at the end of each
   `loop()`. Every Preload gets exactly one PreloadDone, also when a burst of images overflows the event pool (the
   images whose events were dropped are caught up at the return to the event loop, and a refused PreloadDone is
-  raised again). Docs: `docs/usage/images.md` (assets, board paths `/app/...` and `/sdcard/...`, memory of on-board PNG),
+  raised again). Docs: `docs/usage/images.md` (assets, board paths `/app/...` and `/sdcard/...`, memory of images, which comes from the PSRAM the SDK leaves outside PHP: the esp32 SDK's `firmware-reserve`, and memory of on-board PNG),
   the `slate-images` option, performance; IDE stub 1.1.0.
 - Added: .sli images, Slate's run-length image format (written by phpbm image:convert): a reader that checks a whole
   file once (header, row table, every command, padding, the opaque flag) and a drawer that composes the image band
