@@ -54,6 +54,8 @@ $home->temp->text = '93 °C';   // drawn at the next frame
 - [Scenes and pages](docs/usage/scenes.md)
 - [Elements](docs/usage/elements.md)
 - [Images](docs/usage/images.md)
+- [Animations](docs/usage/animations.md)
+- [Scroll](docs/usage/scroll.md)
 - [Effects and build options](docs/usage/effects-and-options.md)
 - [Performance](docs/usage/performance.md)
 - [Debug](docs/usage/debug.md)

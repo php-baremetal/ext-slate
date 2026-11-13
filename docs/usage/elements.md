@@ -4,6 +4,8 @@ lede:    'RoundRect, Circle, Arc, Line, Text, Group, Canvas and Image: construct
 see_also:
   - { href: './scenes.md', meta: 'API' }
   - { href: './images.md', meta: 'API' }
+  - { href: './animations.md', meta: 'API' }
+  - { href: './scroll.md', meta: 'API' }
   - { href: './effects-and-options.md', meta: 'API' }
   - { href: 'package:php-baremetal/ext-display', meta: 'Extension', label: 'ext-display' }
 prev: { label: 'Scenes and pages', href: './scenes.md' }
@@ -31,6 +33,17 @@ Several properties at once, by name: `$el->set(x: 40, opacity: 0.5)`. Positional
 given, each validated on its own (so `set(w: 40, h: 30, clip: true)` works and `set(clip: true, w: 40, h: 30)`
 on a group without a box throws at `clip`; the ones before stay assigned), with PHP's usual conversions of typed
 properties (a script's `strict_types` does not apply inside `set()`).
+
+<!-- @method name="Element::animate(array $props, int $ms = 300, Ease $ease = Ease::OutCubic, int $delay = 0, int $repeat = 0, bool $yoyo = false): Tween" returns="Tween" -->
+
+Moves properties to new values over time, in the compositor: `$el->animate(['x' => 200, 'opacity' => 0.5])`. The
+properties read their final values at once; the returned `Tween` tells when it ends. See
+[Animations](./animations.md), which also lists the animatable properties of each element.
+
+<!-- @method name="Element::ease(array $props, int $ms = 300, Ease $ease = Ease::OutCubic): static" returns="static" -->
+
+From now on, writes of the named properties slide to their values instead of jumping: `$el->ease(['x', 'y'])`;
+`ease([])` makes them jump again. See [Animations](./animations.md).
 
 ## Positions and coordinates
 
@@ -109,6 +122,9 @@ Its children are placed relative to (`$x`, `$y`). `add(Element ...$e): static` p
 
 An element is in one group at a time; a group cannot contain itself or one of its parents
 (`\LogicException`).
+
+A `Scroll` is a group with a view over its children that the finger drags, with inertia, snapping and bars: see
+[Scroll](./scroll.md).
 
 ## A component of your own
 
@@ -194,13 +210,15 @@ preloading and errors are in [Images](./images.md).
 | `Caps: string` | `Butt` (`'butt'`), `Round` (`'round'`) |
 | `Align: string` | `Left` (`'left'`), `Center` (`'center'`), `Right` (`'right'`) |
 | `ImageError: string` | `NotFound` (`'not-found'`), `Unreadable` (`'unreadable'`), `BadFormat` (`'bad-format'`), `Unsupported` (`'unsupported'`), `NoMemory` (`'no-memory'`), see [Images](./images.md) |
+| `Ease` | `Linear`, `InQuad`, `OutQuad`, `InOutQuad`, `InCubic`, `OutCubic`, `InOutCubic`, `OutBack`, `OutBounce`, `OutElastic` (no values), see [Animations](./animations.md) |
 
-`Caps::from('round')` and `Align::tryFrom($name)` read them from strings.
+`Caps::from('round')` and `Align::tryFrom($name)` read them from strings; `Ease` is a pure enum (`Ease::OutBack`).
 
 ## Errors
 
 | Thrown | When |
 | --- | --- |
+| `\ValueError` | A property that cannot be animated, in `animate()`, `then()` and `ease()` (see [Animations](./animations.md#errors)). |
 | `\ValueError` | A value out of range: `Baremetal\Slate\RoundRect::$opacity must be between 0 and 1`, `...::$w must be between 0 and 32767`, `...::$x must be a finite number between -32767 and 32767`, `...::$fill must be a color, 0xRRGGBB or 0xAARRGGBB, or a gradient`, `...::$clip needs $w and $h greater than 0 (the clip box)`, an unknown font, an image path (`Baremetal\Slate\Image::$src must be an absolute path`, `...::$src must end in .sli or .png`). The old value stays. |
 | `\TypeError` | A value of the wrong type (PHP's own message for typed properties). |
 | `\LogicException` | A second parent, or a group that would contain itself. |

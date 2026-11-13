@@ -14,8 +14,13 @@
 /*
  * Scene: what Slate shows, one at a time. Its elements hang from a root group of its own (the scene is not an
  * Element: it cannot go inside a group). A page of an application extends it: build() adds the components
- * (called once, before the first show), onEnter() and onLeave() run when it is shown and replaced, onTouch()
- * gets the touch events while it is the active scene. All four are empty here.
+ * (called once, before the first show), onEnter() and onLeave() run when it is shown and replaced (with a
+ * transition: onEnter() at its start, onLeave() at its end), onTouch() gets the touch events while it is the active
+ * scene (not during a transition). All four are empty here.
+ *
+ * protected bool $keepCache = true: when the scene is left, its element caches stay for a return to it while there
+ * is room (Slate::$keepScenes, Slate::$keptBudget; engine.h, Kept scenes); false: they go when it is left. Read by
+ * the show() that leaves the scene.
  */
 #include "php.h"
 #include "zend_exceptions.h"
@@ -118,4 +123,8 @@ void sl_scene_register(void)
     sl_scene_ce = zend_register_internal_class(&ce);
     sl_scene_ce->ce_flags |= ZEND_ACC_NOT_SERIALIZABLE;
     sl_elements_scene(sl_scene_ce);
+    zval dv;
+    ZVAL_TRUE(&dv);
+    zend_declare_typed_property(sl_scene_ce, zend_string_init_interned("keepCache", sizeof("keepCache") - 1, 1), &dv,
+                                ZEND_ACC_PROTECTED, NULL, (zend_type)ZEND_TYPE_INIT_CODE(_IS_BOOL, 0, 0));
 }

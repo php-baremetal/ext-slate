@@ -32,6 +32,7 @@ void slate_cache_stale(slate_el_t *e, bool content, bool shadow)
     }
     if (content) {
         c->content_ok = false;
+        c->gave_up = false;
         c->shadow_ok = false;   /* a group's shadow comes from its content */
     }
     if (shadow) {

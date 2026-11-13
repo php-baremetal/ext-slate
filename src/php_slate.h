@@ -51,6 +51,7 @@ typedef enum {
     SL_TEXT,
     SL_CANVAS,
     SL_IMAGE,
+    SL_SCROLL,      /* Scroll (a Group made a scroll: php_slate_scroll.c) */
     SL_SCENE,
     SL_BASE_COUNT
 } sl_base_t;
@@ -70,6 +71,14 @@ struct sl_obj {
     int cw, ch;
     int dx0, dy0, dx1, dy1; /* a canvas: the rectangle changed since the last dirty() (dx0 >= dx1: none) */
     struct slate_image *im; /* an Image: its image in the store (a reference held); NULL: none */
+    uint16_t tweens;        /* its running tweens (php_slate_anim.c: each holds a reference on it) */
+    bool animated;          /* a tween or ease() touched it: every write is sent, even of the value it holds (the
+                               screen may show another one: a stopped tween, a remove()) */
+    uint8_t ease;           /* ease(): the curve (slate_ease_t), the properties (bit 1u << slate_prop_t; 0: none) and
+                               the time, sent again when it is realized */
+    uint32_t ease_mask;
+    int32_t ease_ms;
+    struct sl_scroll *sc;   /* a Scroll: its PHP-side state (php_slate_scroll.c, emalloc); NULL otherwise */
     zend_object std;
 };
 
@@ -89,7 +98,8 @@ extern sl_state_t sl_g;
 /* Class entries. */
 extern zend_class_entry *sl_slate_ce, *sl_scene_ce, *sl_element_ce, *sl_group_ce, *sl_roundrect_ce, *sl_circle_ce,
     *sl_arc_ce, *sl_line_ce, *sl_text_ce, *sl_canvas_ce, *sl_caps_ce, *sl_align_ce, *sl_gradient_ce,
-    *sl_linear_ce, *sl_radial_ce, *sl_shadow_ce, *sl_image_ce;
+    *sl_linear_ce, *sl_radial_ce, *sl_shadow_ce, *sl_image_ce, *sl_tween_ce, *sl_tween_done_ce, *sl_ease_ce, *sl_transition_ce,
+    *sl_direction_ce, *sl_transition_done_ce, *sl_scroll_ce, *sl_scroll_axis_ce, *sl_scroll_ended_ce;
 
 /* php_slate.c: pushes a command into the pending batch of the running engine (nothing without one). Throws
    \RuntimeException and returns false when the engine has failed (slate_engine_error()) or refused the command
@@ -108,6 +118,20 @@ void sl_children_add(sl_obj_t *o, zval *args, uint32_t argc);
 void sl_children_remove(sl_obj_t *o, zval *args, uint32_t argc);
 /* Object handlers shared by the elements and the scene (create_object of the base classes). */
 zend_object *sl_obj_create(zend_class_entry *ce);
+/* Whether o lives in the running engine (realized in its generation). */
+bool sl_realized(const sl_obj_t *o);
+/* animate() and then(): checks every property of props (animatable for o's class, not a gradient now or as the
+   target, the value as a write of it would check it, the rules between properties) and throws \ValueError (false,
+   nothing changed) on the first refusal; else writes the values into o's properties (the final values that reading
+   them gives; with back, the yoyo of an odd repeat ends where it started: they stay as they are) and fills
+   spec->props and spec->n. */
+bool sl_anim_collect(sl_obj_t *o, HashTable *props, bool back, slate_tween_spec_t *spec);
+
+/* A property slot of o by name (NULL: o has no such Slate property), its number (0 when absent) and whether it is
+   true. */
+zval *sl_slot(sl_obj_t *o, const char *name);
+double sl_slot_num(sl_obj_t *o, const char *name);
+bool sl_slot_true(sl_obj_t *o, const char *name);
 
 /* Gives the Scene class (registered by php_slate_scene.c) the element handlers. */
 void sl_elements_scene(zend_class_entry *scene_ce);
@@ -160,6 +184,111 @@ bool sl_image_failed(const sl_obj_t *o);
 void sl_images_engine(slate_engine_t *e);
 /* The end of the request: images in flight dropped, the events and the registries gone. */
 void sl_images_rshutdown(void);
+/* The images' part of Slate's idle hook (plain C). */
+void sl_images_idle(void);
+
+/* php_slate_scroll.c: Scroll (its touch(), scrollTo() and the PHP side of its position), the enum ScrollAxis and the
+   event ScrollEnded. The properties of Scroll are php_slate_elements.c's (they call the functions below). */
+/* ScrollAxis, registered before the Scroll class (php_slate_elements.c registers Scroll with this method table). */
+void sl_scroll_axis_register(void);
+const zend_function_entry *sl_scroll_method_table(void);
+/* ScrollEnded (after Scroll and ext-events' Event). */
+void sl_scroll_register(void);
+/* The slate_scroll_axis_t of a ScrollAxis case. */
+uint8_t sl_scroll_axis_of(const zval *v);
+/* A new Scroll object (sl_obj_create) gets its state; its free gives it back. */
+void sl_scroll_init(sl_obj_t *o);
+void sl_scroll_free(sl_obj_t *o);
+/* Realization (sl_realize): the CONFIG right after its NEW; the JUMP to its position after its children. false with
+   an exception. */
+bool sl_scroll_realize_config(sl_obj_t *o);
+bool sl_scroll_realize_position(sl_obj_t *o);
+/* Reading $scrollX/$scrollY: their slots get the position drawn (when the engine has applied the last write). */
+void sl_scroll_sync(sl_obj_t *o);
+/* A write of $scrollX/$scrollY (the slots hold the new values): a JUMP of a realized scroll, which stops its motion
+   and its scrollTo(). false with an exception. */
+bool sl_scroll_jumped(sl_obj_t *o);
+/* A write of $axis, $bounce, $snapX, $snapY, $snapMax or $indicators that changed it: the CONFIG of a realized
+   scroll (setup: one of the first five, which stops its scrollTo()). false with an exception. */
+bool sl_scroll_configured(sl_obj_t *o, bool setup);
+/* The scroll ends of the engine (its tween listener, the engine's task): one ScrollEnded each, for the Scrolls still
+   alive. */
+void sl_scroll_pull(slate_engine_t *e);
+/* The end of the request: the event set up goes. */
+void sl_scroll_rshutdown(void);
+
+/* php_slate_anim.c: Tween, TweenDone, Ease; the engine's tween listener and the TweenDone events. */
+void sl_anim_register(void);
+/* ms >= 1, delay >= 0, repeat >= -1 (each at most INT32_MAX): false with the \ValueError of the Global rules. */
+bool sl_anim_times(zend_long ms, zend_long delay, zend_long repeat);
+/* The slate_ease_t of an Ease case (NULL: OutCubic). */
+uint8_t sl_ease_of(zend_object *ease);
+/* A new Tween into rv for spec on el (spec->tween is set here), after pred (then(); NULL: none). A realized el gets
+   a TWEEN command; one that is not drawn yet has its values already: the Tween is done at once (its TweenDone
+   follows), or stopped for repeat -1. false with an exception (rv undefined). */
+bool sl_tween_make(zval *rv, sl_obj_t *el, slate_tween_spec_t *spec, zend_object *pred);
+/* A new Tween into rv that is done at once (its TweenDone follows), for a change that took no time (scrollTo() with
+   ms 0, or of a Scroll not drawn). false with an exception (rv undefined). */
+bool sl_tween_instant(zval *rv, sl_obj_t *el);
+/* The running Tween id was stopped by the engine without a TWEEN_STOP (a scroll's PRESS, JUMP or new set-up stops its
+   scrollTo()): marked stopped ($done false, wait() false, no TweenDone). Nothing for a Tween that is not running. */
+void sl_tween_silenced(uint32_t id);
+/* Whether the Tween id runs (not done, stopped or pending; its end not reported by the engine yet). */
+bool sl_tween_running(uint32_t id);
+/* c was detached (a REMOVE pushed, or its parent freed) while it has tweens: checked at the next delivery
+   (sl_deliver); without a running Slate they stop at once. */
+void sl_anim_removed(sl_obj_t *c);
+/* o was just realized: its pending tweens (made while it was not drawn) are sent, the values before them first.
+   false with an exception. */
+bool sl_anim_realized(sl_obj_t *o);
+/* A write of prop on o: its pending tweens no longer move prop. */
+void sl_anim_written(sl_obj_t *o, slate_prop_t prop);
+/* The animations' part of Slate's idle hook (plain C). */
+void sl_anim_idle(void);
+/* Hands the pending batch to the compositor: first the tweens of the elements removed since the last delivery and
+   not put back are marked stopped (the engine stops them without a done). Plain C (the idle hook calls it). */
+void sl_deliver(void);
+/* Releases what plain C left to release (elements of tweens that ended or stopped). PHP calls only. */
+void sl_anim_flush(void);
+/* The engine the tween listener drains (NULL: the Slate stopped: every running tween is marked stopped). */
+void sl_anim_engine(slate_engine_t *e);
+/* The end of the request: the Tweens and the events dropped. */
+void sl_anim_rshutdown(void);
+
+/* php_slate_anim.c, transitions: Transition, Direction, TransitionDone; the records of the transitions asked by
+   show(), from the show() to the engine's end of each. */
+/* The transition of a Transition object into *out; false (out all zeros: at once) for NULL. */
+bool sl_transition_of(zend_object *t, slate_trans_t *out);
+/* The first transition of the request: the TransitionDone event, its watch, the idle hook. false with an exception. */
+bool sl_trans_ready(void);
+/* A SHOW of to with a transition was pushed, from from (NULL: no scene shown): recorded (references) until its end. */
+void sl_trans_add(zend_object *from, zend_object *to);
+/* Before such a SHOW: the memory its end will need on the engine's task (taken now, so no end is lost). false with
+   an exception. */
+bool sl_trans_reserve(void);
+/* A show() during a transition: onLeave() now of the scenes the running ones leave (their TransitionDone follows when
+   the engine ends them). false with an exception. */
+bool sl_trans_leave(void);
+/* onLeave() of the transitions that ended and whose TransitionDone was not delivered (a full pool, init-loop); the
+   records go. PHP calls only (show(), commit(), the watch of TransitionDone). false with an exception. */
+bool sl_trans_settle(void);
+/* A transition was asked and has not ended (the ends already reported applied first): the touch is ignored. Plain
+   C. */
+bool sl_trans_running(void);
+/* The transitions' part of Slate's idle hook (plain C). */
+void sl_trans_idle(void);
+
+/* php_slate.c: Slate's one hook of ext-events' idle table (bm_events_on_idle), shared by its users: the running
+   Slate (its delivery), the images, the animations and the transitions (their lost events). Set while any user is on; false when the
+   table is full. PHP task. */
+#define SL_IDLE_SLATE 1u
+#define SL_IDLE_IMAGES 2u
+#define SL_IDLE_ANIM 4u
+#define SL_IDLE_TRANS 8u
+bool sl_idle_use(unsigned user, bool on);
+
+/* php_slate.c: the scene the running Slate shows (NULL: none, or no Slate). */
+zend_object *sl_shown_scene(void);
 
 /* The short name of a class ("Gauge" for App\Gauge). */
 const char *sl_short_name(zend_class_entry *ce);

@@ -10,6 +10,11 @@
 #include "bm_events_hal.h"
 
 #define SLATE_QUEUE_DEPTH 8   /* every Slate queue: this many uint32_t items */
+/* The shortest wait (ms) that really blocks: the events HAL turns ms into ticks rounding down (pdMS_TO_TICKS), and
+   with CONFIG_FREERTOS_HZ = 100 a wait of 1..9 ms is 0 ticks, a receive that returns at once. A loop that sleeps
+   (rather than one bounded by a deadline) waits at least this much per turn, so it yields to the tasks it waits
+   for and its count of turns is a time. */
+#define SLATE_NAP_MS 10
 
 /* A lock (a recycled one, else bm_hal_lock_create()); NULL when out of memory. */
 bm_hal_lock_t *slate_lock_get(void);

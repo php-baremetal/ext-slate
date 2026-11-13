@@ -40,6 +40,20 @@ static void (*s_listener)(slate_image_t *im, void *arg);
 static void *s_listener_arg;
 static void *(*s_alloc)(size_t) = ext_alloc;
 static void (*s_free)(void *) = bm_hal_free;
+static bool (*s_reclaim)(void);          /* slate_images_set_reclaim (atomic) */
+static void *(*s_try_alloc)(size_t);     /* loader task only: the allocator of the image being read */
+static bool s_alloc_failed;              /*   it refused a block while reading it */
+
+/* The loader's allocator: the store's, noting a refusal (only a refused block asks for a reclaim: a size past
+   SIZE_MAX is NO_MEMORY too, and no memory freed changes it). */
+static void *loader_alloc(size_t n)
+{
+    void *p = s_try_alloc(n);
+    if (!p) {
+        s_alloc_failed = true;
+    }
+    return p;
+}
 
 /* s_lock is created by the first get on the PHP task and read by every task (the engine at each wake-up): stored
    with release, loaded with acquire, so another core sees it whole (it lives in internal RAM: atomics are fine). No
@@ -271,13 +285,24 @@ static void loader_main(void *arg)
         uint8_t *data = NULL;
         size_t size = 0;
         slate_sli_t sli;
-        slate_img_err_t err = slate_image_read(im->path, alloc, im->release, &data, &size);
-        if (err == SLATE_IMG_OK && !slate_sli_open(&sli, data, size)) {
-            err = SLATE_IMG_BAD_FORMAT;
-        }
-        if (err != SLATE_IMG_OK && data) {
-            im->release(data);
-            data = NULL;
+        slate_img_err_t err = SLATE_IMG_OK;
+        s_try_alloc = alloc;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            s_alloc_failed = false;
+            err = slate_image_read(im->path, loader_alloc, im->release, &data, &size);
+            if (err == SLATE_IMG_OK && !slate_sli_open(&sli, data, size)) {
+                err = SLATE_IMG_BAD_FORMAT;
+            }
+            if (err != SLATE_IMG_OK && data) {
+                im->release(data);
+                data = NULL;
+            }
+            /* a block refused: the caches of the scenes left go (the engine drops them on its task), and when that
+               freed something, once more */
+            bool (*reclaim)(void) = __atomic_load_n(&s_reclaim, __ATOMIC_ACQUIRE);
+            if (err != SLATE_IMG_NO_MEMORY || !s_alloc_failed || attempt > 0 || !reclaim || !reclaim()) {
+                break;
+            }
         }
         finish(im, err, data, &sli);
     }
@@ -442,6 +467,11 @@ bool slate_images_loading(void)
     bool r = s_running;
     unlock(lk);
     return r;
+}
+
+void slate_images_set_reclaim(bool (*reclaim)(void))
+{
+    __atomic_store_n(&s_reclaim, reclaim, __ATOMIC_RELEASE);
 }
 
 void slate_images_set_alloc(void *(*alloc)(size_t bytes), void (*free_fn)(void *p))

@@ -34,7 +34,14 @@
    failure and every load is told exactly once, always by the store.
 
    Memory: the image record and its file from the store's allocator (default: bm_hal_alloc BM_HAL_MEM_EXTERNAL,
-   PSRAM on the board), outside the element cache budget. A PNG is decoded row by row (png.h), never whole.
+   PSRAM on the board), outside the element cache budget. A PNG is decoded row by row (png.h), never whole. When the
+   loader's allocator refuses a block for an image (reading a .sli, decoding a PNG: every block of the loader comes
+   from the store's allocator) it calls the reclaim function (slate_images_set_reclaim: the engine's, which has the
+   caches of the scenes left dropped on the engine's task and waits for it, bounded) and, when that returns true
+   (something was freed, or no answer came in time), reads the file once more; only then NO_MEMORY. Without one, when
+   it returns false (no engine runs, nothing was kept) or for a NO_MEMORY that no block refused (a size past
+   SIZE_MAX), NO_MEMORY at once, as before. The record itself (slate_image_get, PHP
+   task) is not retried.
    Threads: slate_image_get and the setters from the PHP task; slate_image_ref, slate_image_put and the getters from
    any task (not an ISR); the lock is the events HAL's short critical section, never held across an allocation, a
    free, a file access or the listener. */
@@ -87,6 +94,11 @@ void slate_images_set_listener(void (*done)(slate_image_t *im, void *arg), void 
 uint32_t slate_images_done(void);
 /* The loader task runs (requests are queued or being loaded). Any task. */
 bool slate_images_loading(void);
+
+/* The function the loader calls when it runs out of memory for an image (see Memory): from the loader task; it may
+   block (bounded); true: it may have freed memory, try once more; false: it did not. NULL: none. Set by the engine (engine.h, Kept
+   scenes): code, not an object, so it never goes away; any task. */
+void slate_images_set_reclaim(bool (*reclaim)(void));
 
 /* The store's memory (NULL, NULL: the default, external RAM). Only while no image lives (tests). */
 void slate_images_set_alloc(void *(*alloc)(size_t bytes), void (*free_fn)(void *p));

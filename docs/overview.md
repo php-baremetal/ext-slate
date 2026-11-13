@@ -25,7 +25,10 @@ costs nothing: no frame is composed.
 - `Baremetal\Slate\Scene`: a screen of the application; a page is a class that extends it.
 - `Element` and its classes `RoundRect`, `Circle`, `Arc`, `Line`, `Text`, `Group`, `Canvas`, `Image`.
 - `Images::preload()` and `Preload`, the events `ImageLoaded`, `ImageFailed`, `PreloadProgress`, `PreloadDone`.
-- `Caps`, `Align` and `ImageError` (enums), `LinearGradient`, `RadialGradient`, `Shadow`.
+- `Element::animate()`, `Element::ease()`, `Tween` and the event `TweenDone`: animations run by the compositor.
+- `Transition` and the event `TransitionDone`: page transitions of `Slate::show()` (fade, push, cover, uncover).
+- `Scroll` (a `Group` with a view the finger drags, with inertia, snapping and bars) and the event `ScrollEnded`.
+- `Caps`, `Align`, `ImageError`, `Ease`, `Direction` and `ScrollAxis` (enums), `LinearGradient`, `RadialGradient`, `Shadow`.
 
 ## Requirements
 
@@ -154,7 +157,14 @@ Touch events reach `Scene::onTouch()` in the `event-driven` runtime, where ext-e
   of the scene.
 - Images are loaded in the background; until an image is there its element draws nothing. A bad or missing file
   raises `ImageFailed` and never breaks the screen.
+- Animations run in the compositor, sampled at the panel's refresh: `$card->animate(['x' => 200], ms: 300)`
+  returns a `Tween`, and `TweenDone` comes when it ends. A screen with no animation running composes no frame.
+  `$slate->show($menu, Transition::push(Direction::Left))` slides to another page the same way.
+- A `Scroll` gets the touches the script forwards to it (`$list->touch($e)` in `Scene::onTouch()`); the drag, the
+  inertia, the spring past an edge and the snapping run in the compositor, and `ScrollEnded` comes when the content
+  rests.
 
 See [Scenes and pages](./usage/scenes.md), [Elements](./usage/elements.md), [Images](./usage/images.md),
+[Animations](./usage/animations.md), [Scroll](./usage/scroll.md),
 [Effects and build options](./usage/effects-and-options.md), [Performance](./usage/performance.md) and
 [Debug](./usage/debug.md).

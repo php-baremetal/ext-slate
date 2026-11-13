@@ -1,5 +1,151 @@
 # Changelog
 
+## 1.2.0
+
+- Added: animations, run by the compositor at the pace of the panel (no PHP timer). `Element::animate(array $props,
+  int $ms = 300, Ease $ease = Ease::OutCubic, int $delay = 0, int $repeat = 0, bool $yoyo = false): Tween` moves
+  properties from their values on the screen to the ones given; the properties read their final values at once.
+  Animatable: `x`, `y`, `opacity` of every element, `Group` `w`, `h`, `blur`, `RoundRect` `w`, `h`, `radius`,
+  `border`, `fill`, `borderColor`, `Circle` `r`, `border`, `fill`, `borderColor`, `Arc` `r`, `from`, `to`, `width`,
+  `color`, `Line` `x1`, `y1`, `width`, `color`, `Text` `color` (colours channel by channel). `final class Tween`:
+  read-only `$done`, `stop(bool $toEnd = false)` (with the chain after it, no event), `wait(int $timeout_ms = 5000)`
+  (hands the changes over, delivers no other event; false at once for a stopped tween or `repeat: -1`),
+  `then(Element $e, array $props, int $ms = 300, Ease $ease = Ease::OutCubic): Tween` (starts at its exact end).
+  `Element::ease(array $props, int $ms = 300, Ease $ease = Ease::OutCubic): static`: writes of those properties slide
+  (`ease([])` removes it). The event `TweenDone` (`$tween`, final), once per tween that ends by itself, never for
+  `repeat: -1` nor after a stop (unless the tween ended in the frame the stop arrived); a `$done` whose event was dropped (a full event pool, `init-loop`) is set at the
+  return to the event loop. The enum `Ease` (`Linear`, `InQuad`, `OutQuad`, `InOutQuad`, `InCubic`, `OutCubic`,
+  `InOutCubic`, `OutBack`, `OutBounce`, `OutElastic`). Tweens of a scene that is not shown wait for it; `remove()`
+  of an element stops its tweens (a `remove()` and `add()` in one delivery keeps them), and so does the end of its
+  group or scene (a page dropped with its animations running leaks nothing); the tween of an element not drawn yet
+  (made in `build()`, or before `add()`) waits and starts when it is shown, `then()` after it too. Everything is
+  checked before anything changes, with
+  `\ValueError` `Baremetal\Slate\<Class>::$<name> cannot be animated`, `...::$fill cannot be animated: it is a
+  gradient` (likewise `$color`), `...::$fill cannot be animated: it is null` (likewise `$borderColor`),
+  `ms must be at least 1`, `delay must be 0 or more`, `repeat must be -1 or more`,
+  `props must name at least one property`, or the property's own range message. A write of the value a property
+  already holds is sent all the same on an element that was animated (the screen may show another value after a
+  stop). Docs: `docs/usage/animations.md`; IDE stub 1.2.0.
+- Added: scroll. `class Scroll extends Group` (not final): a view `(0, 0, $w, $h)`, always clipped, over its children
+  (the content, in content coordinates), drawn shifted by the scroll position. `Scroll::__construct(int|float $x = 0,
+  int|float $y = 0, int|float $w = 1, int|float $h = 1, ScrollAxis $axis = ScrollAxis::Both, bool $bounce = true, int
+  $snapX = 0, int $snapY = 0, int $snapMax = 0, bool $indicators = true, int $contentW = 0, int $contentH = 0, float
+  $opacity = 1.0, bool $cache = false)`. Properties: `$contentW`, `$contentH` (0..32767; 0: the box of the children from
+  (0, 0), kept up to date), `$axis`, `$bounce`, `$snapX`, `$snapY` (0..32767, 0: none), `$snapMax` (0..32767, 0: no
+  limit; at most that many snap steps per release, counted in the direction of the fling from the step at or behind the
+  release position, per axis with a snap step, never back against the fling, the nearest step under 20 px/s: `snapMax:
+  1` moves a carousel one card per fling), `$indicators`, `$scrollX`, `$scrollY` (read: the position last drawn, the
+  value written until it is drawn; written: a jump kept within `0..max(0, content - view)`, which stops any motion and
+  ends a drag), `$clip` always `true`, `$w`, `$h` 1..32767; `$cache` keeps the whole content as one image copied at each
+  position (composed directly when it does not fit the cache; with `slate-debug` the console says so once).
+  `touch(\Baremetal\Input\TouchEvent $e): bool`: the script forwards the touches (usually from `Scene::onTouch()`);
+  `true` when the touch is a drag of the scroll (past 8 px from the press on the axis allowed, with `Both` the distance;
+  the Released that ends it) or a catch (a press inside the view that stopped its motion, with every Moved and the
+  Released of that touch); `false` for a press outside the view, a tap, a `Gesture` and a scroll not in the scene shown.
+  The compositor runs the drag (following the finger from the threshold point), the release velocity of the last 80 ms
+  (at most 4000 px/s), the inertia (325 ms time constant), the rubber band past an edge (`d * (1 - 1 / (over * 0.55 / d
+  + 1))`, at most half the view) with a critical spring back, the snap to a step (`OutCubic`, 150 to 600 ms; the end
+  counts as a step) and the bars (3 px, 2 px from the right and bottom edges, `view² / content` long, at least 16 px;
+  shown while the content moves, then 500 ms, then faded in 200 ms), at the frame's time; a motion pauses while its
+  scene is not shown and goes on during a transition; a kept scene keeps its position. `scrollTo(int|float $x, int|float
+  $y, int $ms = 300, Ease $ease = Ease::OutCubic): Tween` (`ms` 0: a jump, the Tween done at once; a press, a write of
+  the position or a new set-up stops it without `TweenDone`). The enum `ScrollAxis` (`Both`, `Vertical`, `Horizontal`);
+  the event `ScrollEnded` (final, `Scroll $scroll`, `int $x`, `int $y`): once when the content comes to rest after a
+  release or at the end of a `scrollTo()` (after its `TweenDone`), none for a scroll freed before its motion ends (one
+  freed after its end was queued gets an event with a stand-in `Scroll`). `\ValueError` `Baremetal\Slate\Scroll::$w must
+  be between 1 and 32767` (`$h`), `...::$clip is always true`, `...::$snapX must be between 0 and 32767` (`$snapY`,
+  `$snapMax`, `$contentW`, `$contentH`), `...::$scrollX must be a finite number` (`$scrollY`, and `scrollTo()`'s `$x`,
+  `$y`), `...::$scrollX cannot be animated; use scrollTo()` (`animate()`/`ease()` of `$scrollX`, `$scrollY`,
+  `$contentW`, `$contentH`, `$snapX`, `$snapY`, `$snapMax`), `ms must be 0 or more`. A scene without a moving scroll
+  does no more work per frame, and a still screen composes no frame. Engine side: the command `SLATE_CMD_SCROLL`
+  (`slate_scroll_cmd_t`), the position published without a lock (`slate_scroll_pub_t`), `slate_engine_scroll_done`, the
+  stats `scrolls_active`, `anim_ticks` and the compositor's `scroll_nocache`; the physics in `src/scroll.h` (pure C).
+  Docs: `docs/usage/scroll.md`; IDE stub.
+- Added: the engine side of tweens (`src/tween.h`: easing curves, sampling from the elapsed time, delay, repeat,
+  yoyo, pause, chains; `src/engine.h`, Tweens: the commands `SLATE_CMD_TWEEN`, `SLATE_CMD_TWEEN_STOP`,
+  `SLATE_CMD_EASE`, the tick at the vsync time of the frame, a frame per pulse only while tweens run, tweens of a
+  scene not shown paused, the done queue `slate_engine_tween_done`, drained by the PHP layer from the tween listener
+  on the engine's task: one ext-events event per id). A scene without tweens does no more work per frame.
+  Slate takes one of the four idle hooks of ext-events, shared by the running Slate, the images, the animations and
+  the transitions.
+- Added: page transitions. `Slate::show(Scene $s, ?Transition $t = null)`: with `$t` the new scene comes in while
+  the compositor composes both scenes together. `final class Transition` (private constructor, no clone):
+  `Transition::fade(int $ms = 300, Ease $ease = Ease::OutCubic)`, `Transition::push(Direction $d, int $ms = 300,
+  Ease $ease = Ease::OutCubic)`, `Transition::cover(...)` and `Transition::uncover(...)` with the same parameters as
+  `push()` (`\ValueError` `ms must be at least 1`, `ms must be at most 2147483647`); the enum `Direction` (`Left`,
+  `Right`, `Up`, `Down`: the direction of the movement); the event `TransitionDone` (final, `Scene $from`,
+  `Scene $to`). Order: `build()` the first time and `onEnter()` of the new scene at once, `onLeave()` of the old one
+  and `TransitionDone` at the end (`onLeave()` runs from Slate's own watch of the event, before the listeners);
+  `scene()` is the new scene meanwhile; the touch reaches no scene from `show()` to the end. `show()` of the scene
+  shown (also of the one a transition goes to) does nothing; `show()` during a transition ends it first
+  (`onLeave()` of the scene it leaves at once, its `TransitionDone` follows), then the new change starts. A
+  transition from no scene (the first `show()`) comes in over the background, with no `TransitionDone`. When its
+  event is not delivered (`init-loop`, a full pool) the `onLeave()` runs at the next `show()` or `commit()`. When
+  the Slate stops during a transition neither comes. A transition that cannot start (no memory for its layers) is a
+  cut, still with its `onLeave()` and `TransitionDone`. `\RuntimeException` `Slate: cannot run a transition: the
+  table of ext-events' idle hooks is full` (or `... watches is full`: Slate takes one of the eight watches of
+  ext-events for TransitionDone, besides the four of the touch) and `Slate: out of memory for the transition`.
+  Without `$t`, `show()` is instant as before. Docs:
+  `docs/usage/scenes.md` (Transitions), `docs/usage/animations.md`; IDE stub.
+- Added: the engine side of transitions (`src/compose.h`, Transitions: `slate_pair_begin` / `slate_pair_at` /
+  `slate_pair_end`, two scene roots in layers under the screen root, each cut to its page, the top one over a curtain
+  of its background, moved by whole pixels or composed offscreen with opacity in strips of the existing scratch: no
+  new screen-sized buffer, both bands as before; caches built for their page and moved with it; the strips of a
+  group sized for what its nested groups need; `slate_compose_underlay_free()`). `src/cmd.h`: a SHOW carries a
+  `slate_trans_t` (kind, direction, ease, ms) next to the PIXELS rectangle; `slate_trans_ok()`; a bad transition
+  makes the push return `SLATE_CMD_BAD_ARG`. `src/engine.h`, Transitions: the start at the batch's time, the ticks
+  with the tweens' (the whole screen dirty only when the layers moved), the end at its time also while the panel
+  sleeps, a SHOW during a transition ending it first (a SHOW of the scene it goes to only changes the name and the
+  background), REMOVE of either scene refused and FREE ending it, the underlay off meanwhile; the done queue
+  `slate_engine_transition_done()` (the roots' ids, 64 waiting), drained from the tween listener; a transition
+  that cannot begin (no memory for its layers) is a cut that still queues its done;
+  `slate_engine_in_transition()`; `stats.transitions` and `stats.transition_dones_lost`. A scene without a
+  transition does no more work per frame.
+- Changed: a scene left keeps its caches (cached groups, shadows, blurs) for a return to it while there is room:
+  showing it again (also with a transition) builds nothing. `Slate::$keepScenes` (`int`, default 2; 0: every scene
+  left drops its caches, as in 1.1), `Slate::$keptBudget` (`?int` KB, default null: only the cache budget; 0:
+  nothing kept), `Scene::$keepCache` (protected `bool`, default true; false: dropped when the scene is left, read at
+  the `show()` that leaves it). Past `$keepScenes` or `$keptBudget` the scene left first drops its caches at once,
+  also when they are lowered. The kept caches stay in the existing cache budget in PSRAM (no internal RAM, no new
+  pool): when the scene shown or the underlay needs room there, the scenes left drop theirs first, the one left
+  first before the others. Images are outside that budget, but an image that cannot be loaded for lack of memory
+  has the scenes left drop their caches and is loaded once more (only then `no-memory`; `docs/usage/images.md`). `\ValueError` `keepScenes must be 0
+  or more`, `keptBudget must be 0 or more` (the old value stays); neither can be taken by reference or unset. IDE
+  stub and `docs/usage/scenes.md` (Returning to a scene), `docs/usage/performance.md`.
+- Added: the engine side of the kept scenes (`src/engine.h`, Kept scenes): `slate_engine_set_keep(e, scenes,
+  budget_bytes)` (applied at the next wake-up; engine default 0, as before), the SHOW's `keep` flag (`src/cmd.h`: the
+  scene it leaves may keep its caches), the list of kept roots, oldest first; the engine's `cache_alloc` takes their
+  room first, oldest first, only when that makes the block fit (in the budget or in external RAM); a SHOW of a kept
+  root or an ADD of it into a group takes it off the list, FREE of a kept root (or of an element in one) and REMOVE
+  of an element from one drop the caches under it first, an ADD into a kept scene counts the caches it brings; a
+  SHOW applied after `slate_engine_set_keep` always uses the new limits; the image loader's reclaim
+  (`slate_images_set_reclaim()` in `src/images.h`, set by the engine at start: out of memory for an image, the
+  loader sets a flag and kicks the engine, the engine drops every kept cache on its own task and answers on a
+  queue, the loader waits at most `SLATE_RECLAIM_WAIT_MS` (100 ms) and reads the file once more when something
+  was freed or no answer came; only a block the store's allocator refused asks; without an engine, with one
+  stopping, or with nothing kept, it fails at once as before; `slate_engine_stop` cuts the loader off first and
+  waits, by the clock, for a request under way before it frees anything); `stats.kept_scenes`,
+  `stats.kept_bytes`, `stats.kept_dropped`, `stats.reclaims`. No work per frame.
+- Fixed: waits that loop until another task is done now block at least `SLATE_NAP_MS` (10 ms, one tick at
+  `CONFIG_FREERTOS_HZ = 100`) per turn: with a 100 Hz tick a wait of 1 ms is 0 ticks, a busy loop that could starve
+  a lower-priority task on the same core (the esp32 SDK runs a 1 kHz tick, where 1 ms blocks). `sl_images_engine(NULL)`
+  (the stop of a Slate waiting for an image listener's kick under way) waited this way.
+- Fixed: the default cache budget is half of the largest external block within 1/16, no longer half of the power of
+  two below it. With 1 008 KB free in one block at start it was 256 KB, short of the underlay of a 360 x 360
+  screen (about 260 KB): the busy scene of `slate-stress` lost its underlay and ran at 35 frames per second
+  instead of 55. It is now 496 KB. On boards with about 1.1 to 2 MB free PSRAM in one block the default budget rises
+  too (1.9 MB gives about 930 KB, it was 512 KB): more room for the live and kept caches, less headroom for images.
+- Fixed: when the stop of a Slate fails because an image load waiting for memory did not end in time, the warning
+  says so (`Slate: the compositor did not stop cleanly (an image load waiting for memory did not end in time); its
+  memory stays`) instead of blaming the panel.
+- Changed: the compositor's task has a 10 KB stack (`SLATE_ENGINE_STACK`, it was 8 KB): a cached group with a shadow
+  built inside the offscreen layer of a fade used 6.3 KB, and deeper nesting of cached and blurred groups needs
+  more. About 2 KB more of internal RAM.
+- Fixed: a tween and a page transition of the same length started in one batch now start on the same time (the
+  batch's, the panel pulse it came with) and end on the same frame; the tween started a little later before.
+- Fixed: writing to an element of a scene that is kept but not shown no longer leaves the kept-cache count high,
+  which made the cache budget evict the kept scenes for a block that did not fit anyway.
+
 ## 1.1.0
 
 - Added: the PHP API of images. `Image` (`new Image($x, $y, $src, opacity: 1.0)`), an element that draws a `.sli`

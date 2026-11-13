@@ -1,8 +1,9 @@
 ---
 eyebrow: 'ext-slate · PHP API'
-lede:    'A Slate shows one Scene at a time; a page of the application is a class that extends Scene, with its components in build() and its actions in methods and listeners.'
+lede:    'A Slate shows one Scene at a time, at once or with a transition; a page of the application is a class that extends Scene, with its components in build() and its actions in methods and listeners.'
 see_also:
   - { href: './elements.md', meta: 'API' }
+  - { href: './animations.md', meta: 'API' }
   - { href: '../overview.md', meta: 'Overview' }
   - { href: 'package:php-baremetal/ext-input', meta: 'Extension', label: 'ext-input' }
 prev: { label: 'Overview', href: '../overview.md' }
@@ -31,16 +32,17 @@ calls it; when the board also has a `touch` block and one touch driver with `onb
 several drivers of the same kind with `onboard()`: `\LogicException`, and the Slate is built by hand with
 `new Slate($display, $touch)`.
 
-<!-- @method name="Slate::show(Scene $s): void" returns="void" -->
+<!-- @method name="Slate::show(Scene $s, ?Transition $t = null): void" returns="void" -->
 
-Shows `$s`: `onLeave()` of the scene shown until now, `build()` the first time `$s` is shown, then
-`onEnter()`. The switch is immediate and is handed to the compositor at once, with what `onEnter()` changed.
-Showing the scene already shown does nothing more than hand over the pending changes. If `build()` throws, the
-scene is emptied and built again by the next `show()`, and the scene shown until now stays on screen.
+Shows `$s`. Without `$t` the switch is immediate: `onLeave()` of the scene shown until now, `build()` the first
+time `$s` is shown, then `onEnter()`. With `$t` the new scene slides or fades in (see
+[Transitions](#transitions)). Either way the change is handed to the compositor at once, with what `onEnter()`
+changed. Showing the scene already shown does nothing more than hand over the pending changes. If `build()`
+throws, the scene is emptied and built again by the next `show()`, and the scene shown until now stays on screen.
 
 <!-- @method name="Slate::scene(): ?Scene" returns="?Scene" -->
 
-The scene shown now, `null` before the first `show()`.
+The scene shown now, `null` before the first `show()`. During a transition, the scene it goes to.
 
 <!-- @method name="Slate::commit(): void" returns="void" -->
 
@@ -68,8 +70,8 @@ Takes elements out; they stay usable and can be added again, here or elsewhere.
 | Method | Called |
 | --- | --- |
 | `protected build(): void` | Once, by the first `show()` of the scene, before `onEnter()`: add the components here. |
-| `onEnter(): void` | Each time the scene is shown. |
-| `onLeave(): void` | When another scene replaces it. |
+| `onEnter(): void` | Each time the scene is shown; with a transition, when it starts. |
+| `onLeave(): void` | When another scene replaces it; with a transition, when it ends. |
 | `onTouch(TouchEvent $e): void` | For each `Pressed`, `Moved`, `Released` and `Gesture` of the Slate's touch device while the scene is shown. |
 
 All four are empty in `Scene`. A scene can also be built without a class:
@@ -135,12 +137,129 @@ $slate->show($home);
 ```
 <!-- @endcode-block -->
 
+## Transitions
+
+<!-- @code-block language="php" label="Transitions" -->
+```php
+<?php
+use Baremetal\Events;
+use Baremetal\Slate\{Transition, Direction, TransitionDone, Ease};
+
+$slate->show($menu, Transition::push(Direction::Left));                    // forward
+$slate->show($home, Transition::push(Direction::Right));                   // back
+$slate->show($panel, Transition::cover(Direction::Up, ms: 250));           // a panel slides up over the page
+$slate->show($home, Transition::uncover(Direction::Down));                 // and slides away again
+$slate->show($splash, Transition::fade(ms: 400, ease: Ease::InOutCubic));
+$slate->show($home);                                                        // at once
+
+Events::listen(TransitionDone::class, function (TransitionDone $e) {
+    echo get_class($e->from), ' -> ', get_class($e->to), "\n";
+});
+```
+<!-- @endcode-block -->
+
+<!-- @method name="Transition::fade(int $ms = 300, Ease $ease = Ease::OutCubic): Transition" returns="Transition" -->
+
+The new scene appears over the old one, its opacity going from 0 to 1.
+
+<!-- @method name="Transition::push(Direction $d, int $ms = 300, Ease $ease = Ease::OutCubic): Transition" returns="Transition" -->
+
+The new scene comes in from the side opposite to `$d` and pushes the old one out towards `$d`:
+`Direction::Left` is the usual "forward", `Direction::Right` "back".
+
+<!-- @method name="Transition::cover(Direction $d, int $ms = 300, Ease $ease = Ease::OutCubic): Transition" returns="Transition" -->
+
+The new scene slides in towards `$d` over the old one, which stays still.
+
+<!-- @method name="Transition::uncover(Direction $d, int $ms = 300, Ease $ease = Ease::OutCubic): Transition" returns="Transition" -->
+
+The old scene slides away towards `$d` and uncovers the new one, which stays still.
+
+`Direction` is an enum: `Left`, `Right`, `Up`, `Down`, the direction of the movement. `$ease` is one of the
+[easing curves](./animations.md) of the animations. A `Transition` is a value: keep one and pass it to as many
+`show()` calls as you like. `$ms` below 1 throws `\ValueError` `ms must be at least 1`, above 2147483647
+`ms must be at most 2147483647`.
+
+What happens, in order:
+
+1. `show($b, $t)`: `build()` of `$b` the first time, then `onEnter()` of `$b` at once: its elements are ready and
+   its tweens start with the transition. `scene()` is `$b` from now on.
+2. For `$ms` milliseconds the compositor composes both scenes together, band by band, at the pace of the panel.
+   The tweens of both scenes run. The touch of the Slate reaches neither scene: a touch during a transition is
+   lost.
+3. At the end: `onLeave()` of the old scene, then the event `TransitionDone` with `$from` (the old scene) and
+   `$to` (the new one), a final class that extends `Baremetal\Event`, delivered after the return to the event
+   loop. The old scene's tweens wait, as for any scene that is not shown.
+
+- `show()` of the scene shown, or of the one a transition goes to, does nothing.
+- `show()` during a transition ends it first: `onLeave()` of the scene it leaves runs at once, its
+  `TransitionDone` follows; then the new change starts from the scene the first one went to, whole. Going back to
+  the scene being left is fine: `onLeave()` runs for it, then `onEnter()` again.
+- The first `show()` with a transition (no scene shown before) brings the scene in over the black background.
+  Nothing is left, so no `TransitionDone` comes.
+- In `init-loop`, which delivers no events, there is no `TransitionDone`, and the `onLeave()` of the old scene
+  runs at the next `show()` or `commit()` after the end: a `$slate->commit()` in `loop()` runs it promptly. The
+  same happens in `event-driven` when the event pool of ext-events is full.
+- When the Slate stops during a transition (`unset($slate)`), neither `onLeave()` nor `TransitionDone` comes.
+- When memory is too short for the transition's layers, the change is a cut (at once), still followed by
+  `onLeave()` and `TransitionDone`.
+
+| Thrown by `show()` with a transition | When |
+| --- | --- |
+| `\RuntimeException` `Slate: cannot run a transition: the table of ext-events' idle hooks is full` | Other extensions took the four idle hooks ext-events keeps (Slate uses one, shared by all its parts). |
+| `\RuntimeException` `Slate: cannot run a transition: the table of ext-events' watches is full` | Other extensions took the eight watches ext-events keeps (Slate uses up to five: four for the touch, one for `TransitionDone`). |
+| `\RuntimeException` `Slate: out of memory for the transition` | No memory for the few bytes that carry its end. Nothing changed. |
+
+A frame during a transition costs about as much as the two scenes together, and the whole screen is sent at
+each refresh while the scenes move. The cached groups of both scenes are used and move with their scene. See
+[Performance](./performance.md).
+
+## Returning to a scene
+
+A scene left keeps its caches (cached groups, shadows, blurs) while there is room, so showing it again, with or
+without a transition, draws it from those images at once instead of building them again.
+
+<!-- @code-block language="php" label="Kept caches" -->
+```php
+$slate->keepScenes = 2;     // scenes left that keep their caches (default 2; 0: none)
+$slate->keptBudget = null;  // a limit in KB for those caches (default null: only the cache budget)
+
+final class Splash extends Scene
+{
+    protected bool $keepCache = false;   // shown once: its caches go when it is left
+}
+```
+<!-- @endcode-block -->
+
+| Property | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `Slate::$keepScenes` | `int` | `2` | How many scenes left keep their caches. Past it, the scene left first drops them. `0`: every scene left drops its caches, as in 1.1. |
+| `Slate::$keptBudget` | `?int` | `null` | A limit in KB for the caches of the scenes left; past it, the scene left first drops them. `null`: no limit of its own (only the cache budget); `0`: nothing is kept. |
+| `Scene::$keepCache` | `bool` (protected) | `true` | `false`: the scene drops its caches when it is left. Read when the scene is left. |
+
+- The kept caches stay where they are: in Slate's cache budget, in external RAM (PSRAM). They take no internal
+  RAM and no memory beyond that budget.
+- When the scene shown, or the underlay, needs room in the budget, the scenes left drop their caches first, the
+  one left first before the others: a kept cache never takes room from the scene on the screen.
+- Images are not part of the budget, but when an image cannot be loaded for lack of memory, the scenes left drop
+  their caches and the image is loaded once more; only then does it fail with `no-memory`.
+- Lowering `$keepScenes` or `$keptBudget` drops the extra caches at once.
+- A scene whose caches were dropped builds them again at its first frame, as before.
+
+| Thrown by a write | When |
+| --- | --- |
+| `\ValueError` `keepScenes must be 0 or more` | A negative `$keepScenes`; the old value stays. |
+| `\ValueError` `keptBudget must be 0 or more` | A negative `$keptBudget`; the old value stays. |
+
+Like the elements' properties, they cannot be taken by reference or unset (`\Error`).
+
 ## Touch
 
 Slate forwards the touch events of its `Touch` to `onTouch()` of the scene shown when the event is delivered;
 the other scenes get nothing. The events come from the event bus of ext-events, so they arrive in the
 `event-driven` runtime (in `init-loop` source events are not delivered). Listeners of the same classes
-registered with `Events::listen()` still get them, after the scene.
+registered with `Events::listen()` still get them, after the scene. During a transition no scene gets them
+(the listeners still do).
 
 <!-- @callout variant="note" -->
 This part of Slate passes the event as it is; finding which element was touched is up to the scene (compare

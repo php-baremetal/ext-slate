@@ -18,6 +18,7 @@ typedef struct batch {
     size_t n, cap;
     uint8_t *bytes;             /* payloads; pointers in cmds are offsets + 1 until the batch is taken */
     size_t used, bcap;
+    bool resolved;              /* taken: the pointers in cmds point into bytes */
 } batch_t;
 
 struct slate_cmdbuf {
@@ -34,15 +35,20 @@ static void *mem(size_t n)
     return bm_hal_alloc(n, BM_HAL_MEM_EXTERNAL);
 }
 
-/* The image references the batch's commands hold (taken at push), given back. */
+/* The image and scroll pub references the batch's commands hold (taken at push), given back. */
 static void drop_images(batch_t *bt)
 {
     for (size_t i = 0; i < bt->n; i++) {
-        if (bt->cmds[i].kind == SLATE_CMD_SET && bt->cmds[i].v.type == SLATE_VAL_IMAGE) {
-            slate_image_put(bt->cmds[i].v.v.image);
+        const slate_cmd_t *c = &bt->cmds[i];
+        if (c->kind == SLATE_CMD_SET && c->v.type == SLATE_VAL_IMAGE) {
+            slate_image_put(c->v.v.image);
+        } else if (c->kind == SLATE_CMD_SCROLL && c->data) {
+            const slate_scroll_cmd_t *sc = bt->resolved ? c->data : (const void *)(bt->bytes + ((uintptr_t)c->data - 1));
+            slate_scroll_pub_put(sc->pub);
         }
     }
     bt->n = 0;
+    bt->resolved = false;
 }
 
 static void batch_free(batch_t *bt)
@@ -150,17 +156,55 @@ static size_t pixels_bytes(const slate_cmd_t *c)
     return n <= SLATE_CMD_PIXELS_MAX ? n : 0;
 }
 
+/* The bytes of a TWEEN's or EASE's spec (a TWEEN: up to its last property) or of a SCROLL's data; 0 when the command
+   is not acceptable. */
+static size_t spec_bytes(const slate_cmd_t *c)
+{
+    if (!c->data) {
+        return 0;
+    }
+    if (c->kind == SLATE_CMD_EASE) {
+        return sizeof(slate_ease_spec_t);
+    }
+    if (c->kind == SLATE_CMD_SCROLL) {
+        const slate_scroll_cmd_t *s = c->data;
+        bool ok = s->op < SLATE_SCROLL_OP_COUNT && (s->op != SLATE_SCROLL_OP_CONFIG || s->axis <= SLATE_SCROLL_H);
+        return ok ? sizeof(slate_scroll_cmd_t) : 0;
+    }
+    const slate_tween_spec_t *t = c->data;
+    if (t->n < 1 || t->n > SLATE_TWEEN_PROPS_MAX) {
+        return 0;
+    }
+    return offsetof(slate_tween_spec_t, props) + t->n * sizeof(slate_tween_prop_t);
+}
+
+bool slate_trans_ok(const slate_trans_t *t)
+{
+    if (t->kind == SLATE_TRANS_NONE) {
+        return true;
+    }
+    return t->kind < SLATE_TRANS_COUNT && (t->kind == SLATE_TRANS_FADE || t->dir < SLATE_DIR_COUNT) &&
+           t->ease < SLATE_EASE_COUNT && t->ms >= 1;
+}
+
 slate_cmd_result_t slate_cmd_push(slate_cmdbuf_t *b, const slate_cmd_t *c)
 {
     if (c->kind == SLATE_CMD_PIXELS && pixels_bytes(c) == 0) {
         return SLATE_CMD_BAD_PIXELS;
+    }
+    bool spec = c->kind == SLATE_CMD_TWEEN || c->kind == SLATE_CMD_EASE || c->kind == SLATE_CMD_SCROLL;
+    if (spec && spec_bytes(c) == 0) {
+        return SLATE_CMD_BAD_ARG;
+    }
+    if (c->kind == SLATE_CMD_SHOW && !slate_trans_ok(&c->tr)) {
+        return SLATE_CMD_BAD_ARG;
     }
     if (!b->pending && !(b->pending = batch_new())) {
         return SLATE_CMD_NO_MEM;
     }
     batch_t *bt = b->pending;
     /* What it points to, measured first: nothing is appended unless all of it fits. */
-    size_t text = 0, data = 0, grad = 0;
+    size_t text = 0, data = 0, grad = 0, phys = 0;
     int ns = 0;
     if (c->kind == SLATE_CMD_SET && c->v.type == SLATE_VAL_TEXT && c->v.v.text) {
         text = strlen(c->v.v.text) + 1;
@@ -169,19 +213,24 @@ slate_cmd_result_t slate_cmd_push(slate_cmdbuf_t *b, const slate_cmd_t *c)
         ns = c->v.v.paint.grad->ns > 0 && c->v.v.paint.grad->stops ? c->v.v.paint.grad->ns : 0;
         grad = align8(sizeof(slate_paint_grad_t)) + align8((size_t)ns * sizeof(slate_stop_t));
     }
+    if (c->kind == SLATE_CMD_SET && c->v.type == SLATE_VAL_SCROLL && c->v.v.scroll) {
+        phys = sizeof(slate_scroll_t);
+    }
     if (c->kind == SLATE_CMD_SHOW && c->data) {
         data = strlen(c->data) + 1;
     } else if (c->kind == SLATE_CMD_PIXELS) {
         data = pixels_bytes(c);
+    } else if (spec) {
+        data = spec_bytes(c);
     }
-    size_t need = bt->used + align8(text) + grad + align8(data);
+    size_t need = bt->used + align8(text) + grad + align8(phys) + align8(data);
     if (!grow((void **)&bt->cmds, &bt->cap, bt->n + 1, sizeof(slate_cmd_t), CMDS_MIN)
         || !grow((void **)&bt->bytes, &bt->bcap, need, 1, BYTES_MIN)) {
         return SLATE_CMD_NO_MEM;
     }
     slate_cmd_t *d = &bt->cmds[bt->n++];
     *d = *c;
-    if (c->kind != SLATE_CMD_SHOW && c->kind != SLATE_CMD_PIXELS) {
+    if (c->kind != SLATE_CMD_SHOW && c->kind != SLATE_CMD_PIXELS && !spec) {
         d->data = NULL;
     }
     if (text) {
@@ -196,12 +245,18 @@ slate_cmd_result_t slate_cmd_push(slate_cmdbuf_t *b, const slate_cmd_t *c)
         memcpy(bt->bytes + goff, &g, sizeof g);
         d->v.v.paint.grad = (const void *)(uintptr_t)(goff + 1);
     }
+    if (phys) {
+        d->v.v.scroll = put(bt, c->v.v.scroll, phys);
+    }
     if (c->kind == SLATE_CMD_SET && c->v.type == SLATE_VAL_IMAGE) {
         slate_image_ref(c->v.v.image);   /* the image lives while the command does */
     }
+    if (c->kind == SLATE_CMD_SCROLL) {
+        slate_scroll_pub_ref(((const slate_scroll_cmd_t *)c->data)->pub);   /* likewise its pub */
+    }
     if (data) {
         d->data = put(bt, c->data, data);
-    } else if (d->kind == SLATE_CMD_SHOW || d->kind == SLATE_CMD_PIXELS) {
+    } else if (d->kind == SLATE_CMD_SHOW || d->kind == SLATE_CMD_PIXELS || spec) {
         d->data = NULL;
     }
     return SLATE_CMD_OK;
@@ -273,9 +328,12 @@ size_t slate_cmd_take(slate_cmdbuf_t *b, const slate_cmd_t **out)
             slate_paint_grad_t *g = (slate_paint_grad_t *)resolve(bt, c->v.v.paint.grad);
             g->stops = resolve(bt, g->stops);
             c->v.v.paint.grad = g;
+        } else if (c->kind == SLATE_CMD_SET && c->v.type == SLATE_VAL_SCROLL) {
+            c->v.v.scroll = resolve(bt, c->v.v.scroll);
         }
         c->data = resolve(bt, c->data);
     }
+    bt->resolved = true;
     b->taken = bt;
     *out = bt->cmds;
     return bt->n;
@@ -312,4 +370,48 @@ void slate_cmd_release(slate_cmdbuf_t *b)
     if (!kept) {
         batch_free(bt);
     }
+}
+
+/* ---- scroll pubs ---- */
+
+slate_scroll_pub_t *slate_scroll_pub_new(void)
+{
+    /* internal RAM: atomics do not work in PSRAM on every chip */
+    slate_scroll_pub_t *p = bm_hal_alloc(sizeof *p, BM_HAL_MEM_INTERNAL);
+    if (p) {
+        memset(p, 0, sizeof *p);
+        __atomic_store_n(&p->refs, 1, __ATOMIC_SEQ_CST);
+    }
+    return p;
+}
+
+void slate_scroll_pub_ref(slate_scroll_pub_t *p)
+{
+    if (p) {
+        __atomic_add_fetch(&p->refs, 1, __ATOMIC_SEQ_CST);
+    }
+}
+
+void slate_scroll_pub_put(slate_scroll_pub_t *p)
+{
+    if (p && __atomic_sub_fetch(&p->refs, 1, __ATOMIC_SEQ_CST) == 0) {
+        bm_hal_free(p);
+    }
+}
+
+void slate_scroll_pub_pos(const slate_scroll_pub_t *p, int *x, int *y)
+{
+    uint32_t w = __atomic_load_n(&p->pos, __ATOMIC_SEQ_CST);
+    *x = (int16_t)(uint16_t)(w & 0xFFFFu);
+    *y = (int16_t)(uint16_t)(w >> 16);
+}
+
+bool slate_scroll_pub_moving(const slate_scroll_pub_t *p)
+{
+    return __atomic_load_n(&p->moving, __ATOMIC_SEQ_CST) != 0;
+}
+
+uint32_t slate_scroll_pub_seq(const slate_scroll_pub_t *p)
+{
+    return __atomic_load_n(&p->seq, __ATOMIC_SEQ_CST);
 }

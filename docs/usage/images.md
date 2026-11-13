@@ -7,7 +7,7 @@ see_also:
   - { href: './effects-and-options.md', meta: 'API' }
   - { href: 'package:php-baremetal/ext-events', meta: 'Extension', label: 'ext-events' }
 prev: { label: 'Elements', href: './elements.md' }
-next: { label: 'Effects and build options', href: './effects-and-options.md' }
+next: { label: 'Animations', href: './animations.md' }
 ---
 
 # Images
@@ -209,6 +209,9 @@ mounted later, then loads.
   PNG files with phpbm instead of decoding them on the board. For example, an opaque 1024 x 600 background is a
   `.sli` of about 1.2 MB: on a board with 32 MB of PSRAM, a reserve of 3072 KB leaves it room next to the caches
   (see the excerpt after this list).
+- When an image cannot be loaded for lack of memory (reading a `.sli`, decoding a PNG), the caches the scenes left
+  keep (see [Returning to a scene](./scenes.md#returning-to-a-scene)) are dropped and the image is loaded once
+  more; only then does it fail with `no-memory`. The loader asks the compositor for it and waits at most 100 ms.
 - Images are loaded one at a time, in the order they were asked for, by a task of low priority that exists only
   while there is something to load (6 KB of stack); PHP and the compositor go on meanwhile.
 - A PNG is decoded row by row straight into a `.sli`: never the whole image as pixels, but at the end of the

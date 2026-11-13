@@ -47,6 +47,7 @@
 
 #include "bm_events_hal.h"
 #include "event_bus_php.h"
+#include "halpool.h"
 #include "images.h"
 #include "php_slate.h"
 #include "slate_config.h"
@@ -165,7 +166,9 @@ void sl_images_engine(slate_engine_t *e)
     __atomic_store_n(&s_kick_engine, e, __ATOMIC_SEQ_CST);
     while (!e && __atomic_load_n(&s_kick_users, __ATOMIC_SEQ_CST) > 0) {
         uint8_t t;
-        bm_hal_queue_receive(s_wake, &t, 1);   /* lets a listener of a lower priority finish its kick */
+        /* lets a listener of a lower priority finish its kick: a real block (1 ms would be 0 ticks at 100 Hz, a
+           busy loop that starves it on the same core) */
+        bm_hal_queue_receive(s_wake, &t, SLATE_NAP_MS);
     }
 }
 
@@ -290,10 +293,9 @@ static void drop(sl_done_t *n)
     bm_hal_free(n);
 }
 
-/* Back in the event loop (plain C): the finished images whose events are gone undelivered. */
-static void idle(void *arg)
+/* Back in the event loop (plain C, from Slate's idle hook): the finished images whose events are gone undelivered. */
+void sl_images_idle(void)
 {
-    (void)arg;
     if (!s_ready) {
         return;
     }
@@ -496,8 +498,8 @@ static bool ready(void)
         s_tag[i] = tags[i];
         bm_events_set_filler(tags[i], s_fillers[i]);
     }
-    if (!bm_events_on_idle(idle, NULL)) {
-        /* ext-events keeps 4 hooks; Slate takes 2 (this one and the running Slate's) */
+    if (!sl_idle_use(SL_IDLE_IMAGES, true)) {
+        /* ext-events keeps 4 hooks; Slate takes 1 for the running Slate, the images and the animations */
         for (int i = 0; i < EV_N; i++) {
             bm_events_set_filler(tags[i], NULL);
         }
@@ -521,7 +523,7 @@ void sl_images_rshutdown(void)
         return;
     }
     s_ready = false;
-    bm_events_off_idle(idle, NULL);
+    sl_idle_use(SL_IDLE_IMAGES, false);
     bm_hal_lock_t *l = lock();
     s_accepting = false;
     sl_done_t *list = s_head;

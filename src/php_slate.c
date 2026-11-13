@@ -14,7 +14,8 @@
 /*
  * The module `slate` and Baremetal\Slate\Slate: the object that takes a display's panel (display_claim()), starts
  * the compositor task (engine.h) on its band path, paces it on the TE pulses (display_vsync_hook()) when the
- * panel has them, shows one Scene at a time and forwards the touch events of its Touch device to that scene.
+ * panel has them, shows one Scene at a time (at once, or with a transition: php_slate_anim.c, transitions) and
+ * forwards the touch events of its Touch device to that scene (none during a transition).
  *
  * Delivery. The commands of the PHP task are handed to the compositor when the PHP task returns to the event loop
  * (bm_events_on_idle() of ext-events: after each delivered event in the event-driven runtime, after each loop()
@@ -22,7 +23,13 @@
  *
  * One Slate at a time: the compositor and its rasterizers are not reentrant (engine.h). A second Slate, on any
  * panel, throws \LogicException while the first one lives.
+ *
+ * Kept scenes. $keepScenes (int >= 0, default 2) and $keptBudget (?int KB, default null) are the limits of the
+ * caches the scenes left keep (engine.h, Kept scenes: slate_engine_set_keep, at start and at every write); a scene
+ * left keeps them unless its Scene::$keepCache is false (read at the show() that leaves it: the SHOW's keep).
  */
+#include <limits.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "php.h"
@@ -57,6 +64,36 @@ typedef struct {
 static sl_slate_t *slate_of(zend_object *o)
 {
     return (sl_slate_t *)((char *)o - XtOffsetOf(sl_slate_t, std));
+}
+
+static zend_property_info *s_keep_pi, *s_budget_pi;   /* Slate::$keepScenes, Slate::$keptBudget */
+
+/* The limits of the kept scenes to the engine: $keepScenes, and $keptBudget in bytes (null: none of its own; 0 KB:
+   nothing kept). */
+static void sl_keep_apply(sl_slate_t *s)
+{
+    if (!s->engine) {
+        return;
+    }
+    zval *k = OBJ_PROP(&s->std, s_keep_pi->offset), *b = OBJ_PROP(&s->std, s_budget_pi->offset);
+    zend_long scenes = Z_TYPE_P(k) == IS_LONG ? Z_LVAL_P(k) : 2;
+    size_t bytes = 0;
+    if (Z_TYPE_P(b) == IS_LONG) {
+        zend_ulong kb = (zend_ulong)Z_LVAL_P(b);
+        if (kb == 0) {
+            scenes = 0;
+        }
+        bytes = kb > SIZE_MAX / 1024 ? SIZE_MAX : (size_t)kb * 1024;
+    }
+    slate_engine_set_keep(s->engine, scenes > INT_MAX ? INT_MAX : (int)scenes, bytes);
+}
+
+/* Scene::$keepCache of scene (true unless it is false). */
+static bool scene_keeps(zend_object *scene)
+{
+    zval rv;
+    zval *v = zend_read_property(sl_scene_ce, scene, "keepCache", sizeof("keepCache") - 1, 1, &rv);
+    return !v || Z_TYPE_P(v) != IS_FALSE;
 }
 
 /* The engine the TE hook wakes: set once it runs, cleared before it stops (the hook is removed first). */
@@ -95,6 +132,10 @@ bool sl_push(const slate_cmd_t *c)
         zend_throw_exception(spl_ce_RuntimeException,
                              "Slate: the canvas pixels were refused (an empty rectangle, or more than 2 MB)", 0);
         return false;
+    case SLATE_CMD_BAD_ARG:   /* a TWEEN or EASE without its spec, a SHOW with a bad transition: the PHP layer sends
+                                 them whole and checked */
+        zend_throw_exception(spl_ce_RuntimeException, "Slate: an animation command was refused", 0);
+        return false;
     }
     return false;
 }
@@ -130,13 +171,40 @@ static void sl_panel(void *arg, display_panel_event_t event)
     }
 }
 
-/* Back in the event loop (bm_events_on_idle()): the batch of the listener that just returned goes. Plain C. */
+/* Back in the event loop (bm_events_on_idle()): the batch of the listener that just returned goes; the images, the
+   animations and the transitions catch up their lost events. Plain C. One hook for all of Slate's users (ext-events keeps 4). */
+static unsigned s_idle_users;
+
 static void sl_idle(void *arg)
 {
     (void)arg;
-    if (sl_g.engine) {
-        slate_engine_deliver(sl_g.engine);
+    unsigned u = s_idle_users;
+    if ((u & SL_IDLE_SLATE) && sl_g.engine) {
+        sl_deliver();
     }
+    if (u & SL_IDLE_IMAGES) {
+        sl_images_idle();
+    }
+    if (u & SL_IDLE_ANIM) {
+        sl_anim_idle();
+    }
+    if (u & SL_IDLE_TRANS) {
+        sl_trans_idle();
+    }
+}
+
+bool sl_idle_use(unsigned user, bool on)
+{
+    unsigned was = s_idle_users;
+    unsigned now = on ? was | user : was & ~user;
+    if (!was && now && !bm_events_on_idle(sl_idle, NULL)) {
+        return false;
+    }
+    s_idle_users = now;
+    if (was && !now) {
+        bm_events_off_idle(sl_idle, NULL);
+    }
+    return true;
 }
 
 static void call0(zend_object *obj, const char *lcname)
@@ -147,11 +215,12 @@ static void call0(zend_object *obj, const char *lcname)
     }
 }
 
-/* A touch event of the bus: the active scene's onTouch(), when the event comes from this Slate's Touch. */
+/* A touch event of the bus: the active scene's onTouch(), when the event comes from this Slate's Touch; none
+   while a transition runs (from its show() to its end). */
 static void sl_touch(zend_object *event, void *arg)
 {
     sl_slate_t *s = arg;
-    if (!s->engine || !s->scene || !s->touch) {
+    if (!s->engine || !s->scene || !s->touch || sl_trans_running()) {
         return;
     }
     zval rv;
@@ -185,7 +254,7 @@ static void sl_stop(sl_slate_t *s)
                 s->touch_ce[i] = NULL;
             }
         }
-        bm_events_off_idle(sl_idle, NULL);
+        sl_idle_use(SL_IDLE_SLATE, false);
         if (s->hook) {
             display_vsync_hook(s->display, NULL, NULL);   /* before the stop: no pulse uses the engine after */
             s->hook = false;
@@ -193,14 +262,16 @@ static void sl_stop(sl_slate_t *s)
         __atomic_store_n(&s_vsync_engine, NULL, __ATOMIC_RELEASE);
         sl_images_engine(NULL);   /* no image listener kicks the engine after */
         slate_engine_t *e = s->engine;
-        const char *err = slate_engine_error(e);
         s->engine = NULL;
         sl_g.engine = NULL;
         sl_g.slate = NULL;
         if (!slate_engine_stop(e)) {
+            /* read after the stop, which gives the reason it failed; e is not freed when it returns false */
+            const char *err = slate_engine_error(e);
             php_error_docref(NULL, E_WARNING, "Slate: the compositor did not stop cleanly (%s); its memory stays",
                              err ? err : "the panel did not finish a band");
         }
+        sl_anim_engine(NULL);   /* after the stop: the listener ran on the engine's task; no tween will end */
         display_release(s->display);
     }
     zend_object *o;
@@ -266,6 +337,7 @@ static bool sl_start(sl_slate_t *s, zend_object *display, zend_object *touch)
     }
     __atomic_store_n(&s_vsync_engine, e, __ATOMIC_RELEASE);
     sl_images_engine(e);   /* an image that finishes loading wakes it */
+    sl_anim_engine(e);     /* the tween listener (set at MINIT, copied by the start) drains its dones */
     GC_ADDREF(display);
     s->display = display;
     s->engine = e;
@@ -275,7 +347,8 @@ static bool sl_start(sl_slate_t *s, zend_object *display, zend_object *touch)
     if (++sl_g.gen == 0) {
         sl_g.gen = 1;
     }
-    bm_events_on_idle(sl_idle, NULL);
+    sl_idle_use(SL_IDLE_SLATE, true);
+    sl_keep_apply(s);
     if (touch) {
         GC_ADDREF(touch);
         s->touch = touch;
@@ -300,6 +373,11 @@ static bool sl_start(sl_slate_t *s, zend_object *display, zend_object *touch)
         }
     }
     return true;
+}
+
+zend_object *sl_shown_scene(void)
+{
+    return sl_g.slate ? slate_of(sl_g.slate)->scene : NULL;
 }
 
 static sl_slate_t *running(zval *this_ptr)
@@ -463,25 +541,43 @@ PHP_METHOD(SlateSlate, onboard)
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_slate_show, 0, 1, IS_VOID, 0)
     ZEND_ARG_OBJ_INFO(0, s, Baremetal\\Slate\\Scene, 0)
+    ZEND_ARG_OBJ_INFO_WITH_DEFAULT_VALUE(0, t, Baremetal\\Slate\\Transition, 1, "null")
 ZEND_END_ARG_INFO()
 
-/* show(): onLeave() of the scene shown until now, build() the first time, onEnter(); the change is delivered at
-   once (with what onEnter() did). */
+/* show(): nothing for the scene shown (also the one a running transition goes to). A running transition ends first:
+   onLeave() of the scene it leaves now (its TransitionDone follows). Without a transition: onLeave() of the scene
+   shown until now, build() the first time, onEnter(). With one: build() the first time, onEnter() at once, and at
+   its end onLeave() of the scene left and TransitionDone (sl_trans_*). The change is delivered at once (with what
+   onEnter() did). */
 PHP_METHOD(SlateSlate, show)
 {
-    zend_object *scene;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
+    zend_object *scene, *tobj = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_OBJ_OF_CLASS(scene, sl_scene_ce)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_OBJ_OF_CLASS_OR_NULL(tobj, sl_transition_ce)
     ZEND_PARSE_PARAMETERS_END();
     sl_slate_t *s = running(ZEND_THIS);
     if (!s || !sl_check()) {
         RETURN_THROWS();
     }
+    sl_anim_flush();
+    if (!sl_trans_settle() || !s->engine) {
+        RETURN_THROWS();
+    }
     if (s->scene == scene) {
-        slate_engine_deliver(s->engine);
+        sl_deliver();
         return;
     }
-    if (s->scene) {
+    slate_trans_t tr;
+    bool trans = sl_transition_of(tobj, &tr);
+    if (trans && (!sl_trans_ready() || !sl_trans_reserve())) {
+        RETURN_THROWS();
+    }
+    if (!sl_trans_leave() || !s->engine) {
+        RETURN_THROWS();
+    }
+    if (s->scene && !trans) {
         call0(s->scene, "onleave");
         if (EG(exception) || !s->engine) {
             RETURN_THROWS();
@@ -493,7 +589,7 @@ PHP_METHOD(SlateSlate, show)
         call0(scene, "build");
         if (EG(exception) || !s->engine) {
             /* a build() that failed: the scene is emptied and built again by the next show(); the scene shown
-               until now stays (its onLeave() already ran) */
+               until now stays (without a transition its onLeave() already ran) */
             so->built = false;
             zval *zv;
             ZEND_HASH_FOREACH_VAL(&so->children, zv) {
@@ -507,11 +603,14 @@ PHP_METHOD(SlateSlate, show)
         RETURN_THROWS();
     }
     slate_cmd_t c = { .kind = SLATE_CMD_SHOW, .id = so->id, .data = sl_short_name(scene->ce),
-                      .v = slate_v_color(0xFF000000u) };
+                      .v = slate_v_color(0xFF000000u), .tr = tr, .keep = s->scene && scene_keeps(s->scene) };
     if (!sl_push(&c)) {
         RETURN_THROWS();
     }
     zend_object *old = s->scene;
+    if (trans) {
+        sl_trans_add(old, scene);   /* onLeave() of old at its end */
+    }
     GC_ADDREF(scene);
     s->scene = scene;
     if (old) {
@@ -519,7 +618,7 @@ PHP_METHOD(SlateSlate, show)
     }
     call0(scene, "onenter");
     if (s->engine) {
-        slate_engine_deliver(s->engine);
+        sl_deliver();
     }
     if (EG(exception)) {
         RETURN_THROWS();
@@ -550,7 +649,13 @@ PHP_METHOD(SlateSlate, commit)
     if (!s || !sl_check()) {
         RETURN_THROWS();
     }
-    slate_engine_deliver(s->engine);
+    sl_anim_flush();
+    if (!sl_trans_settle()) {
+        RETURN_THROWS();
+    }
+    if (s->engine) {   /* an onLeave() may have dropped the Slate */
+        sl_deliver();
+    }
 }
 
 static const zend_function_entry slate_methods[] = {
@@ -595,7 +700,63 @@ static HashTable *slate_gc(zend_object *obj, zval **table, int *n)
         }
     }
     zend_get_gc_buffer_use(buf, table, n);
-    return obj->properties;   /* Slate declares no property: only dynamic ones, when any */
+    return zend_std_get_properties(obj);   /* $keepScenes, $keptBudget (no object in them) and dynamic ones */
+}
+
+/* $keepScenes and $keptBudget: PHP's typed write, then the range (the old value back on a refusal), then the engine.
+   No cache slot: every write comes here. */
+static zval *slate_write_property(zend_object *obj, zend_string *name, zval *value, void **cache_slot)
+{
+    bool scenes = zend_string_equals(name, s_keep_pi->name);
+    if (!scenes && !zend_string_equals(name, s_budget_pi->name)) {
+        return zend_std_write_property(obj, name, value, cache_slot);
+    }
+    zval *slot = OBJ_PROP(obj, (scenes ? s_keep_pi : s_budget_pi)->offset);
+    zval old;
+    ZVAL_COPY_VALUE(&old, slot);   /* an int or null */
+    zend_std_write_property(obj, name, value, NULL);
+    if (EG(exception)) {
+        return &EG(error_zval);
+    }
+    if (Z_TYPE_P(slot) == IS_LONG && Z_LVAL_P(slot) < 0) {
+        ZVAL_COPY_VALUE(slot, &old);
+        zend_value_error("%s must be 0 or more", scenes ? "keepScenes" : "keptBudget");
+        return &EG(error_zval);
+    }
+    sl_keep_apply(slate_of(obj));
+    return slot;
+}
+
+static bool slate_own(zend_string *name)
+{
+    return zend_string_equals(name, s_keep_pi->name) || zend_string_equals(name, s_budget_pi->name);
+}
+
+/* No reference to them (it would change them without the check and without reaching the engine). */
+static zval *slate_read_property(zend_object *obj, zend_string *name, int type, void **cache_slot, zval *rv)
+{
+    if (type != BP_VAR_R && type != BP_VAR_IS && slate_own(name)) {
+        zend_throw_error(NULL, "Cannot take a reference to %s::$%s", ZSTR_VAL(obj->ce->name), ZSTR_VAL(name));
+        return &EG(uninitialized_zval);
+    }
+    return zend_std_read_property(obj, name, type, cache_slot, rv);
+}
+
+static zval *slate_get_property_ptr_ptr(zend_object *obj, zend_string *name, int type, void **cache_slot)
+{
+    if (slate_own(name)) {
+        return NULL;   /* compound assignments and ++ go through read + write */
+    }
+    return zend_std_get_property_ptr_ptr(obj, name, type, cache_slot);
+}
+
+static void slate_unset_property(zend_object *obj, zend_string *name, void **cache_slot)
+{
+    if (slate_own(name)) {
+        zend_throw_error(NULL, "Cannot unset %s::$%s", ZSTR_VAL(obj->ce->name), ZSTR_VAL(name));
+        return;
+    }
+    zend_std_unset_property(obj, name, cache_slot);
 }
 
 /* ---- module ---- */
@@ -608,6 +769,8 @@ PHP_MINIT_FUNCTION(slate)
     sl_elements_register();
     sl_scene_register();
     sl_images_register();
+    sl_anim_register();
+    sl_scroll_register();
 
     memcpy(&slate_handlers, zend_get_std_object_handlers(), sizeof slate_handlers);
     slate_handlers.offset = XtOffsetOf(sl_slate_t, std);
@@ -615,12 +778,23 @@ PHP_MINIT_FUNCTION(slate)
     slate_handlers.free_obj = slate_free;
     slate_handlers.clone_obj = NULL;
     slate_handlers.get_gc = slate_gc;
+    slate_handlers.write_property = slate_write_property;
+    slate_handlers.read_property = slate_read_property;
+    slate_handlers.get_property_ptr_ptr = slate_get_property_ptr_ptr;
+    slate_handlers.unset_property = slate_unset_property;
 
     zend_class_entry ce;
     INIT_NS_CLASS_ENTRY(ce, "Baremetal\\Slate", "Slate", slate_methods);
     sl_slate_ce = zend_register_internal_class(&ce);
     sl_slate_ce->ce_flags |= ZEND_ACC_FINAL | ZEND_ACC_NOT_SERIALIZABLE;
     sl_slate_ce->create_object = slate_create;
+    zval dv;
+    ZVAL_LONG(&dv, 2);
+    s_keep_pi = zend_declare_typed_property(sl_slate_ce, zend_string_init_interned("keepScenes", 10, 1), &dv,
+                                            ZEND_ACC_PUBLIC, NULL, (zend_type)ZEND_TYPE_INIT_CODE(IS_LONG, 0, 0));
+    ZVAL_NULL(&dv);
+    s_budget_pi = zend_declare_typed_property(sl_slate_ce, zend_string_init_interned("keptBudget", 10, 1), &dv,
+                                              ZEND_ACC_PUBLIC, NULL, (zend_type)ZEND_TYPE_INIT_CODE(IS_LONG, 1, 0));
     return SUCCESS;
 }
 
@@ -634,6 +808,8 @@ PHP_RSHUTDOWN_FUNCTION(slate)
         sl_stop(slate_of(sl_g.slate));
     }
     sl_images_rshutdown();
+    sl_anim_rshutdown();
+    sl_scroll_rshutdown();
     return SUCCESS;
 }
 
@@ -668,6 +844,6 @@ zend_module_entry slate_module_entry = {
     NULL,
     PHP_RSHUTDOWN(slate),
     PHP_MINFO(slate),
-    "1.1.0",
+    "1.2.0",
     STANDARD_MODULE_PROPERTIES
 };

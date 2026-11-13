@@ -7,13 +7,21 @@
    blend onto an opaque pixel) plus the update of the alpha plane, A' = a + A * (255 - a) / 255 for every pixel
    written with alpha a. The image starts as all zeros (transparent black).
 
-   Caches. Memory comes from the target's cache_alloc (PSRAM on the board, slate_compose) and goes back to its
-   cache_free; the record itself is a small struct from the scene allocator (slate_scene_set_alloc) that remembers the free function, so slate_el_free
+   Caches. Memory comes from the target's cache_alloc (PSRAM on the board, slate_compose; the engine's takes the room
+   of the scenes left first, engine.h, Kept scenes) and goes back to its cache_free; the record itself is a small struct from the scene allocator (slate_scene_set_alloc) that remembers the free function, so slate_el_free
    can release it. Two images per element:
    - content (GROUP with cache, shadow or blur): the group's children composed offscreen (and blurred when the
      group has a blur), in screen pixels around the group's origin;
    - shadow (ROUNDRECT, CIRCLE, GROUP with a shadow): A8, the coverage (or the content's alpha) blurred, drawn
      with fill_mask in the shadow colour.
+   A scroll (scene.h, "Scroll") with cache and without shadow or blur keeps instead the image of its whole content:
+   its children composed at position 0 over slate_el_scroll_area (crel, in content coordinates: the children's box,
+   cut to the view's span on an axis the scroll cannot move), the same format; the caches of those children are built
+   for that image, not cut to the screen. A change of its position, view or bars keeps it (each frame copies the part
+   in the view) while the area needed stays inside it; a change inside rebuilds it. The children's own images made
+   for the build are dropped once it is done (they are in it). A build in which a child's shadow or blur gets no
+   memory is given up (memory freed, the scroll composed directly) and not tried again until its content changes.
+   With a shadow or blur a scroll is drawn through the image of its view, as a group, rebuilt when it scrolls.
    Validity. An image is rebuilt on the next frame that needs it when:
    - something inside changed: any property of a descendant, a child added or removed, a canvas inside marked
      dirty (slate_cache_stale_up), or a property of the element that changes its pixels (clip box, blur; for a
@@ -55,6 +63,8 @@ typedef struct slate_cache {
     bool shadow_ok;
     uint32_t frame;             /* last frame that resolved this cache */
     bool usable;                /* result of that resolution */
+    bool gave_up;               /* a scroll's content image lost children's effects for lack of memory: not built
+                                   again until its content changes (compose.c) */
     void (*free)(void *ctx, void *p);
     void *ctx;
 } slate_cache_t;
@@ -67,8 +77,8 @@ void slate_cache_stale(slate_el_t *e, bool content, bool shadow);
 void slate_cache_stale_up(slate_el_t *e);
 /* Frees e's images and record. */
 void slate_cache_drop(slate_el_t *e);
-/* Frees the images of e and of everything under it (e.g. for a scene that is no longer shown); they are rebuilt
-   when needed again. */
+/* Frees the images of e and of everything under it (e.g. for a scene that is no longer shown and does not keep its
+   caches, or a kept one whose room is needed: engine.h, Kept scenes); they are rebuilt when needed again. */
 void slate_cache_drop_tree(slate_el_t *e);
 /* Makes *slot hold at least need bytes from alloc (reusing it when it already does); NULL on failure, with the
    old block freed. */

@@ -78,8 +78,13 @@ through images kept in external RAM (PSRAM):
 - a change of something inside (any property of a child, a child added or removed) rebuilds it at the next
   frame that needs it.
 
-The caches of a scene go when another scene is shown: showing it again builds its shadows and blurs again at
-its first frame.
+When another scene is shown, the caches of the scene left stay while there is room (`Slate::$keepScenes`, default
+2 scenes, and `Slate::$keptBudget`; see [Returning to a scene](./scenes.md#returning-to-a-scene)): showing it again
+costs no build. They stay in the budget below, and they are the first to go when the scene shown or the underlay
+needs room there, the scene left first before the others, and when an image cannot be loaded for lack of memory
+(see [Images](./images.md#memory)); a scene whose caches went builds its shadows and blurs again at its first
+frame. Keeping them costs no work per frame; with `$keepScenes = 0` (or `Scene::$keepCache =
+false`) the caches of a scene go when it is left, as in 1.1.
 
 A change of anything inside a group with `$cache`, a `$shadow` or a `$blur` redraws the group's whole box, since
 its image is built again.
@@ -153,9 +158,12 @@ every frame. The pixels are the same as when everything is drawn.
 - It is made only when the bottom holds something that costs more to draw than to copy (a gradient, an `Arc`,
   a `Line`, `Text`, a border); a plain colored background is drawn directly.
 - It takes 2 bytes per pixel of the screen (about 270 KB on a 360 x 360 panel) from the caches' budget, and it
-  gives the memory back as soon as an element's cache needs it: caches come first.
+  gives the memory back as soon as an element's cache needs it: caches come first. The kept caches of the scenes
+  left go before it.
 - Elements drawn through an image (a `Group` with `$cache`, `$shadow`, `$blur` or `$opacity` below 1, a shape
   with a `$shadow`) end the run: the underlay holds only what is drawn directly.
+- During a transition between scenes it is not used and its memory is given back; it is made again for the new
+  scene after the end.
 
 ## One Slate at a time
 
@@ -185,7 +193,7 @@ to the panel: below it the drawing hides behind the transfer.
 | A 240 x 240 `RoundRect` with `Shadow(0, 6, 14, 0xA0000000)`, first frame (the shadow is built) | 31.5 ms | 28.8 ms |
 | A full-screen `Group` with `opacity: 0.6` (a `RoundRect` and a `Circle` inside) | 50.3 ms | 50.1 ms |
 | A 240 x 240 `Group` with `blur: 8`, first frame | 135 ms | 135 ms |
-| A 240 x 240 `Group` with a `Shadow`, first frame | 70 to 125 ms | 70 to 125 ms |
+| A 240 x 240 `Group` with a `Shadow`, first frame | 60 to 125 ms | 60 to 125 ms |
 
 The pixel code of Slate is compiled for speed even when the firmware is built for size. A radial gradient
 costs most of the shapes because its rows are cut into short pieces, each with its own square roots; keep large
@@ -213,6 +221,82 @@ other core share the instruction cache and the external RAM, so in a busy scene 
 times what it costs alone (measured: a band composed while the PHP listener runs takes 1.5 to 2 times as long). The
 work that remains is about one refresh period per frame, so some frames still miss a refresh. The
 gauge example (a dial, an arc moved by the IMU and an orbiting dot) runs at 60 frames per second.
+
+## Animations and transitions
+
+Tweens and transitions cost nothing in PHP: the compositor samples them at every refresh of the panel and composes
+only what they changed. Measured on an ESP32-S3 at 240 MHz with the 360 x 360 QSPI panel and its TE pin, on the
+pages of the `06-display/slate-transitions` example (each page keeps its own tweens running, `repeat: -1`, also
+during the transitions), page changes driven by a timer, four runs of six to twelve transitions of each kind; with
+and without `slate-debug`, the same within 1 frame per second:
+
+| Transition | Frames | Frames per second | Frame, average / longest | Longest frame with `keepScenes = 0` |
+| --- | --- | --- | --- | --- |
+| `push`, 300 ms | 16 to 19 | 57 to 58 (53 to 60) | 15.1 / 21 ms | 25 ms |
+| `cover`, 350 ms (a panel over the page) | 20 to 22 | 59 to 60 | 13.7 / 28 ms (the panel's first time) | 28 ms, every time |
+| `uncover`, 300 ms | 17 to 18 | 59 to 60 | 14.4 / 17 ms | 25 ms |
+| `fade`, 400 ms | 8 to 9 | 19 to 22 | 42 to 49 / 70 ms | 84 ms |
+
+- During a slide (`push`, `cover`, `uncover`) the whole screen is composed at every frame, both scenes band by band:
+  a frame costs about what the two pages cost together, here 13 to 17 ms, so the panel's 60 refreshes a second are
+  nearly all met. The frame after the end composes the new page alone (13 to 20 ms).
+- A `fade` composes the scene coming in apart and blends it over the other one, as a full-screen group with an
+  `$opacity` below 1 is (about 50 ms, see [Full-screen times](#full-screen-times)): about 20 frames per second. It
+  is still smooth enough for a short fade; for large, busy pages a slide costs less.
+- **Kept caches.** With the default `Slate::$keepScenes = 2`, a page with a shadow that is shown again builds
+  nothing: no cache was built in any of the 48 transitions after the first visit of each page. With
+  `$keepScenes = 0` each return builds the shadow again, in the first frame of the transition: 4 to 8 ms more for
+  that frame in a slide, 15 ms more in a fade. Keeping the caches of two pages took 84 KB of PSRAM here (a card and
+  a panel with a shadow, about 42 KB each).
+- **Many tweens.** Circles moving with `animate(['x' => ..., 'y' => ...], repeat: -1, yoyo: true)`, each with
+  its own time, over an opaque background: 20 of them run at 60 frames per second, composing 3.7 ms per frame (9 %
+  of the screen dirty); 50 of them also at 60, composing 8 ms (20 % dirty).
+- **Memory.** Without Wi-Fi, through all of the above: at least 80 KB of internal RAM free at every frame, PSRAM
+  free never under 630 KB of the 1.3 MB left outside PHP. The compositor's task used at most 6.3 KB of its stack (a shadow built during a fade); the stack is 10 KB, which leaves room for deeper
+  nesting of cached and blurred groups inside a fade.
+- **Waiting between frames.** The compositor's task sleeps until the next TE pulse or deadline; with the 1 kHz
+  tick of the esp32 SDK even a wait of a millisecond blocks. Measured: one wait in 150 s returned without blocking
+  (0.2 ms in all).
+
+## Scroll
+
+A `Scroll` costs nothing in PHP either: the script forwards the touches, and the compositor runs the drag, the
+inertia, the snapping and the springs at every refresh of the panel, composing only the view. Measured on an
+ESP32-S3 at 240 MHz with the 360 x 360 QSPI panel and its TE pin, on the pages of the `06-display/slate-scroll`
+example (views of 240 x 240 and 240 x 180), with touches sent by a timer every 16 ms, two rounds of each case:
+
+| Case | Frames per second | Frame, average / longest | Compose, average / longest |
+| --- | --- | --- | --- |
+| A list of 40 rows (48 px, a card, a dot, two texts), no cache: drag | 60 | 13.9 / 14.6 ms | 7.6 / 11.1 ms |
+| The same list: inertia after a fling | 55 (see below) | 13.5 / 13.9 ms | 7.0 / 9.4 ms |
+| The same list, snapping on the rows (`snapY: 48`) | 57 to 60 | 13.6 / 13.9 ms | 5.7 / 6.9 ms |
+| The same list, spring back from past an edge | 53 to 54 (see below) | 13.5 / 13.7 ms | 6.9 / 8.0 ms |
+| The same list, `scrollTo()` 300 and 600 ms | 60 | 13.5 / 13.7 ms | 5.7 / 6.4 ms |
+| A list of 12 rows with `$cache` (240 x 576, in the cache): drag | 58 | 15.8 / 18.7 ms | 13.5 / 16.0 ms |
+| The same list with `$cache`: inertia | 60 | 15.9 / 17.6 ms | 12.8 / 13.9 ms |
+| The same list with `$cache`: spring back from past an edge | 40 (see below) | 16.0 / 16.7 ms | 12.6 / 13.1 ms |
+| The same list without `$cache`: inertia | 60 | 13.5 / 13.9 ms | 6.9 / 7.8 ms |
+| The same list without `$cache`: spring back from past an edge | 38 (see below) | 13.6 / 13.8 ms | 6.9 / 7.9 ms |
+| A carousel of six cards (`snapX: 240`): drag, snap | 58 to 60 | 11.6 / 12.3 ms | 5.0 / 9.2 ms |
+| A 720 x 720 grid on both axes: drag | 60 | 14.4 / 17.4 ms | 10.1 / 13.8 ms |
+| The same grid: inertia | 54 (see below) | 13.6 / 15.3 ms | 9.1 / 11.7 ms |
+| The same grid: spring back from a corner | 53 (see below) | 13.6 / 14.3 ms | 8.2 / 9.5 ms |
+| `push` between the pages | 60 | 14.4 / 15.3 ms | 10.4 / 11.8 ms |
+
+- **Every frame is shorter than a refresh.** The longest frame of a moving list, uncached, is 14.6 ms, under the
+  16.7 ms of the panel's refresh. The rates under 60 during inertia and springs come from their slow end: when the
+  content moves less than a pixel between two refreshes nothing changes on the screen, and no frame is composed. The springs of the 12-row list are the lowest, 37 to 40 frames per second: its overshoot is
+  short, so the slow tail is a large share of it, and the frames it does draw are as short as in the other cases. If
+  your board shows about 38 fps there, it is this effect, not a slow frame.
+- **`$cache` on a list.** The 40-row list is 1.38 MB as one image, over the caches' budget: it is composed directly,
+  as without `$cache`, at the same rates. The 12-row list fits, but copying its image costs more than composing its
+  few simple rows (compose 12.8 ms against 6.9 ms), and building it takes one frame of about 50 ms when the page is
+  first shown. Keep `$cache` for a small content with costly children (shadows, blurs, gradients).
+- **Snapping and springs** cost what a frame of the same content costs: the curve and the spring are a few
+  operations per axis per frame.
+- **Memory.** Through all of the above, without Wi-Fi: at least 77 KB of internal RAM free at every frame, PSRAM
+  free never under 560 KB (with the cache of the 12-row list), and the compositor's task used at most 4.1 KB of its
+  10 KB stack.
 
 ## Measuring
 

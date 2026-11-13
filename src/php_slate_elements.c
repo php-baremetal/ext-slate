@@ -12,9 +12,11 @@
 */
 
 /*
- * The elements: abstract Element (x, y, visible, opacity, set()), Group (add, remove), RoundRect, Circle, Arc,
- * Line, Text, Canvas (its drawing methods are in php_slate_canvas.c) and Image (its image, wait() and the events
- * are in php_slate_images.c). See php_slate.h for the model.
+ * The elements: abstract Element (x, y, visible, opacity, set(), animate(), ease()), Group (add, remove), Scroll (a
+ * Group; touch(), scrollTo(), its position and its events are in php_slate_scroll.c), RoundRect, Circle, Arc, Line,
+ * Text, Canvas (its drawing methods are in php_slate_canvas.c) and Image (its image, wait() and the events are in
+ * php_slate_images.c). See php_slate.h for the model; the Tween and its events are in
+ * php_slate_anim.c.
  *
  * Properties are declared, typed public properties. The object handlers route a write of a Slate property through
  * sl_assign(): PHP checks the type (and coerces, as for any typed property), the value is validated here
@@ -22,6 +24,11 @@
  * get_property_ptr_ptr refuses those properties, so `$el->x += 4` and `$el->x++` go through the write handler
  * too; unset() of one throws, and so does foreach by reference over an element (its references would change the
  * properties without validation, as a reference taken one by one would).
+ *
+ * A Scroll's own properties do not all become SETs: $axis, $bounce, $snapX, $snapY, $snapMax and $indicators are its
+ * set-up (a SCROLL CONFIG with all of them), $scrollX and $scrollY its position (a SCROLL JUMP: a SET would be
+ * overwritten by the physics); reading those two gives the position drawn (php_slate_scroll.c), so their reads are
+ * not cached.
  */
 #include <math.h>
 #include <string.h>
@@ -67,12 +74,20 @@ typedef enum {
     PT_PIXELS,    /* int, 0..32767 */
     PT_CSIZE,     /* int, a canvas side 1..1024 */
     PT_SRC,       /* string: an image's path (php_slate_images.c checks it and holds the image) */
+    PT_VIEW,      /* int|float, a Scroll's view 1..32767 */
+    PT_CLIPON,    /* bool, a Scroll's $clip: always true */
+    PT_AXIS,      /* ScrollAxis */
+    PT_SPOS,      /* int|float, a scroll position: finite (clamped by the engine) */
 } sl_ptype_t;
+
+/* How a write reaches the engine. */
+enum { HOW_SET = 0, HOW_CONFIG, HOW_JUMP };
 
 typedef struct {
     const char *name;
     slate_prop_t prop;
     uint8_t type;   /* sl_ptype_t */
+    uint8_t how;    /* HOW_*: a SET of prop, a Scroll's CONFIG (prop unused), a Scroll's JUMP */
 } sl_pdef_t;
 
 typedef struct {
@@ -81,66 +96,86 @@ typedef struct {
     uint32_t offset;
 } sl_prop_t;
 
-#define PROPS_MAX 16
+#define PROPS_MAX 24
 
 static const sl_pdef_t common_defs[] = {
-    { "x", SLATE_PROP_X, PT_COORD },
-    { "y", SLATE_PROP_Y, PT_COORD },
-    { "visible", SLATE_PROP_VISIBLE, PT_BOOL },
-    { "opacity", SLATE_PROP_OPACITY, PT_OPACITY },
+    { "x", SLATE_PROP_X, PT_COORD, HOW_SET },
+    { "y", SLATE_PROP_Y, PT_COORD, HOW_SET },
+    { "visible", SLATE_PROP_VISIBLE, PT_BOOL, HOW_SET },
+    { "opacity", SLATE_PROP_OPACITY, PT_OPACITY, HOW_SET },
 };
 static const sl_pdef_t group_defs[] = {
-    { "w", SLATE_PROP_W, PT_SIZE },
-    { "h", SLATE_PROP_H, PT_SIZE },
-    { "clip", SLATE_PROP_CLIP, PT_BOOL },
-    { "cache", SLATE_PROP_CACHE, PT_BOOL },
-    { "blur", SLATE_PROP_BLUR, PT_BLUR },
-    { "shadow", SLATE_PROP_SHADOW, PT_SHADOW },
+    { "w", SLATE_PROP_W, PT_SIZE, HOW_SET },
+    { "h", SLATE_PROP_H, PT_SIZE, HOW_SET },
+    { "clip", SLATE_PROP_CLIP, PT_BOOL, HOW_SET },
+    { "cache", SLATE_PROP_CACHE, PT_BOOL, HOW_SET },
+    { "blur", SLATE_PROP_BLUR, PT_BLUR, HOW_SET },
+    { "shadow", SLATE_PROP_SHADOW, PT_SHADOW, HOW_SET },
+};
+/* Group's six first (the class declares only the others: it inherits those) */
+#define SCROLL_INHERITED 6
+static const sl_pdef_t scroll_defs[] = {
+    { "w", SLATE_PROP_W, PT_VIEW, HOW_SET },
+    { "h", SLATE_PROP_H, PT_VIEW, HOW_SET },
+    { "clip", SLATE_PROP_CLIP, PT_CLIPON, HOW_SET },
+    { "cache", SLATE_PROP_CACHE, PT_BOOL, HOW_SET },
+    { "blur", SLATE_PROP_BLUR, PT_BLUR, HOW_SET },
+    { "shadow", SLATE_PROP_SHADOW, PT_SHADOW, HOW_SET },
+    { "contentW", SLATE_PROP_CONTENT_W, PT_PIXELS, HOW_SET },
+    { "contentH", SLATE_PROP_CONTENT_H, PT_PIXELS, HOW_SET },
+    { "axis", SLATE_PROP_SCROLL, PT_AXIS, HOW_CONFIG },
+    { "bounce", SLATE_PROP_SCROLL, PT_BOOL, HOW_CONFIG },
+    { "snapX", SLATE_PROP_SCROLL, PT_PIXELS, HOW_CONFIG },
+    { "snapY", SLATE_PROP_SCROLL, PT_PIXELS, HOW_CONFIG },
+    { "snapMax", SLATE_PROP_SCROLL, PT_PIXELS, HOW_CONFIG },
+    { "indicators", SLATE_PROP_SCROLL, PT_BOOL, HOW_CONFIG },
+    { "scrollX", SLATE_PROP_SCROLL_X, PT_SPOS, HOW_JUMP },
+    { "scrollY", SLATE_PROP_SCROLL_Y, PT_SPOS, HOW_JUMP },
 };
 static const sl_pdef_t roundrect_defs[] = {
-    { "w", SLATE_PROP_W, PT_SIZE },
-    { "h", SLATE_PROP_H, PT_SIZE },
-    { "radius", SLATE_PROP_RADIUS, PT_SIZE },
-    { "fill", SLATE_PROP_FILL, PT_NPAINT },
-    { "border", SLATE_PROP_BORDER, PT_SIZE },
-    { "borderColor", SLATE_PROP_BORDER_COLOR, PT_NCOLOR },
-    { "shadow", SLATE_PROP_SHADOW, PT_SHADOW },
+    { "w", SLATE_PROP_W, PT_SIZE, HOW_SET },
+    { "h", SLATE_PROP_H, PT_SIZE, HOW_SET },
+    { "radius", SLATE_PROP_RADIUS, PT_SIZE, HOW_SET },
+    { "fill", SLATE_PROP_FILL, PT_NPAINT, HOW_SET },
+    { "border", SLATE_PROP_BORDER, PT_SIZE, HOW_SET },
+    { "borderColor", SLATE_PROP_BORDER_COLOR, PT_NCOLOR, HOW_SET },
+    { "shadow", SLATE_PROP_SHADOW, PT_SHADOW, HOW_SET },
 };
 static const sl_pdef_t circle_defs[] = {
-    { "r", SLATE_PROP_R, PT_SIZE },
-    { "fill", SLATE_PROP_FILL, PT_NPAINT },
-    { "border", SLATE_PROP_BORDER, PT_SIZE },
-    { "borderColor", SLATE_PROP_BORDER_COLOR, PT_NCOLOR },
-    { "shadow", SLATE_PROP_SHADOW, PT_SHADOW },
+    { "r", SLATE_PROP_R, PT_SIZE, HOW_SET },
+    { "fill", SLATE_PROP_FILL, PT_NPAINT, HOW_SET },
+    { "border", SLATE_PROP_BORDER, PT_SIZE, HOW_SET },
+    { "borderColor", SLATE_PROP_BORDER_COLOR, PT_NCOLOR, HOW_SET },
+    { "shadow", SLATE_PROP_SHADOW, PT_SHADOW, HOW_SET },
 };
 static const sl_pdef_t arc_defs[] = {
-    { "r", SLATE_PROP_R, PT_SIZE },
-    { "from", SLATE_PROP_FROM, PT_ANGLE },
-    { "to", SLATE_PROP_TO, PT_ANGLE },
-    { "width", SLATE_PROP_WIDTH, PT_SIZE },
-    { "color", SLATE_PROP_COLOR, PT_PAINT },
-    { "caps", SLATE_PROP_CAPS, PT_CAPS },
+    { "r", SLATE_PROP_R, PT_SIZE, HOW_SET },
+    { "from", SLATE_PROP_FROM, PT_ANGLE, HOW_SET },
+    { "to", SLATE_PROP_TO, PT_ANGLE, HOW_SET },
+    { "width", SLATE_PROP_WIDTH, PT_SIZE, HOW_SET },
+    { "color", SLATE_PROP_COLOR, PT_PAINT, HOW_SET },
+    { "caps", SLATE_PROP_CAPS, PT_CAPS, HOW_SET },
 };
 static const sl_pdef_t line_defs[] = {
-    { "x1", SLATE_PROP_X1, PT_COORD },
-    { "y1", SLATE_PROP_Y1, PT_COORD },
-    { "width", SLATE_PROP_WIDTH, PT_SIZE },
-    { "color", SLATE_PROP_COLOR, PT_COLOR },
-    { "caps", SLATE_PROP_CAPS, PT_CAPS },
+    { "x1", SLATE_PROP_X1, PT_COORD, HOW_SET },
+    { "y1", SLATE_PROP_Y1, PT_COORD, HOW_SET },
+    { "width", SLATE_PROP_WIDTH, PT_SIZE, HOW_SET },
+    { "color", SLATE_PROP_COLOR, PT_COLOR, HOW_SET },
+    { "caps", SLATE_PROP_CAPS, PT_CAPS, HOW_SET },
 };
 static const sl_pdef_t text_defs[] = {
-    { "text", SLATE_PROP_TEXT, PT_TEXT },
-    { "font", SLATE_PROP_FONT, PT_FONT },
-    { "color", SLATE_PROP_COLOR, PT_COLOR },
-    { "align", SLATE_PROP_ALIGN, PT_ALIGN },
-    { "maxWidth", SLATE_PROP_MAX_WIDTH, PT_PIXELS },
+    { "text", SLATE_PROP_TEXT, PT_TEXT, HOW_SET },
+    { "font", SLATE_PROP_FONT, PT_FONT, HOW_SET },
+    { "color", SLATE_PROP_COLOR, PT_COLOR, HOW_SET },
+    { "align", SLATE_PROP_ALIGN, PT_ALIGN, HOW_SET },
+    { "maxWidth", SLATE_PROP_MAX_WIDTH, PT_PIXELS, HOW_SET },
 };
 static const sl_pdef_t canvas_defs[] = {
-    { "w", SLATE_PROP_W, PT_CSIZE },
-    { "h", SLATE_PROP_H, PT_CSIZE },
+    { "w", SLATE_PROP_W, PT_CSIZE, HOW_SET },
+    { "h", SLATE_PROP_H, PT_CSIZE, HOW_SET },
 };
 static const sl_pdef_t image_defs[] = {
-    { "src", SLATE_PROP_IMAGE, PT_SRC },
+    { "src", SLATE_PROP_IMAGE, PT_SRC, HOW_SET },
 };
 
 #define N(a) (int)(sizeof(a) / sizeof((a)[0]))
@@ -152,10 +187,11 @@ static zend_class_entry *s_base_ce[SL_BASE_COUNT];
 static const uint8_t s_kind[SL_BASE_COUNT + 1] = {
     [SL_GROUP] = SLATE_EL_GROUP, [SL_ROUNDRECT] = SLATE_EL_ROUNDRECT, [SL_CIRCLE] = SLATE_EL_CIRCLE,
     [SL_ARC] = SLATE_EL_ARC, [SL_LINE] = SLATE_EL_LINE, [SL_TEXT] = SLATE_EL_TEXT, [SL_CANVAS] = SLATE_EL_CANVAS,
-    [SL_IMAGE] = SLATE_EL_IMAGE, [SL_SCENE] = SLATE_EL_GROUP, [SL_BASE_COUNT] = SLATE_EL_GROUP,
+    [SL_IMAGE] = SLATE_EL_IMAGE, [SL_SCROLL] = SLATE_EL_GROUP, [SL_SCENE] = SLATE_EL_GROUP,
+    [SL_BASE_COUNT] = SLATE_EL_GROUP,
 };
 
-static zend_string *s_gradient_name, *s_shadow_name, *s_caps_name, *s_align_name;
+static zend_string *s_gradient_name, *s_shadow_name, *s_caps_name, *s_align_name, *s_axis_name;
 
 const char *sl_short_name(zend_class_entry *ce)
 {
@@ -391,6 +427,30 @@ static bool to_value(sl_obj_t *o, const sl_prop_t *p, zval *v, slate_value_t *ou
         }
         *out = slate_v_image(o->im);   /* sl_assign binds the new path's image after the checks */
         return true;
+    case PT_VIEW:
+        if (!num_in(v, 1, 32767, &d) && check) {
+            bad_value(o, p, "must be between 1 and 32767");
+            return false;
+        }
+        *out = slate_v_num((float)d);
+        return true;
+    case PT_CLIPON:
+        if (Z_TYPE_P(v) != IS_TRUE && check) {
+            bad_value(o, p, "is always true");
+            return false;
+        }
+        *out = slate_v_bool(true);
+        return true;
+    case PT_AXIS:
+        *out = slate_v_enum(sl_scroll_axis_of(v));   /* sent in a CONFIG, never as a SET */
+        return true;
+    case PT_SPOS:
+        if (!num_in(v, -INFINITY, INFINITY, &d) && check) {
+            bad_value(o, p, "must be a finite number");
+            return false;
+        }
+        *out = slate_v_num(isfinite(d) ? (float)d : 0.0f);   /* sent in a JUMP, never as a SET */
+        return true;
     }
     return false;
 }
@@ -405,6 +465,22 @@ static bool slot_true(sl_obj_t *o, const char *name)
 {
     const sl_prop_t *p = find_prop_c(o, name);
     return p && Z_TYPE_P(prop_slot(o, p)) == IS_TRUE;
+}
+
+zval *sl_slot(sl_obj_t *o, const char *name)
+{
+    const sl_prop_t *p = find_prop_c(o, name);
+    return p ? prop_slot(o, p) : NULL;
+}
+
+double sl_slot_num(sl_obj_t *o, const char *name)
+{
+    return slot_num(o, name);
+}
+
+bool sl_slot_true(sl_obj_t *o, const char *name)
+{
+    return slot_true(o, name);
 }
 
 /* Rules between properties, after p changed: a clipping group needs a clip box. */
@@ -425,6 +501,11 @@ static bool realized(const sl_obj_t *o)
     return sl_g.engine && o->gen == sl_g.gen;
 }
 
+bool sl_realized(const sl_obj_t *o)
+{
+    return realized(o);
+}
+
 static bool push_set(sl_obj_t *o, const sl_prop_t *p, const slate_value_t *v)
 {
     slate_cmd_t c = { .kind = SLATE_CMD_SET, .id = o->id, .prop = p->def->prop, .v = *v };
@@ -435,6 +516,10 @@ static bool push_set(sl_obj_t *o, const sl_prop_t *p, const slate_value_t *v)
    SET of a realized element. */
 static zend_result sl_assign(sl_obj_t *o, const sl_prop_t *p, zval *value)
 {
+    sl_anim_flush();   /* a PHP call: what plain C left to release goes now */
+    if (p->def->how == HOW_JUMP) {
+        sl_scroll_sync(o);   /* both slots at the position drawn: the JUMP keeps the other axis where it is */
+    }
     zval *slot = prop_slot(o, p);
     zval old;
     ZVAL_COPY(&old, slot);
@@ -453,8 +538,9 @@ static zend_result sl_assign(sl_obj_t *o, const sl_prop_t *p, zval *value)
         return FAILURE;
     }
     /* The same value again (the same number, string or enum case, or the same gradient or shadow object, which are
-       immutable) changes nothing: no SET, so nothing is redrawn and the compositor is not woken. */
-    bool same = Z_TYPE(old) != IS_ARRAY && zend_is_identical(&old, slot);
+       immutable) changes nothing: no SET, so nothing is redrawn and the compositor is not woken. Not for an element
+       a tween or ease() touched: the screen may show another value (a stopped tween), and the write puts it right. */
+    bool same = Z_TYPE(old) != IS_ARRAY && zend_is_identical(&old, slot) && !o->animated;
     /* An image's path: the image of the new path (or of the same one again, when it failed: a file written or a
        card mounted since). */
     if (p->def->type == PT_SRC && (!same || sl_image_failed(o))) {
@@ -468,13 +554,26 @@ static zend_result sl_assign(sl_obj_t *o, const sl_prop_t *p, zval *value)
         v = slate_v_image(o->im);
         same = false;
     }
+    bool changed = !zend_is_identical(&old, slot);
     zval_ptr_dtor(&old);
+    if (p->def->how == HOW_JUMP) {
+        return sl_scroll_jumped(o) ? SUCCESS : FAILURE;   /* always: the slot may have been behind the screen */
+    }
+    if (p->def->how == HOW_CONFIG) {
+        if (!changed) {
+            return SUCCESS;   /* a CONFIG of the same set-up changes nothing */
+        }
+        return sl_scroll_configured(o, strcmp(p->def->name, "indicators") != 0) ? SUCCESS : FAILURE;
+    }
     /* A canvas resized: the PHP buffer is cleared here, and the engine clears its own copy when the SET of W or H
        arrives (scene.h), so no pixels need to be sent again. */
     if (o->base == SL_CANVAS && (p->def->prop == SLATE_PROP_W || p->def->prop == SLATE_PROP_H)) {
         if (!sl_canvas_resize(o, (int)slot_num(o, "w"), (int)slot_num(o, "h"))) {
             return FAILURE;
         }
+    }
+    if (o->tweens) {
+        sl_anim_written(o, p->def->prop);   /* a pending tween no longer moves it */
     }
     if (!same && realized(o) && !push_set(o, p, &v)) {
         return FAILURE;
@@ -503,6 +602,15 @@ static zval *sl_read_property(zend_object *obj, zend_string *name, int type, voi
     if (type != BP_VAR_R && type != BP_VAR_IS && find_prop(sl_obj(obj), name)) {
         zend_throw_error(NULL, "Cannot take a reference to %s::$%s", ZSTR_VAL(obj->ce->name), ZSTR_VAL(name));
         return &EG(uninitialized_zval);
+    }
+    sl_obj_t *o = sl_obj(obj);
+    if (o->base == SL_SCROLL) {
+        const sl_prop_t *p = find_prop(o, name);
+        if (p && p->def->how == HOW_JUMP) {
+            /* the position drawn: never cached (a cached read would skip this handler) */
+            sl_scroll_sync(o);
+            return zend_std_read_property(obj, name, type, NULL, rv);
+        }
     }
     return zend_std_read_property(obj, name, type, cache_slot, rv);
 }
@@ -572,7 +680,11 @@ static void sl_free_obj(zend_object *obj)
         zval *zv;
         ZEND_HASH_FOREACH_VAL(&o->children, zv) {
             if (Z_TYPE_P(zv) == IS_OBJECT) {
-                sl_obj(Z_OBJ_P(zv))->parent = NULL;
+                sl_obj_t *c = sl_obj(Z_OBJ_P(zv));
+                c->parent = NULL;
+                if (c->tweens) {
+                    sl_anim_removed(c);   /* detached for good unless added again: its tweens stop */
+                }
             }
         } ZEND_HASH_FOREACH_END();
         zend_hash_destroy(&o->children);
@@ -583,6 +695,9 @@ static void sl_free_obj(zend_object *obj)
         o->px = NULL;
     }
     sl_image_unbind(o);
+    if (o->sc) {
+        sl_scroll_free(o);
+    }
     zend_object_std_dtor(obj);
 }
 
@@ -602,7 +717,16 @@ static void default_of(int base, const sl_pdef_t *d, zval *out)
 {
     switch ((sl_ptype_t)d->type) {
     case PT_BOOL:
-        ZVAL_BOOL(out, d->prop == SLATE_PROP_VISIBLE);
+        ZVAL_BOOL(out, d->prop == SLATE_PROP_VISIBLE || d->how == HOW_CONFIG);   /* a Scroll's bounce, indicators */
+        return;
+    case PT_CLIPON:
+        ZVAL_TRUE(out);
+        return;
+    case PT_VIEW:
+        ZVAL_LONG(out, 1);
+        return;
+    case PT_AXIS:
+        ZVAL_OBJ_COPY(out, zend_enum_get_case_cstr(sl_scroll_axis_ce, "Both"));
         return;
     case PT_OPACITY:
         ZVAL_DOUBLE(out, 1.0);
@@ -667,9 +791,12 @@ zend_object *sl_obj_create(zend_class_entry *ce)
     o->id = s_next_id;
     o->dx0 = o->dy0 = 0;
     o->dx1 = o->dy1 = 0;
-    if (o->base == SL_GROUP || o->base == SL_SCENE) {
+    if (o->base == SL_GROUP || o->base == SL_SCROLL || o->base == SL_SCENE) {
         zend_hash_init(&o->children, 4, NULL, ZVAL_PTR_DTOR, 0);
         o->has_children = true;
+    }
+    if (o->base == SL_SCROLL) {
+        sl_scroll_init(o);
     }
     for (int i = 0; i < s_nprops[o->base]; i++) {
         const sl_prop_t *p = &s_props[o->base][i];
@@ -695,8 +822,14 @@ bool sl_realize(sl_obj_t *o)
         return false;
     }
     o->gen = sl_g.gen;
+    if (o->base == SL_SCROLL && !sl_scroll_realize_config(o)) {   /* it is a scroll before its properties */
+        return false;
+    }
     for (int i = 0; i < s_nprops[o->base]; i++) {
         const sl_prop_t *p = &s_props[o->base][i];
+        if (p->def->how != HOW_SET) {
+            continue;   /* in the CONFIG, or the JUMP after the children */
+        }
         slate_value_t v;
         slate_paint_grad_t grad;
         to_value(o, p, prop_slot(o, p), &v, &grad, false);
@@ -706,6 +839,13 @@ bool sl_realize(sl_obj_t *o)
     }
     if (o->base == SL_CANVAS && o->px && !sl_canvas_send(o, 0, 0, o->cw, o->ch)) {
         return false;
+    }
+    if (o->ease_mask) {   /* after the properties: they jump to their values, later writes slide */
+        slate_ease_spec_t es = { .mask = o->ease_mask, .ms = o->ease_ms, .ease = o->ease };
+        slate_cmd_t ec = { .kind = SLATE_CMD_EASE, .id = o->id, .data = &es };
+        if (!sl_push(&ec)) {
+            return false;
+        }
     }
     if (o->has_children) {
         zval *zv;
@@ -720,7 +860,10 @@ bool sl_realize(sl_obj_t *o)
             }
         } ZEND_HASH_FOREACH_END();
     }
-    return true;
+    if (o->base == SL_SCROLL && !sl_scroll_realize_position(o)) {   /* clamped to the content of its children */
+        return false;
+    }
+    return sl_anim_realized(o);   /* the tweens made before it was drawn */
 }
 
 /* ---- children ---- */
@@ -790,6 +933,9 @@ void sl_children_remove(sl_obj_t *o, zval *args, uint32_t argc)
                 return;
             }
         }
+        if (c->tweens) {
+            sl_anim_removed(c);   /* its tweens (running or pending) stop unless it is back in a group at the delivery */
+        }
         zend_hash_index_del(&o->children, idx);   /* may free c (FREE after REMOVE) */
     }
 }
@@ -829,6 +975,8 @@ static const char *const text_args[] = { "x", "y", "text", "font", "color", "ali
 static const char *const group_args[] = { "x", "y", "w", "h", "opacity", "clip", "cache", "blur", "shadow" };
 static const char *const canvas_args[] = { "x", "y", "w", "h" };
 static const char *const image_args[] = { "x", "y", "src", "opacity" };
+static const char *const scroll_args[] = { "x", "y", "w", "h", "axis", "bounce", "snapX", "snapY", "snapMax",
+                                           "indicators", "contentW", "contentH", "opacity", "cache" };
 
 PHP_METHOD(SlateRoundRect, __construct)
 {
@@ -868,6 +1016,12 @@ PHP_METHOD(SlateCanvas, __construct)
 PHP_METHOD(SlateImage, __construct)
 {
     construct(INTERNAL_FUNCTION_PARAM_PASSTHRU, image_args, 3, 4);
+}
+
+/* In Scroll's method table (php_slate_scroll.c). */
+PHP_METHOD(SlateScroll, __construct)
+{
+    construct(INTERNAL_FUNCTION_PARAM_PASSTHRU, scroll_args, 0, 14);
 }
 
 /* ---- Element::set(), Group::add(), Group::remove() ---- */
@@ -947,12 +1101,286 @@ PHP_METHOD(SlateGroup, remove)
     RETURN_OBJ_COPY(Z_OBJ_P(ZEND_THIS));
 }
 
+/* ---- animate(), ease() ---- */
+
+/* The animatable properties (design §1.2): numbers and solid colours. */
+static bool animatable(const sl_obj_t *o, const sl_prop_t *p)
+{
+    int b = o->base;
+    switch (p->def->prop) {
+    case SLATE_PROP_X:
+    case SLATE_PROP_Y:
+    case SLATE_PROP_OPACITY:
+        return true;
+    case SLATE_PROP_W:
+    case SLATE_PROP_H:
+        return b == SL_GROUP || b == SL_SCROLL || b == SL_ROUNDRECT;   /* a Canvas's size is its buffer: not
+                                                                          animatable */
+    case SLATE_PROP_BLUR:
+        return b == SL_GROUP || b == SL_SCROLL;
+    case SLATE_PROP_RADIUS:
+        return b == SL_ROUNDRECT;
+    case SLATE_PROP_BORDER:
+    case SLATE_PROP_FILL:
+    case SLATE_PROP_BORDER_COLOR:
+        return b == SL_ROUNDRECT || b == SL_CIRCLE;
+    case SLATE_PROP_R:
+        return b == SL_CIRCLE || b == SL_ARC;
+    case SLATE_PROP_FROM:
+    case SLATE_PROP_TO:
+        return b == SL_ARC;
+    case SLATE_PROP_WIDTH:
+        return b == SL_ARC || b == SL_LINE;
+    case SLATE_PROP_COLOR:
+        return b == SL_ARC || b == SL_LINE || b == SL_TEXT;
+    case SLATE_PROP_X1:
+    case SLATE_PROP_Y1:
+        return b == SL_LINE;
+    default:
+        return false;
+    }
+}
+
+static void not_animatable(const sl_obj_t *o, const char *name)
+{
+    zend_value_error("%s::$%s cannot be animated", ZSTR_VAL(o->std.ce->name), name);
+}
+
+static bool is_gradient(const zval *v)
+{
+    ZVAL_DEREF(v);
+    return Z_TYPE_P(v) == IS_OBJECT && instanceof_function(Z_OBJCE_P(v), sl_gradient_ce);
+}
+
+/* The property named by a key of animate() (or a name of ease()), animatable for o's class; NULL with the
+   \ValueError. */
+static const sl_prop_t *anim_prop(sl_obj_t *o, zend_string *key, zend_ulong idx)
+{
+    const sl_prop_t *p = key ? find_prop(o, key) : NULL;
+    if (p && o->base == SL_SCROLL
+        && (p->def->how == HOW_JUMP || p->def->prop == SLATE_PROP_CONTENT_W || p->def->prop == SLATE_PROP_CONTENT_H
+            || (p->def->how == HOW_CONFIG && p->def->type == PT_PIXELS))) {
+        /* the position, the content size, the snap steps and $snapMax: the physics owns them */
+        zend_value_error("%s::$%s cannot be animated; use scrollTo()", ZSTR_VAL(o->std.ce->name), p->def->name);
+        return NULL;
+    }
+    if (!p || !animatable(o, p)) {
+        if (key) {
+            not_animatable(o, ZSTR_VAL(key));
+        } else {
+            char num[24];
+            snprintf(num, sizeof num, ZEND_ULONG_FMT, idx);
+            not_animatable(o, num);
+        }
+        return NULL;
+    }
+    return p;
+}
+
+/* Puts back the slots of ps[0..n) from old (their copies), freeing the values written. */
+static void slots_back(sl_obj_t *o, const sl_prop_t *const *ps, zval *old, int n)
+{
+    for (int i = 0; i < n; i++) {
+        zval *slot = prop_slot(o, ps[i]);
+        zval tmp;
+        ZVAL_COPY_VALUE(&tmp, slot);
+        ZVAL_COPY_VALUE(slot, &old[i]);
+        zval_ptr_dtor(&tmp);
+    }
+}
+
+bool sl_anim_collect(sl_obj_t *o, HashTable *props, bool back, slate_tween_spec_t *spec)
+{
+    if (zend_hash_num_elements(props) == 0) {
+        zend_value_error("props must name at least one property");
+        return false;
+    }
+    const sl_prop_t *ps[SLATE_TWEEN_PROPS_MAX];
+    zval *vals[SLATE_TWEEN_PROPS_MAX];
+    int k = 0;
+    zend_string *key;
+    zend_ulong idx;
+    zval *v;
+    /* the names and the gradients first: nothing is written before they are all right */
+    ZEND_HASH_FOREACH_KEY_VAL(props, idx, key, v) {
+        const sl_prop_t *p = anim_prop(o, key, idx);
+        if (!p) {
+            return false;
+        }
+        ZVAL_DEREF(v);
+        if ((p->def->type == PT_PAINT || p->def->type == PT_NPAINT) && (is_gradient(v) || is_gradient(prop_slot(o, p)))) {
+            zend_value_error("%s::$%s cannot be animated: it is a gradient", ZSTR_VAL(o->std.ce->name), p->def->name);
+            return false;
+        }
+        if ((p->def->type == PT_NCOLOR || p->def->type == PT_NPAINT)
+            && (Z_TYPE_P(v) == IS_NULL || Z_TYPE_P(prop_slot(o, p)) == IS_NULL)) {
+            /* no fill or no border: nothing to blend from or to (design §1.2) */
+            zend_value_error("%s::$%s cannot be animated: it is null", ZSTR_VAL(o->std.ce->name), p->def->name);
+            return false;
+        }
+        if (k == SLATE_TWEEN_PROPS_MAX) {   /* never: a class has at most 9 animatable properties */
+            zend_value_error("props can name at most %d properties", SLATE_TWEEN_PROPS_MAX);
+            return false;
+        }
+        ps[k] = p;
+        vals[k] = v;
+        k++;
+    } ZEND_HASH_FOREACH_END();
+    /* then each value as a write of it: PHP's type check (and coercion), the range, the rules between properties;
+       the old values come back on the first refusal */
+    zval old[SLATE_TWEEN_PROPS_MAX];
+    int w = 0;
+    bool ok = true;
+    for (int i = 0; i < k && ok; i++) {
+        zval *slot = prop_slot(o, ps[i]);
+        ZVAL_COPY(&old[i], slot);
+        w++;
+        zend_std_write_property(&o->std, ps[i]->name, vals[i], NULL);
+        slate_value_t sv;
+        slate_paint_grad_t grad;
+        ok = !EG(exception) && to_value(o, ps[i], slot, &sv, &grad, true);
+    }
+    for (int i = 0; i < k && ok; i++) {
+        ok = cross_check(o, ps[i]);
+    }
+    if (ok) {
+        for (int i = 0; i < k; i++) {
+            slate_value_t sv;
+            slate_paint_grad_t grad;
+            to_value(o, ps[i], prop_slot(o, ps[i]), &sv, &grad, false);
+            slate_value_t fv;
+            to_value(o, ps[i], &old[i], &fv, &grad, false);   /* the value before: a pending tween sets it first */
+            slate_tween_prop_t *tp = &spec->props[i];
+            memset(tp, 0, sizeof *tp);
+            tp->prop = ps[i]->def->prop;
+            if (sv.type == SLATE_VAL_COLOR) {
+                tp->type = SLATE_VAL_COLOR;
+                tp->to.argb = sv.v.argb;
+                tp->from.argb = fv.v.argb;
+            } else if (sv.type == SLATE_VAL_PAINT) {
+                tp->type = SLATE_VAL_COLOR;   /* solid: gradients and null were refused above */
+                tp->to.argb = sv.v.paint.argb;
+                tp->from.argb = fv.v.paint.argb;
+            } else {
+                tp->type = SLATE_VAL_NUM;
+                tp->to.num = sv.v.num;
+                tp->from.num = fv.v.num;
+            }
+        }
+        spec->n = (uint8_t)k;
+        o->animated = true;
+    }
+    if (!ok || back) {
+        slots_back(o, ps, old, w);
+    } else {
+        for (int i = 0; i < w; i++) {
+            zval_ptr_dtor(&old[i]);
+        }
+    }
+    return ok;
+}
+
+PHP_METHOD(SlateElement, animate)
+{
+    HashTable *props;
+    zend_long ms = 300, delay = 0, repeat = 0;
+    zend_object *ease = NULL;
+    bool yoyo = false;
+    ZEND_PARSE_PARAMETERS_START(1, 6)
+        Z_PARAM_ARRAY_HT(props)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(ms)
+        Z_PARAM_OBJ_OF_CLASS(ease, sl_ease_ce)
+        Z_PARAM_LONG(delay)
+        Z_PARAM_LONG(repeat)
+        Z_PARAM_BOOL(yoyo)
+    ZEND_PARSE_PARAMETERS_END();
+    if (!sl_anim_times(ms, delay, repeat)) {
+        RETURN_THROWS();
+    }
+    sl_obj_t *o = sl_obj(Z_OBJ_P(ZEND_THIS));
+    slate_tween_spec_t spec;
+    memset(&spec, 0, sizeof spec);
+    spec.ms = (int32_t)ms;
+    spec.delay_ms = (int32_t)delay;
+    spec.repeat = (int32_t)repeat;
+    spec.yoyo = yoyo;
+    spec.ease = sl_ease_of(ease);
+    /* with yoyo and an odd number of repeats the last run comes back: it ends where it starts */
+    if (!sl_anim_collect(o, props, yoyo && repeat > 0 && (repeat & 1), &spec)
+        || !sl_tween_make(return_value, o, &spec, NULL)) {
+        RETURN_THROWS();
+    }
+}
+
+PHP_METHOD(SlateElement, ease)
+{
+    HashTable *props;
+    zend_long ms = 300;
+    zend_object *ease = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_ARRAY_HT(props)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(ms)
+        Z_PARAM_OBJ_OF_CLASS(ease, sl_ease_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    if (!sl_anim_times(ms, 0, 0)) {
+        RETURN_THROWS();
+    }
+    sl_obj_t *o = sl_obj(Z_OBJ_P(ZEND_THIS));
+    uint32_t mask = 0;
+    zval *v;
+    ZEND_HASH_FOREACH_VAL(props, v) {
+        ZVAL_DEREF(v);
+        const sl_prop_t *p;
+        if (Z_TYPE_P(v) == IS_STRING) {
+            p = anim_prop(o, Z_STR_P(v), 0);
+        } else if (Z_TYPE_P(v) == IS_LONG) {
+            p = anim_prop(o, NULL, (zend_ulong)Z_LVAL_P(v));
+        } else {
+            zend_argument_type_error(1, "must contain only property names, %s given", zend_zval_value_name(v));
+            RETURN_THROWS();
+        }
+        if (!p) {
+            RETURN_THROWS();
+        }
+        mask |= 1u << p->def->prop;   /* animatable: below 32 (php_slate_anim.c) */
+    } ZEND_HASH_FOREACH_END();
+    o->ease_mask = mask;
+    o->ease_ms = (int32_t)ms;
+    o->ease = sl_ease_of(ease);
+    o->animated = o->animated || mask != 0;
+    if (realized(o)) {
+        slate_ease_spec_t es = { .mask = mask, .ms = o->ease_ms, .ease = o->ease };
+        slate_cmd_t c = { .kind = SLATE_CMD_EASE, .id = o->id, .data = &es };
+        if (!sl_push(&c)) {
+            RETURN_THROWS();
+        }
+    }
+    RETURN_OBJ_COPY(&o->std);
+}
+
 /* ---- arginfo ---- */
 
 #define T_NUM (MAY_BE_LONG | MAY_BE_DOUBLE)
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_element_set, 0, 0, IS_STATIC, 0)
     ZEND_ARG_VARIADIC_TYPE_INFO(0, props, IS_MIXED, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_element_animate, 0, 1, Baremetal\\Slate\\Tween, 0)
+    ZEND_ARG_TYPE_INFO(0, props, IS_ARRAY, 0)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, ms, IS_LONG, 0, "300")
+    ZEND_ARG_OBJ_INFO_WITH_DEFAULT_VALUE(0, ease, Baremetal\\Slate\\Ease, 0, "\\Baremetal\\Slate\\Ease::OutCubic")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, delay, IS_LONG, 0, "0")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, repeat, IS_LONG, 0, "0")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, yoyo, _IS_BOOL, 0, "false")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_element_ease, 0, 1, IS_STATIC, 0)
+    ZEND_ARG_TYPE_INFO(0, props, IS_ARRAY, 0)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, ms, IS_LONG, 0, "300")
+    ZEND_ARG_OBJ_INFO_WITH_DEFAULT_VALUE(0, ease, Baremetal\\Slate\\Ease, 0, "\\Baremetal\\Slate\\Ease::OutCubic")
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_group_children, 0, 0, IS_STATIC, 0)
@@ -1027,6 +1455,8 @@ ZEND_END_ARG_INFO()
 
 static const zend_function_entry element_methods[] = {
     PHP_ME(SlateElement, set, arginfo_element_set, ZEND_ACC_PUBLIC)
+    PHP_ME(SlateElement, animate, arginfo_element_animate, ZEND_ACC_PUBLIC)
+    PHP_ME(SlateElement, ease, arginfo_element_ease, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 static const zend_function_entry group_methods[] = {
@@ -1081,11 +1511,15 @@ static zend_type type_of(uint8_t t)
         return (zend_type)ZEND_TYPE_INIT_CLASS(s_align_name, 0, 0);
     case PT_SHADOW:
         return (zend_type)ZEND_TYPE_INIT_CLASS(s_shadow_name, 1, 0);
+    case PT_AXIS:
+        return (zend_type)ZEND_TYPE_INIT_CLASS(s_axis_name, 0, 0);
+    case PT_CLIPON:
+        return (zend_type)ZEND_TYPE_INIT_CODE(_IS_BOOL, 0, 0);
     case PT_BLUR:
     case PT_PIXELS:
     case PT_CSIZE:
         return (zend_type)ZEND_TYPE_INIT_CODE(IS_LONG, 0, 0);
-    default:   /* COORD, SIZE, ANGLE, COLOR */
+    default:   /* COORD, SIZE, ANGLE, COLOR, VIEW, SPOS */
         return (zend_type)ZEND_TYPE_INIT_MASK(T_NUM);
     }
 }
@@ -1139,6 +1573,7 @@ void sl_elements_register(void)
     s_shadow_name = zend_string_init_interned("Baremetal\\Slate\\Shadow", sizeof("Baremetal\\Slate\\Shadow") - 1, 1);
     s_caps_name = zend_string_init_interned("Baremetal\\Slate\\Caps", sizeof("Baremetal\\Slate\\Caps") - 1, 1);
     s_align_name = zend_string_init_interned("Baremetal\\Slate\\Align", sizeof("Baremetal\\Slate\\Align") - 1, 1);
+    s_axis_name = zend_string_init_interned("Baremetal\\Slate\\ScrollAxis", sizeof("Baremetal\\Slate\\ScrollAxis") - 1, 1);
 
     memcpy(&sl_handlers, zend_get_std_object_handlers(), sizeof sl_handlers);
     sl_handlers.offset = XtOffsetOf(sl_obj_t, std);
@@ -1162,6 +1597,11 @@ void sl_elements_register(void)
     declare(sl_element_ce, common_defs, N(common_defs));
 
     sl_group_ce = leaf("Baremetal\\Slate\\Group", group_methods, group_defs, N(group_defs), false);
+    sl_scroll_axis_register();
+    INIT_NS_CLASS_ENTRY(ce, "Baremetal\\Slate", "Scroll", sl_scroll_method_table());
+    sl_scroll_ce = zend_register_internal_class_ex(&ce, sl_group_ce);   /* not final: a list of an app extends it */
+    sl_scroll_ce->ce_flags |= ZEND_ACC_NOT_SERIALIZABLE;
+    declare(sl_scroll_ce, scroll_defs + SCROLL_INHERITED, N(scroll_defs) - SCROLL_INHERITED);
     sl_roundrect_ce = leaf("Baremetal\\Slate\\RoundRect", roundrect_methods, roundrect_defs, N(roundrect_defs), true);
     sl_circle_ce = leaf("Baremetal\\Slate\\Circle", circle_methods, circle_defs, N(circle_defs), true);
     sl_arc_ce = leaf("Baremetal\\Slate\\Arc", arc_methods, arc_defs, N(arc_defs), true);
@@ -1179,6 +1619,7 @@ void sl_elements_register(void)
     s_base_ce[SL_TEXT] = sl_text_ce;
     s_base_ce[SL_CANVAS] = sl_canvas_ce;
     s_base_ce[SL_IMAGE] = sl_image_ce;
+    s_base_ce[SL_SCROLL] = sl_scroll_ce;
 
     table(SL_GROUP, group_defs, N(group_defs));
     table(SL_ROUNDRECT, roundrect_defs, N(roundrect_defs));
@@ -1188,6 +1629,7 @@ void sl_elements_register(void)
     table(SL_TEXT, text_defs, N(text_defs));
     table(SL_CANVAS, canvas_defs, N(canvas_defs));
     table(SL_IMAGE, image_defs, N(image_defs));
+    table(SL_SCROLL, scroll_defs, N(scroll_defs));
 }
 
 void sl_elements_scene(zend_class_entry *scene_ce)

@@ -32,6 +32,15 @@
         scratch cannot hold a row the children are drawn straight into the band, opacity ignored, and
         stats.degraded counts it (offscreen work never blends in cache memory);
       - otherwise its children are drawn straight into the band;
+      a scroll (scene.h, "Scroll") is drawn as a group clipped to its view, its children shifted by its drawn
+      position (those outside the view are not listed, as with any clip); with cache (and no shadow or blur) its
+      content image (cache.h) is copied at that position, built once (the caches of the children built inside it
+      are cut to that image, not to the screen, and dropped once it is built); when cache memory or the scratch
+      refuses it, or a child's shadow or blur gets no memory during the build (the image is then freed and not
+      built again until the content changes), the scroll is composed directly as without cache and
+      stats.scroll_nocache counts it. Its bars go over its content: for a
+      scroll drawn straight into the band, an item of their own right after its children; else drawn after the
+      group's content with its opacity;
    5. converts the band to the panel's byte order (high byte first, slate_swap565_row, in place: the compositor
       swaps, not the engine) and calls emit(ctx, region, y0, rows, px): px holds rows x region width pixels,
       stride = region width (contiguous), screen rows y0 .. y0 + rows - 1. The bands of one region are emitted
@@ -55,12 +64,43 @@
 
    Placement: elements drawn through a cache sit on whole pixels (scene.h, "Placement").
 
+   Transitions (slate_pair_*): two scene roots composed together, band by band, in the same two bands, without a
+   screen-sized buffer more. slate_pair_begin puts them, each in a layer of its own (an internal plain GROUP), under
+   the root the frames compose (the screen): the bottom layer holds the scene underneath, the top layer the scene on
+   top over a curtain, an opaque screen-sized ROUNDRECT of that scene's background colour (its page; the curtain is an
+   occluder, so what it covers of the bottom scene is skipped). The target's background must then be the bottom
+   scene's (under_bg). slate_pair_at moves the layers by whole pixels (x or y: the eased progress v times the screen's
+   width or height, rounded to the nearest pixel, halves up; v may leave 0..1 with an ease that overshoots) or, for a
+   fade, sets the top layer's opacity to v (clamped to 0..1): then the top scene and its curtain are composed
+   offscreen like any group with opacity (strips from the scratch, a band's worth at most). Directions are those of
+   the movement (s = -1 for LEFT and UP, +1 for RIGHT and DOWN; d = the offset in pixels):
+     FADE     bottom: from, top: to (opacity v)
+     PUSH     bottom: from at s * d, top: to at s * (d - span): to enters from the side opposite the direction and
+              pushes from out
+     COVER    bottom: from, still; top: to at s * (d - span), sliding over it
+     UNCOVER  bottom: to, still; top: from at s * d, sliding away and uncovering it
+   Each layer clips to its page, the box (0, 0, w, h) at its offset: what a scene has off its page (a drawer parked
+   at a negative x, a panel past an edge, a shadow or blur past an edge) never shows over the other scene, as it
+   never shows on the screen when that scene is shown alone. While a pair is active the caches of its scenes are
+   built for the page of their scene, not for the screen (cache.h: "big groups are built clipped to the screen"), so
+   a cached group that slides onto the screen is built once, as it will be when shown alone, and only moved
+   afterwards. An ease that overshoots (OutBack, OutElastic) moves the layers past their places: the strip a slide
+   leaves uncovered then shows the target's background, the bottom scene's.
+   The roots keep their own x, y (the layer's offset adds to them); group caches move with them (whole pixels: a
+   shift of the image), and elements may change, be animated, added or removed meanwhile as usual. The caller marks
+   the whole screen dirty at every step that moved the layers and, as the underlay's items move, turns the underlay off (and gives its
+   memory back) for the transition. slate_pair_end takes the layers away and puts to back under the root, on top of
+   its children (from is left without a parent). Scene functions only: nothing here draws, and the dirty set is not
+   touched.
+
    Stats (overwritten by every call): drawn = items drawn, counted once per band or offscreen strip they are drawn
    into (children of a group composed offscreen count too); culled = items skipped by occlusion, likewise per band;
    cache_hit / cache_miss = per element and frame, when an element's cached images are used as they are / have
    to be built (or cannot be: allocation failure); area = pixels composed (sum of the bands); degraded = groups
    drawn without their opacity for lack of scratch; aborted = 1 when the frame was not composed (band_buf NULL);
-   scratch_want = the most scratch the frame asked scratch_grow for (bytes, 0: none asked; see slate_target_t). */
+   scratch_want = the most scratch the frame asked scratch_grow for (bytes, 0: none asked; see slate_target_t);
+   scroll_nocache = cached scrolls composed directly because their content image could not be built (no cache memory,
+   or no scratch to build it; per element and frame, also counted in cache_miss). */
 #ifndef SLATE_COMPOSE_H
 #define SLATE_COMPOSE_H
 
@@ -72,7 +112,9 @@
 #include "scene.h"
 #include "slate_gfx.h"
 
-typedef struct { uint32_t drawn, culled, cache_hit, cache_miss, area, degraded, aborted, scratch_want; } slate_stats_t;
+typedef struct {
+    uint32_t drawn, culled, cache_hit, cache_miss, area, degraded, aborted, scratch_want, scroll_nocache;
+} slate_stats_t;
 
 typedef void (*slate_emit_fn)(void *ctx, slate_rect_t region, int y0, int rows, uint16_t *px);
 
@@ -95,7 +137,8 @@ typedef struct {
     void (*cache_free)(void *ctx, void *p);
     /* Fast scratch memory (internal RAM) for groups composed offscreen and for building caches. Required for
        group opacity and caches: a strip of a group needs (width * 3 + 3) & ~3 bytes per row, and each nesting
-       level gets half of what is left, so the minimum is 2 * (3 * w + 3) bytes; recommended 3 * w * rows (one
+       level gets half of what is left (less when that would leave a level nested deeper without a row: then each
+       level leaves a row for each one under it), so the minimum is 2 * (3 * w + 3) bytes; recommended 3 * w * rows (one
        band's worth of strips, e.g. 43 KB for 360 x 40). Without it (NULL / too small) opacity groups are drawn
        without their opacity and caches are not built. */
     void *scratch;
@@ -120,7 +163,41 @@ void slate_compose(slate_el_t *root, slate_dirty_t *d, const slate_target_t *t, 
 /* Turns the underlay on or off for the frames that follow (off by default; off keeps the one there is, unused). */
 void slate_compose_underlay(bool on);
 
+/* Gives the underlay's memory back now (cache_free); a later frame with the underlay on defines it again. */
+void slate_compose_underlay_free(void);
+
 /* Frees the compositor's own working memory (the item list, which otherwise grows to the largest scene seen). */
 void slate_compose_release(void);
+
+/* Transitions (see above). Kinds and directions in the order of the PHP API (enum Direction). */
+typedef enum {
+    SLATE_TRANS_NONE,
+    SLATE_TRANS_FADE,
+    SLATE_TRANS_PUSH,
+    SLATE_TRANS_COVER,
+    SLATE_TRANS_UNCOVER,
+} slate_trans_kind_t;
+#define SLATE_TRANS_COUNT 5
+typedef enum { SLATE_DIR_LEFT, SLATE_DIR_RIGHT, SLATE_DIR_UP, SLATE_DIR_DOWN } slate_dir_t;
+#define SLATE_DIR_COUNT 4
+
+typedef struct {
+    slate_el_t *parent, *from, *to;
+    slate_el_t *lay[2];      /* bottom, top: internal groups, children of parent */
+    slate_el_t *curtain;     /* the top scene's background, at the bottom of the top layer */
+    uint8_t kind, dir;
+    int w, h;
+    uint32_t under_bg;       /* the bottom scene's background (0xAARRGGBB, alpha ignored): the target's background */
+} slate_pair_t;
+
+/* Starts a transition of kind (not NONE) and dir from from (a child of parent, or NULL: only its background) to
+   to (a GROUP without a parent), at v = 0. from_bg, to_bg: the scenes' backgrounds (argb, alpha ignored); w, h: the
+   screen. false when out of memory (nothing changed). */
+bool slate_pair_begin(slate_pair_t *p, slate_el_t *parent, slate_el_t *from, slate_el_t *to, slate_trans_kind_t kind,
+                      slate_dir_t dir, uint32_t from_bg, uint32_t to_bg, int w, int h);
+/* The layers at eased progress v (0: the start, 1: the end); true when that moved them (or changed the opacity). */
+bool slate_pair_at(slate_pair_t *p, float v);
+/* Ends it: from (when still in its layer) is detached, to goes back under parent, on top; the layers are freed. */
+void slate_pair_end(slate_pair_t *p);
 
 #endif

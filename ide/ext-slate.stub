@@ -1,5 +1,5 @@
 <?php
-// php-baremetal/ext-slate 1.1.0 — IDE helper, not loaded at runtime.
+// php-baremetal/ext-slate 1.2.0 — IDE helper, not loaded at runtime.
 
 namespace Baremetal\Slate {
     /**
@@ -13,6 +13,24 @@ namespace Baremetal\Slate {
      */
     final class Slate
     {
+        /**
+         * How many scenes left keep their caches (cached groups, shadows, blurs) for a return to them; 0: a scene
+         * left drops them, as in 1.1. Past it, the oldest scene left drops them at once (also when it is lowered).
+         * The caches stay in Slate's cache budget in PSRAM: when the shown scene needs room there, the scenes left
+         * drop theirs first, oldest first.
+         *
+         * @throws \ValueError When negative ("keepScenes must be 0 or more"); the old value stays.
+         */
+        public int $keepScenes = 2;
+
+        /**
+         * A limit in KB for the caches of the scenes left; past it the oldest drops them at once (0: none is kept).
+         * null: only Slate's cache budget limits them.
+         *
+         * @throws \ValueError When negative ("keptBudget must be 0 or more"); the old value stays.
+         */
+        public ?int $keptBudget = null;
+
         /**
          * Takes the panel of $display and starts the compositor; with $touch, the active scene gets its touch
          * events through Scene::onTouch().
@@ -35,16 +53,28 @@ namespace Baremetal\Slate {
         public static function onboard(): Slate {}
 
         /**
-         * Shows a scene: onLeave() of the scene shown until now, build() the first time the scene is shown, then
-         * onEnter(). The change is sent to the compositor at once.
+         * Shows a scene. build() runs the first time the scene is shown.
+         *
+         * Without $t the change is instant: onLeave() of the scene shown until now, then onEnter() of the new one.
+         *
+         * With $t the new scene slides or fades in: its onEnter() runs at once (its elements are ready and its
+         * tweens start), and at the end onLeave() of the old scene runs and TransitionDone is raised. Meanwhile
+         * scene() is the new scene, both scenes' tweens run, and the touch reaches neither. From no scene shown
+         * (the first show()) the new scene comes in over the black background, with no TransitionDone.
+         *
+         * show() of the scene shown (also the one a transition goes to) does nothing. show() during a transition
+         * ends it first: onLeave() of the scene it leaves runs now (its TransitionDone follows), then the new
+         * change starts from the scene it went to, whole.
+         *
+         * The change is sent to the compositor at once.
          *
          * @throws \RuntimeException When the compositor has failed (the panel stopped answering) or is out of
          *     memory.
          */
-        public function show(Scene $s): void {}
+        public function show(Scene $s, ?Transition $t = null): void {}
 
         /**
-         * The scene shown now, or null before the first show().
+         * The scene shown now (during a transition: the scene it goes to), or null before the first show().
          */
         public function scene(): ?Scene {}
 
@@ -64,6 +94,12 @@ namespace Baremetal\Slate {
     class Scene
     {
         /**
+         * Whether the scene's caches stay when it is left, for a quick return (within Slate::$keepScenes and
+         * Slate::$keptBudget). Set it to false in a scene shown once (a splash): its caches go when it is left.
+         */
+        protected bool $keepCache = true;
+
+        /**
          * Adds elements on top of the scene's elements (the last one added is drawn on top).
          *
          * @throws \LogicException When an element already belongs to a group or a scene.
@@ -81,12 +117,13 @@ namespace Baremetal\Slate {
         protected function build(): void {}
 
         /**
-         * Called each time the scene is shown.
+         * Called each time the scene is shown (with a transition: when it starts).
          */
         public function onEnter(): void {}
 
         /**
-         * Called when another scene replaces this one.
+         * Called when another scene replaces this one (with a transition: when it ends, or when a show() during it
+         * ends it).
          */
         public function onLeave(): void {}
 
@@ -125,6 +162,43 @@ namespace Baremetal\Slate {
          * @throws \Error When a name is not a property.
          */
         public function set(mixed ...$props): static {}
+
+        /**
+         * Animates properties from their values on the screen to the ones given, in the compositor, at the
+         * panel's pace: ['x' => 200, 'opacity' => 0.5]. The properties read their final values at once. All of them
+         * share the time and the curve, and make one Tween; TweenDone follows when it ends by itself. A new
+         * animate() of a property that is already moving takes it over from where it is.
+         *
+         * Animatable: x, y and opacity of every element; Group w, h, blur; RoundRect w, h, radius, border, fill,
+         * borderColor; Circle r, border, fill, borderColor; Arc r, from, to, width, color; Line x1, y1, width,
+         * color; Text color. Colours move channel by channel; gradients and null (no fill, no border) are not
+         * animated.
+         *
+         * Like every tween of an element that is not shown, the tween of an element Slate has not drawn yet (made
+         * in build(), or before add()) waits, and starts when the element is shown.
+         *
+         * @param array<string, int|float|null> $props Property => final value, as a write of the property takes it.
+         * @param int $ms One run, in milliseconds (at least 1).
+         * @param int $delay Milliseconds before the first run.
+         * @param int $repeat Runs after the first; -1: forever (never done).
+         * @param bool $yoyo The repeats go back and forth (an odd repeat ends where it started).
+         * @throws \ValueError When a property is not animatable ("Baremetal\Slate\<Class>::$<name> cannot be
+         *     animated"), is a gradient or null now or as the target ("... cannot be animated: it is a gradient",
+         *     "... cannot be animated: it is null"), a value is
+         *     out of range, $props is empty, ms < 1 ("ms must be at least 1"), delay < 0 or repeat < -1 ("repeat must
+         *     be -1 or more"). Nothing changes then.
+         */
+        public function animate(array $props, int $ms = 300, Ease $ease = Ease::OutCubic, int $delay = 0,
+                                int $repeat = 0, bool $yoyo = false): Tween {}
+
+        /**
+         * From now on, every write of these properties slides to its value in $ms instead of jumping (from where
+         * the property is on the screen). ease([]) makes them jump again. No TweenDone for these moves.
+         *
+         * @param list<string> $props Names of animatable properties (see animate()).
+         * @throws \ValueError When a property is not animatable, or ms < 1.
+         */
+        public function ease(array $props, int $ms = 300, Ease $ease = Ease::OutCubic): static {}
     }
 
     /**
@@ -172,6 +246,117 @@ namespace Baremetal\Slate {
          * Takes elements out of the group; they stay usable.
          */
         public function remove(Element ...$e): static {}
+    }
+
+    /**
+     * A view (0, 0, w, h), always clipped, over its children, the content: they are placed in content coordinates
+     * and drawn shifted by the scroll position. The finger drags the content (forward the touches with touch()), a
+     * release flings it on with inertia, past an edge it stretches and springs back, and it can snap to steps; bars
+     * show the position while it moves. The compositor runs all of it at the pace of the panel; PHP is told when a
+     * motion ends (ScrollEnded). Extend it to build a list of your own.
+     *
+     * $w and $h (inherited) are the view, 1..32767; $clip is always true (writing false throws \ValueError
+     * "Baremetal\Slate\Scroll::$clip is always true"); $cache keeps the whole content as one image.
+     */
+    class Scroll extends Group
+    {
+        /** The content's width, 0..32767; 0: the box of the children from (0, 0), kept up to date. */
+        public int $contentW;
+
+        /** The content's height, 0..32767; 0: the box of the children from (0, 0), kept up to date. */
+        public int $contentH;
+
+        /** The axes the content moves on. */
+        public ScrollAxis $axis;
+
+        /** Past an edge the content stretches and springs back; false: it stops at the edge. */
+        public bool $bounce;
+
+        /** Snap step on x in pixels (the content comes to rest on a multiple of it, or on the end), 0..32767; 0: none. */
+        public int $snapX;
+
+        /** Snap step on y in pixels, 0..32767; 0: none. */
+        public int $snapY;
+
+        /**
+         * At most this many snap steps per release, counted in the direction of the fling from the snap point at or
+         * behind the release position (never back against the fling; under 20 px/s the nearest point), 0..32767;
+         * 0: no limit. Per axis, only on an axis with a snap step: 1 makes a carousel move one card per fling,
+         * however fast. Not animatable.
+         */
+        public int $snapMax;
+
+        /** Bars that show the position while the content moves, then fade. */
+        public bool $indicators;
+
+        /**
+         * The position on x: read, the one last drawn (after a write, the value written until it is drawn); written,
+         * the content jumps there (kept within the limits, no error) and any motion stops.
+         */
+        public int|float $scrollX;
+
+        /** The position on y (as $scrollX). */
+        public int|float $scrollY;
+
+        /**
+         * @throws \ValueError When a value is out of range ("Baremetal\Slate\Scroll::$w must be between 1 and
+         *     32767", "...::$snapY must be between 0 and 32767", ...).
+         */
+        public function __construct(int|float $x = 0, int|float $y = 0, int|float $w = 1, int|float $h = 1,
+                                    ScrollAxis $axis = ScrollAxis::Both, bool $bounce = true, int $snapX = 0,
+                                    int $snapY = 0, int $snapMax = 0, bool $indicators = true, int $contentW = 0,
+                                    int $contentH = 0, float $opacity = 1.0, bool $cache = false) {}
+
+        /**
+         * Gives the scroll a touch event (usually from Scene::onTouch()). True when the touch belongs to the scroll:
+         * a Moved past 8 px from the press (on the axis allowed; with Both, the distance) and the ones after it, the
+         * Released that ends a drag (the content flings on); and a catch: a Pressed inside the view while the content
+         * moves (it stops there), with every Moved and the Released of that touch (never a tap; a drag may still
+         * start from it). False for a Pressed outside the view, a Pressed at rest, a Moved under 8 px and a Released
+         * without a drag (a tap), a Gesture, and for a scroll that is not in the scene shown. The view is the part on
+         * the screen (cut by the scrolls and clipping groups it is in). A touch that is the scroll's stays so to its
+         * end, also when a write of the position, scrollTo(), a new set-up or leaving the screen ends its drag (from
+         * then on nothing is sent for it).
+         *
+         * @throws \TypeError When $e is not a TouchEvent.
+         */
+        public function touch(\Baremetal\Input\TouchEvent $e): bool {}
+
+        /**
+         * Moves the content to ($x, $y), kept within the limits, in $ms milliseconds along $ease; the Tween ends with
+         * its TweenDone and the scroll's ScrollEnded. $ms 0 (or a scroll not drawn yet): it jumps there, the Tween is
+         * done at once. A press, a write of $scrollX/$scrollY or a change of $axis, $bounce or the snap steps stops
+         * it (no TweenDone).
+         *
+         * @throws \ValueError When $x or $y is not finite ("Baremetal\Slate\Scroll::$scrollX must be a finite
+         *     number"), $ms < 0 ("ms must be 0 or more") or past 2147483647.
+         */
+        public function scrollTo(int|float $x, int|float $y, int $ms = 300, Ease $ease = Ease::OutCubic): Tween {}
+    }
+
+    /**
+     * The axes a Scroll moves on.
+     */
+    enum ScrollAxis
+    {
+        case Both;
+        case Vertical;
+        case Horizontal;
+    }
+
+    /**
+     * The content of a Scroll came to rest after a release (inertia, snap, spring) or at the end of a scrollTo()
+     * (which also gives its TweenDone). Once per motion; never while the finger holds the content.
+     */
+    final class ScrollEnded extends \Baremetal\Event
+    {
+        /** The scroll. */
+        public readonly Scroll $scroll;
+
+        /** Its position, in whole pixels. */
+        public readonly int $x;
+
+        public readonly int $y;
     }
 
     /**
@@ -472,6 +657,135 @@ namespace Baremetal\Slate {
     {
         /** @var list<string> The paths that could not be loaded (empty when all were). */
         public readonly array $failed;
+    }
+
+    /**
+     * An animation of Element::animate() or Tween::then(). The element is held while it runs.
+     */
+    final class Tween
+    {
+        /**
+         * true once it ended by itself (after all its repeats); set when its TweenDone is delivered, or by wait().
+         * Never for repeat -1; not after stop(), unless it ended in the very frame the stop reached the compositor.
+         */
+        public readonly bool $done;
+
+        private function __construct() {}
+
+        /**
+         * Stops it, and the tweens chained after it with then(), without TweenDone. The properties stay where they
+         * are on the screen (they still read the final values: write them to move them); with $toEnd they go to
+         * their final values.
+         *
+         * @throws \RuntimeException When the compositor failed.
+         */
+        public function stop(bool $toEnd = false): void {}
+
+        /**
+         * Waits until it ends, at most $timeout_ms milliseconds; the pending changes are handed to the compositor
+         * first, no event is delivered meanwhile. Returns false at once for a stopped tween and for repeat -1.
+         *
+         * @return bool true when it ended by itself.
+         * @throws \ValueError When $timeout_ms is negative.
+         */
+        public function wait(int $timeout_ms = 5000): bool {}
+
+        /**
+         * A tween of $e that starts when this one ends (after the ones already chained after it), from the values
+         * on the screen then; at once when this one has ended or stopped. stop() of the first stops the chain.
+         *
+         * @param array<string, int|float|null> $props As for Element::animate().
+         * @throws \ValueError As Element::animate().
+         */
+        public function then(Element $e, array $props, int $ms = 300, Ease $ease = Ease::OutCubic): Tween {}
+    }
+
+    /**
+     * A tween ended by itself (once per Tween; never for repeat -1; not after stop(), unless it ended in the very
+     * frame the stop reached the compositor).
+     */
+    final class TweenDone extends \Baremetal\Event
+    {
+        public readonly Tween $tween;
+    }
+
+    /**
+     * The easing curves of animations (the standard Penner curves). OutBack goes past the end and comes back,
+     * OutBounce bounces at the end, OutElastic oscillates around it.
+     */
+    enum Ease
+    {
+        case Linear;
+        case InQuad;
+        case OutQuad;
+        case InOutQuad;
+        case InCubic;
+        case OutCubic;
+        case InOutCubic;
+        case OutBack;
+        case OutBounce;
+        case OutElastic;
+    }
+
+    /**
+     * How Slate::show() changes the scene: the old and the new one are composed together, band by band, for $ms
+     * milliseconds along the $ease curve.
+     */
+    final class Transition
+    {
+        private function __construct() {}
+
+        /**
+         * The new scene appears over the old one, its opacity from 0 to 1.
+         *
+         * @throws \ValueError When $ms is below 1 (ms must be at least 1) or above 2147483647.
+         */
+        public static function fade(int $ms = 300, Ease $ease = Ease::OutCubic): Transition {}
+
+        /**
+         * The new scene comes in from the side opposite to $d and pushes the old one out towards $d.
+         *
+         * @throws \ValueError As fade().
+         */
+        public static function push(Direction $d, int $ms = 300, Ease $ease = Ease::OutCubic): Transition {}
+
+        /**
+         * The new scene slides in towards $d over the old one, which stays still.
+         *
+         * @throws \ValueError As fade().
+         */
+        public static function cover(Direction $d, int $ms = 300, Ease $ease = Ease::OutCubic): Transition {}
+
+        /**
+         * The old scene slides away towards $d and uncovers the new one, which stays still.
+         *
+         * @throws \ValueError As fade().
+         */
+        public static function uncover(Direction $d, int $ms = 300, Ease $ease = Ease::OutCubic): Transition {}
+    }
+
+    /**
+     * The direction a transition moves in.
+     */
+    enum Direction
+    {
+        case Left;
+        case Right;
+        case Up;
+        case Down;
+    }
+
+    /**
+     * A transition of Slate::show() ended (also when a show() during it ended it): onLeave() of $from has run.
+     * None for a transition from no scene (the first show()).
+     */
+    final class TransitionDone extends \Baremetal\Event
+    {
+        /** The scene left. */
+        public readonly Scene $from;
+
+        /** The scene shown. */
+        public readonly Scene $to;
     }
 
     /**

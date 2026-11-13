@@ -147,10 +147,14 @@ slate_el_t *slate_el_new(slate_el_kind_t kind)
     return e;
 }
 
+/* e's extent and its ancestors' are to compute again, and so are the content sizes of the scrolls among them. */
 static void invalidate_up(slate_el_t *e)
 {
     for (; e; e = e->parent) {
         e->ext_ok = false;
+        if (e->kind == SLATE_EL_GROUP && e->u.g.scroll) {
+            e->u.g.scroll->stale = true;
+        }
     }
 }
 
@@ -190,6 +194,7 @@ void slate_el_free(slate_el_t *e)
             detach(c);
             slate_el_free(c);
         }
+        slate_scene_mem_free(e->u.g.scroll);
         break;
     case SLATE_EL_ROUNDRECT: case SLATE_EL_CIRCLE:
         slate_scene_mem_free((void *)e->u.shape.fill.grad);
@@ -223,8 +228,10 @@ static void origin_of(const slate_el_t *a, float *ox, float *oy)
         origin_of(a->parent, &px, &py);
     }
     slate_el_place(a, &px, &py);
-    *ox = px + a->x;
-    *oy = py + a->y;
+    int dx, dy;
+    slate_el_scroll_px(a, &dx, &dy);
+    *ox = px + a->x - (float)dx;
+    *oy = py + a->y - (float)dy;
 }
 
 void slate_el_parent_origin(const slate_el_t *e, float *ox, float *oy)
@@ -317,6 +324,86 @@ static frect_t full_ext(slate_el_t *e)
     return frect_join(c, shadow_of(e, c));
 }
 
+/* ---- scroll geometry ---- */
+
+/* The children's boxes (s->ux*: shadows included, for the area they draw; s->aw, ah: the content size from (0, 0),
+   without shadows) and the physics' limits, when stale. */
+static void scroll_refresh(slate_el_t *e)
+{
+    slate_scroll_el_t *s = e->u.g.scroll;
+    if (!s->stale) {
+        return;
+    }
+    frect_t u = FEMPTY, c = FEMPTY;
+    for (slate_el_t *k = e->u.g.first; k; k = k->next) {
+        if (hidden(k)) {
+            continue;
+        }
+        frect_t f = full_ext(k);
+        if (!fempty(f)) {   /* a child placed on whole pixels: half a pixel either way (see content_ext) */
+            float p = slate_el_snaps(k) ? 0.5f : 0.0f;
+            u = frect_join(u, (frect_t){ f.x0 - p, f.y0 - p, f.x1 + p, f.y1 + p });
+            c = frect_join(c, content_ext(k));
+        }
+    }
+    s->ux0 = u.x0, s->uy0 = u.y0, s->ux1 = u.x1, s->uy1 = u.y1;
+    s->aw = !fempty(c) && c.x1 > 0 ? fmn(ceilf(c.x1), 32767.0f) : 0.0f;
+    s->ah = !fempty(c) && c.y1 > 0 ? fmn(ceilf(c.y1), 32767.0f) : 0.0f;
+    s->stale = false;
+    slate_scroll_limits(&s->phys, fmx(e->u.g.w, 0.0f), fmx(e->u.g.h, 0.0f), s->cw ? (float)s->cw : s->aw,
+                        s->ch ? (float)s->ch : s->ah);
+}
+
+/* The bar of one axis: view and content sizes, the scroll max, the drawn position (whole pixels), whether the other
+   bar takes the corner; its span along the axis in *o0 .. *o1 (view coordinates). false: no room for it. */
+static bool bar_span(float view, float content, float max, int pos, bool corner, int *o0, int *o1)
+{
+    int track = ifloor(view) - 2 * SLATE_SCROLL_BAR_GAP - (corner ? SLATE_SCROLL_BAR + SLATE_SCROLL_BAR_GAP : 0);
+    if (track < 1) {
+        return false;
+    }
+    float l = view * view / content;
+    l = fmn(fmx(l, (float)SLATE_SCROLL_BAR_MIN), (float)track);
+    int len = iround(l), over = 0;
+    if ((float)pos < 0) {
+        over = -pos;
+    } else if ((float)pos > max) {
+        over = iround((float)pos - max);
+    }
+    int lo = len < SLATE_SCROLL_BAR ? len : SLATE_SCROLL_BAR, cur = len - over > lo ? len - over : lo, off;
+    if (pos <= 0) {
+        off = 0;
+    } else if ((float)pos >= max) {
+        off = track - cur;
+    } else {
+        off = iround((float)(track - len) * (float)pos / max);
+    }
+    *o0 = SLATE_SCROLL_BAR_GAP + off;
+    *o1 = *o0 + cur;
+    return true;
+}
+
+static int scroll_bars(slate_el_t *e, slate_rect_t bars[2])
+{
+    slate_scroll_el_t *s = e->u.g.scroll;
+    scroll_refresh(e);
+    float w = e->u.g.w, h = e->u.g.h;
+    float cw = s->cw ? (float)s->cw : s->aw, ch = s->ch ? (float)s->ch : s->ah;
+    float mx = fmx(cw - w, 0.0f), my = fmx(ch - h, 0.0f);
+    bool ax = s->phys.axis != SLATE_SCROLL_V && mx > 0, ay = s->phys.axis != SLATE_SCROLL_H && my > 0;
+    int dx, dy, n = 0, o0, o1;
+    slate_el_scroll_px(e, &dx, &dy);
+    if (ay && bar_span(h, ch, my, dy, ax, &o0, &o1)) {
+        int x1 = iround(w) - SLATE_SCROLL_BAR_GAP;
+        bars[n++] = (slate_rect_t){ x1 - SLATE_SCROLL_BAR, o0, x1, o1 };
+    }
+    if (ax && bar_span(w, cw, mx, dx, ay, &o0, &o1)) {
+        int y1 = iround(h) - SLATE_SCROLL_BAR_GAP;
+        bars[n++] = (slate_rect_t){ o0, y1 - SLATE_SCROLL_BAR, o1, y1 };
+    }
+    return n;
+}
+
 static frect_t content_ext(slate_el_t *e)
 {
     if (e->ext_ok) {
@@ -367,7 +454,12 @@ static frect_t content_ext(slate_el_t *e)
         break;
     case SLATE_EL_GROUP: {
         const slate_group_t *g = &e->u.g;
-        for (slate_el_t *k = g->first; k; k = k->next) {
+        if (g->scroll) {   /* a scroll is its view in its parent, whatever its content and position */
+            if (g->w > 0 && g->h > 0) {
+                c = (frect_t){ e->x, e->y, e->x + g->w, e->y + g->h };
+            }
+        }
+        for (slate_el_t *k = g->scroll ? NULL : g->first; k; k = k->next) {
             if (hidden(k)) {
                 continue;
             }
@@ -435,7 +527,7 @@ static bool has_effects(const slate_el_t *g)
 
 bool slate_el_clips(const slate_el_t *g)
 {
-    return g->kind == SLATE_EL_GROUP && g->clip && g->u.g.w > 0 && g->u.g.h > 0;
+    return g->kind == SLATE_EL_GROUP && g->clip && ((g->u.g.w > 0 && g->u.g.h > 0) || g->u.g.scroll);
 }
 
 static bool under_effects(const slate_el_t *e)
@@ -522,14 +614,38 @@ static void dirty(slate_dirty_t *d, slate_rect_t r, int sw, int sh)
     }
 }
 
+/* The tracks of scroll a's bars on screen: where its bars can be whatever its content size and position (a change
+   inside a can change its content size, and so its bars), cut by its ancestors. Two thin boxes. */
+static void dirty_tracks(const slate_el_t *a, slate_dirty_t *d, int sw, int sh)
+{
+    if (hidden_chain(a)) {
+        return;
+    }
+    float ox, oy;
+    slate_el_parent_origin(a, &ox, &oy);
+    slate_el_place(a, &ox, &oy);
+    int fx = ifloor(ox + a->x), fy = ifloor(oy + a->y), cx = iceil(ox + a->x), cy = iceil(oy + a->y);
+    int w = iround(a->u.g.w), h = iround(a->u.g.h), m = SLATE_AA_MARGIN, g = SLATE_SCROLL_BAR_GAP;
+    int t = g + SLATE_SCROLL_BAR;
+    slate_rect_t v = { fx + w - t - m, fy + g - m, cx + w - g + m, cy + h - g + m };
+    slate_rect_t hz = { fx + g - m, fy + h - t - m, cx + w - g + m, cy + h - g + m };
+    dirty(d, through_ancestors(a, v), sw, sh);
+    dirty(d, through_ancestors(a, hz), sw, sh);
+}
+
 /* A change under groups drawn through an image (has_effects) builds their images again, which may change them
-   whole even when the element changed shows nothing (hidden, fully transparent): the outermost one's box. */
+   whole even when the element changed shows nothing (hidden, fully transparent): the outermost one's box. A change
+   under a scroll that shows its bars and sizes its content from its children also marks the tracks of its bars. */
 static void dirty_images(const slate_el_t *e, slate_dirty_t *d, int sw, int sh)
 {
     const slate_el_t *top = NULL;
     for (const slate_el_t *a = e->parent; a; a = a->parent) {
         if (has_effects(a)) {
             top = a;
+        }
+        const slate_scroll_el_t *s = a->u.g.scroll;   /* a: a GROUP (a parent) */
+        if (d && s && s->ind && (!s->cw || !s->ch)) {
+            dirty_tracks(a, d, sw, sh);
         }
     }
     if (d && top) {
@@ -612,6 +728,9 @@ static unsigned prop_kinds(slate_prop_t p)
         return K_SHAPE | K(SLATE_EL_GROUP);
     case SLATE_PROP_IMAGE:
         return K(SLATE_EL_IMAGE);
+    case SLATE_PROP_SCROLL: case SLATE_PROP_SCROLL_X: case SLATE_PROP_SCROLL_Y: case SLATE_PROP_CONTENT_W:
+    case SLATE_PROP_CONTENT_H: case SLATE_PROP_INDICATOR_A:
+        return K(SLATE_EL_GROUP);
     }
     return 0;
 }
@@ -633,6 +752,8 @@ static bool type_ok(slate_prop_t p, slate_val_type_t t)
         return t == SLATE_VAL_SHADOW;
     case SLATE_PROP_IMAGE:
         return t == SLATE_VAL_IMAGE;
+    case SLATE_PROP_SCROLL:
+        return t == SLATE_VAL_SCROLL;
     default:
         return t == SLATE_VAL_NUM;
     }
@@ -657,6 +778,75 @@ static float *num_field(slate_el_t *e, slate_prop_t p)
     case SLATE_PROP_Y1: return &e->u.line.y1;
     default: return NULL;
     }
+}
+
+bool slate_el_anim_get(const slate_el_t *e, slate_prop_t prop, slate_value_t *out)
+{
+    unsigned k = K(e->kind);
+    const slate_paint_t *paint = NULL;
+    switch (prop) {
+    case SLATE_PROP_X: case SLATE_PROP_Y:
+        break;
+    case SLATE_PROP_OPACITY:
+        *out = slate_v_num((float)e->alpha / 255.0f);
+        return true;
+    case SLATE_PROP_W: case SLATE_PROP_H:
+        if (!(k & (K(SLATE_EL_ROUNDRECT) | K(SLATE_EL_GROUP)))) {
+            return false;
+        }
+        break;
+    case SLATE_PROP_BLUR:
+        if (e->kind != SLATE_EL_GROUP) {
+            return false;
+        }
+        *out = slate_v_num((float)e->u.g.blur);
+        return true;
+    case SLATE_PROP_SCROLL_X: case SLATE_PROP_SCROLL_Y:   /* a scroll's drawn position: scrollTo (the engine's) */
+        if (e->kind != SLATE_EL_GROUP || !e->u.g.scroll) {
+            return false;
+        }
+        *out = slate_v_num(prop == SLATE_PROP_SCROLL_X ? e->u.g.scroll->sx : e->u.g.scroll->sy);
+        return true;
+    case SLATE_PROP_FILL:
+        if (!(k & K_SHAPE)) {
+            return false;
+        }
+        paint = &e->u.shape.fill;
+        break;
+    case SLATE_PROP_BORDER_COLOR:
+        if (!(k & K_SHAPE)) {
+            return false;
+        }
+        *out = slate_v_color(e->u.shape.border_argb);
+        return true;
+    case SLATE_PROP_COLOR:
+        if (e->kind == SLATE_EL_ARC) {
+            paint = &e->u.arc.color;
+        } else if (e->kind == SLATE_EL_LINE || e->kind == SLATE_EL_TEXT) {
+            *out = slate_v_color(e->kind == SLATE_EL_LINE ? e->u.line.argb : e->u.text.argb);
+            return true;
+        } else {
+            return false;
+        }
+        break;
+    case SLATE_PROP_RADIUS: case SLATE_PROP_BORDER: case SLATE_PROP_R: case SLATE_PROP_FROM: case SLATE_PROP_TO:
+    case SLATE_PROP_WIDTH: case SLATE_PROP_X1: case SLATE_PROP_Y1:
+        if (!(prop_kinds(prop) & k)) {
+            return false;
+        }
+        break;
+    default:
+        return false;
+    }
+    if (paint) {
+        if (paint->grad) {
+            return false;
+        }
+        *out = slate_v_color(paint->argb);
+        return true;
+    }
+    *out = slate_v_num(*num_field((slate_el_t *)e, prop));
+    return true;
 }
 
 /* A copy of p (gradient and stops in one block); false when out of memory. */
@@ -805,6 +995,147 @@ static bool arc_change_rect(const slate_el_t *e, const slate_arc_t *old, slate_p
     return true;
 }
 
+/* ---- scroll properties ---- */
+
+/* The end of a change of e: stamps, the caches over it, and the screen before (given) and after. */
+static void changed_tail(slate_el_t *e, slate_rect_t before, slate_dirty_t *d, int sw, int sh)
+{
+    touch(e);
+    slate_cache_stale_up(e);
+    dirty_images(e, d, sw, sh);
+    if (d) {
+        dirty(d, before, sw, sh);
+        dirty(d, slate_el_dirty_rect(e), sw, sh);
+    }
+}
+
+/* The screen area of scroll e's bars (at any alpha), cut by the ancestors; empty when hidden. */
+static slate_rect_t bars_rect(slate_el_t *e)
+{
+    slate_rect_t b[2], r = EMPTY;
+    int n = hidden_chain(e) ? 0 : scroll_bars(e, b);
+    if (n == 0) {
+        return EMPTY;
+    }
+    float ox, oy;
+    slate_el_parent_origin(e, &ox, &oy);
+    slate_el_place(e, &ox, &oy);
+    for (int i = 0; i < n; i++) {
+        slate_rect_t q = { ifloor(ox + e->x) + b[i].x0 - SLATE_AA_MARGIN, ifloor(oy + e->y) + b[i].y0 - SLATE_AA_MARGIN,
+                           iceil(ox + e->x) + b[i].x1 + SLATE_AA_MARGIN, iceil(oy + e->y) + b[i].y1 + SLATE_AA_MARGIN };
+        r = slate_rect_or(r, q);
+    }
+    return through_ancestors(e, r);
+}
+
+static bool scroll_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slate_dirty_t *d, int sw, int sh)
+{
+    slate_scroll_el_t *s = e->u.g.scroll;
+    if (prop == SLATE_PROP_SCROLL) {
+        const slate_scroll_t *cfg = v->v.scroll;
+        if (!cfg && !s) {
+            return true;
+        }
+        slate_rect_t before = d ? slate_el_dirty_rect(e) : EMPTY;
+        if (cfg) {
+            if (!s) {
+                s = slate_scene_mem(sizeof *s);
+                if (!s) {
+                    return false;
+                }
+                e->u.g.scroll = s;
+            }
+            s->phys = *cfg;   /* its limits follow (stale) */
+            e->clip = true;
+        } else {
+            slate_scene_mem_free(s);
+            e->u.g.scroll = NULL;
+        }
+        invalidate_up(e);
+        slate_cache_stale(e, true, true);   /* the content image of a scroll is not a group's */
+        if (e->cache && !needs_cache(e)) {
+            slate_cache_drop(e);
+        }
+        changed_tail(e, before, d, sw, sh);
+        return true;
+    }
+    if (!s) {
+        return false;
+    }
+    switch (prop) {
+    case SLATE_PROP_SCROLL_X: case SLATE_PROP_SCROLL_Y: {
+        float *f = prop == SLATE_PROP_SCROLL_X ? &s->sx : &s->sy;
+        float val = fmn(fmx(v->v.num, -1048576.0f), 1048576.0f);
+        if (*f == val) {
+            return true;
+        }
+        if (iround(*f) == iround(val)) {   /* drawn on the same pixel: nothing changes on screen */
+            *f = val;
+            return true;
+        }
+        slate_rect_t before = d ? slate_el_dirty_rect(e) : EMPTY;
+        *f = val;   /* e's box (its view) and its content size do not change */
+        bool image = slate_el_has_shadow(e) || slate_el_blur(e) > 0;
+        if (image) {
+            slate_cache_stale(e, true, true);   /* drawn through an image of the view */
+        }
+        touch(e);
+        slate_cache_stale_up(e);
+        dirty_images(e, d, sw, sh);
+        if (d) {
+            slate_rect_t after = slate_el_dirty_rect(e);
+            if (!image && !under_effects(e)) {   /* the pixels that change are the view's (no AA fringe past it) */
+                float ox, oy;
+                slate_el_parent_origin(e, &ox, &oy);
+                slate_rect_t view = slate_el_clip_rect(e, ox, oy);
+                before = slate_rect_and(before, view);
+                after = slate_rect_and(after, view);
+            }
+            dirty(d, before, sw, sh);
+            dirty(d, after, sw, sh);
+        }
+        return true;
+    }
+    case SLATE_PROP_CONTENT_W: case SLATE_PROP_CONTENT_H: {
+        int n = iround(v->v.num);
+        int16_t val = (int16_t)(n < 0 ? 0 : n > 32767 ? 32767 : n), *f = prop == SLATE_PROP_CONTENT_W ? &s->cw : &s->ch;
+        if (*f == val) {
+            return true;
+        }
+        /* the limits change; on screen only the bars, when shown */
+        slate_rect_t before = d && s->ind ? bars_rect(e) : EMPTY;
+        *f = val;
+        s->stale = true;
+        if (s->ind) {
+            touch(e);
+            slate_cache_stale_up(e);
+            dirty_images(e, d, sw, sh);
+            dirty(d, before, sw, sh);
+            dirty(d, d ? bars_rect(e) : EMPTY, sw, sh);
+        }
+        return true;
+    }
+    case SLATE_PROP_INDICATOR_A: {
+        float o = v->v.num < 0 ? 0 : v->v.num > 1 ? 1 : v->v.num;
+        uint8_t a = (uint8_t)(o * 255.0f + 0.5f);
+        if (a == s->ind) {
+            return true;
+        }
+        /* the bars only: nothing else changes (they are drawn over any image of e, never in it) */
+        slate_rect_t before = d ? bars_rect(e) : EMPTY;
+        s->ind = a;
+        touch(e);
+        slate_cache_stale_up(e);
+        dirty_images(e, d, sw, sh);
+        dirty(d, before, sw, sh);
+        dirty(d, d ? bars_rect(e) : EMPTY, sw, sh);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 bool slate_el_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slate_dirty_t *d, int sw, int sh)
 {
     if (!e || !v || !(prop_kinds(prop) & K(e->kind)) || !type_ok(prop, v->type)) {
@@ -812,6 +1143,9 @@ bool slate_el_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slat
     }
     if (v->type == SLATE_VAL_NUM && !isfinite(v->v.num)) {
         return false;
+    }
+    if (prop >= SLATE_PROP_SCROLL) {
+        return scroll_set(e, prop, v, d, sw, sh);
     }
     float *f = num_field(e, prop);
     if (f && *f == v->v.num) {   /* unchanged: nothing to do (and nothing to redraw) */
@@ -853,7 +1187,10 @@ bool slate_el_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slat
         } else {
             *f = v->v.num;
         }
-        own_content = own_shadow = true;
+        /* a scroll's content image does not depend on its view (it is rebuilt when the cut axis needs more: compose.c,
+           slate_el_scroll_area); the image of a scroll's view with shadow or blur does */
+        own_content = own_shadow = e->kind != SLATE_EL_GROUP || !e->u.g.scroll || slate_el_has_shadow(e) ||
+                                    slate_el_blur(e) > 0;
         break;
     case SLATE_PROP_BORDER: case SLATE_PROP_RADIUS: case SLATE_PROP_R: case SLATE_PROP_WIDTH:
         *f = v->v.num;
@@ -936,6 +1273,9 @@ bool slate_el_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slat
         text_layout(e);
         break;
     case SLATE_PROP_CLIP:
+        if (e->u.g.scroll && !v->v.b) {
+            return false;   /* a scroll always clips */
+        }
         changed = e->clip != v->v.b;
         e->clip = v->v.b;
         own_content = true;
@@ -975,6 +1315,8 @@ bool slate_el_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slat
         own_content = true;
         break;
     }
+    default:
+        return false;
     }
     if (!changed) {
         return true;
@@ -1091,4 +1433,56 @@ bool slate_el_image_sync(slate_el_t *e, slate_dirty_t *d, int sw, int sh)
     dirty(d, before, sw, sh);
     dirty(d, slate_el_dirty_rect(e), sw, sh);
     return true;
+}
+
+/* ---- scroll ---- */
+
+slate_scroll_t *slate_el_scroll(slate_el_t *e)
+{
+    if (!e || e->kind != SLATE_EL_GROUP || !e->u.g.scroll) {
+        return NULL;
+    }
+    scroll_refresh(e);
+    return &e->u.g.scroll->phys;
+}
+
+void slate_el_scroll_extent(slate_el_t *e, float *cw, float *ch)
+{
+    *cw = *ch = 0;
+    if (!slate_el_scroll(e)) {
+        return;
+    }
+    const slate_scroll_el_t *s = e->u.g.scroll;
+    *cw = s->cw ? (float)s->cw : s->aw;
+    *ch = s->ch ? (float)s->ch : s->ah;
+}
+
+slate_rect_t slate_el_scroll_area(slate_el_t *e)
+{
+    if (!slate_el_scroll(e)) {
+        return EMPTY;
+    }
+    const slate_scroll_el_t *s = e->u.g.scroll;
+    if (!(s->ux0 < s->ux1 && s->uy0 < s->uy1)) {
+        return EMPTY;
+    }
+    slate_rect_t r = { ifloor(s->ux0) - SLATE_AA_MARGIN, ifloor(s->uy0) - SLATE_AA_MARGIN,
+                       iceil(s->ux1) + SLATE_AA_MARGIN, iceil(s->uy1) + SLATE_AA_MARGIN };
+    /* on an axis it cannot scroll only the view's span shows (at the position written there, normally 0) */
+    int dx, dy;
+    slate_el_scroll_px(e, &dx, &dy);
+    if (s->phys.axis == SLATE_SCROLL_V) {
+        r = slate_rect_and(r, (slate_rect_t){ dx - 1, r.y0, dx + iceil(e->u.g.w) + 1, r.y1 });
+    } else if (s->phys.axis == SLATE_SCROLL_H) {
+        r = slate_rect_and(r, (slate_rect_t){ r.x0, dy - 1, r.x1, dy + iceil(e->u.g.h) + 1 });
+    }
+    return slate_rect_empty(r) ? EMPTY : r;
+}
+
+int slate_el_scroll_bars(slate_el_t *e, slate_rect_t bars[2])
+{
+    if (!e || e->kind != SLATE_EL_GROUP || !e->u.g.scroll) {
+        return 0;
+    }
+    return scroll_bars(e, bars);
 }

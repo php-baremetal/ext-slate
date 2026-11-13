@@ -53,6 +53,26 @@
    and opacity 1, or a CANVAS with opacity 1, or an IMAGE that is shown (sync), opaque (the .sli flag) and at
    opacity 1. The compositor uses it to skip what is underneath (compose.h).
 
+   Scroll. A GROUP made a scroll (SLATE_PROP_SCROLL, a copy of a slate_scroll_t of scroll.h; the record, 40 bytes
+   plus the physics, from the scene allocator, only for scrolls; the element's size does not change) is a view (0, 0, w, h) over its children, the
+   content, in content coordinates: they are drawn shifted by minus its drawn position (SCROLL_X, SCROLL_Y, rounded
+   to whole pixels, slate_el_scroll_px), so the origin of its children (slate_el_parent_origin) includes that shift.
+   Its clip is always on (CLIP false is refused) and cuts the view even with w or h <= 0 (then nothing shows). The
+   content size is CONTENT_W / CONTENT_H, or for 0 the box of the visible children from (0, 0) (their geometry, no
+   shadow, rounded up), computed again whenever the children's extent, the content size or the view changes; the
+   physics' limits follow (slate_scroll_limits) before any use of them (slate_el_scroll and the functions below).
+   Its box is its view (0, 0, w, h) (grown by its blur), whatever its content and position: that is what it counts
+   for in its parent's box and in an outer scroll's content size. A change of the drawn position marks only the view
+   (on the same whole pixel: nothing), and keeps the content image of a cached scroll (cache.h); a change under it
+   marks as for any group; a change of its content size marks only its bars (nothing without them). Bars (indicators): SLATE_SCROLL_BAR px thick, rounded,
+   SLATE_SCROLL_BAR_GAP px from the view's right (vertical bar) and bottom (horizontal bar) edges, only on the axes
+   the scroll allows that have something to scroll (content > view); along its axis a bar runs on a track from
+   SLATE_SCROLL_BAR_GAP to view - SLATE_SCROLL_BAR_GAP (minus the other bar's corner, SLATE_SCROLL_BAR +
+   SLATE_SCROLL_BAR_GAP, when both show), its length view^2 / content, at least SLATE_SCROLL_BAR_MIN and at most the
+   track, at an offset (track - length) * position / max rounded; past an edge it is shorter by the overscroll (down to
+   SLATE_SCROLL_BAR px) and sits against the end of its track. Drawn over the content in SLATE_SCROLL_BAR_ARGB times
+   INDICATOR_A (written by the engine as they fade): 0 draws none, and a change of it marks only their boxes.
+
    Images. An IMAGE element holds a reference to its image (taken by slate_el_set, dropped when the image changes
    and by slate_el_free) and the image's pixels once seen READY (u.image.sli: what the compositor draws). The
    image becomes READY in the loader task, at any moment: the element shows it only from slate_el_image_sync on
@@ -61,17 +81,26 @@
 #ifndef SLATE_SCENE_H
 #define SLATE_SCENE_H
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "dirty.h"
 #include "raster.h"
+#include "scroll.h"
 #include "slate_gfx.h"
 #include "sli.h"
 
 #define SLATE_AA_MARGIN 1
 #define SLATE_BLUR_EXTENT(r) (3 * (r))
+
+/* Scroll bars (see "Scroll" above): thickness, gap to the view's edges, shortest length (px), colour (straight argb,
+   times the indicator alpha and the scroll's opacity). */
+#define SLATE_SCROLL_BAR 3
+#define SLATE_SCROLL_BAR_GAP 2
+#define SLATE_SCROLL_BAR_MIN 16
+#define SLATE_SCROLL_BAR_ARGB 0x99808080u
 
 typedef enum {
     SLATE_EL_GROUP = 1,
@@ -113,6 +142,13 @@ typedef enum {
     SLATE_PROP_BLUR,          /* NUM: GROUP blur radius, whole pixels, 0..SLATE_BLUR_RADIUS_MAX */
     SLATE_PROP_SHADOW,        /* SHADOW: ROUNDRECT, CIRCLE, GROUP */
     SLATE_PROP_IMAGE,         /* IMAGE: IMAGE (NULL: none); a reference is taken */
+    SLATE_PROP_SCROLL,        /* SCROLL: GROUP; makes it a scroll with a copy of the given physics state, NULL: a
+                                 plain group again (see "Scroll" above) */
+    SLATE_PROP_SCROLL_X,      /* NUM: scroll only, the drawn position (overscroll included) */
+    SLATE_PROP_SCROLL_Y,      /* NUM */
+    SLATE_PROP_CONTENT_W,     /* NUM: scroll only, whole pixels 0..32767, 0 = from the children */
+    SLATE_PROP_CONTENT_H,     /* NUM */
+    SLATE_PROP_INDICATOR_A,   /* NUM: scroll only, alpha of the scroll bars, clamped to 0..1 */
 } slate_prop_t;
 
 typedef enum {
@@ -125,6 +161,7 @@ typedef enum {
     SLATE_VAL_FONT,
     SLATE_VAL_SHADOW,
     SLATE_VAL_IMAGE,
+    SLATE_VAL_SCROLL,
 } slate_val_type_t;
 
 /* A drop shadow: offset (dx, dy) in pixels, blur radius (box radius, 0..SLATE_BLUR_RADIUS_MAX) and straight
@@ -147,6 +184,7 @@ typedef struct {
         const struct display_font_entry *font;
         slate_shadow_t shadow;
         struct slate_image *image;         /* IMAGE: the receiver takes its own reference */
+        const slate_scroll_t *scroll;      /* SCROLL: copied by the receiver; NULL: none */
     } v;
 } slate_value_t;
 
@@ -164,6 +202,11 @@ static inline slate_value_t slate_v_font(const struct display_font_entry *f)
 static inline slate_value_t slate_v_image(struct slate_image *im)
 {
     slate_value_t v = { SLATE_VAL_IMAGE, { .image = im } };
+    return v;
+}
+static inline slate_value_t slate_v_scroll(const slate_scroll_t *s)
+{
+    slate_value_t v = { SLATE_VAL_SCROLL, { .scroll = s } };
     return v;
 }
 /* dx, dy clamped to +-32767, blur to 0..SLATE_BLUR_RADIUS_MAX */
@@ -186,11 +229,24 @@ typedef struct {          /* ROUNDRECT: box w x h, corner radius r; CIRCLE: radi
     uint32_t border_argb;
     slate_shadow_t shadow;
 } slate_shape_t;
+/* A scroll's state (GROUP with SLATE_PROP_SCROLL), from the scene allocator. */
+typedef struct {
+    slate_scroll_t phys;        /* the physics, stepped by the engine; its limits kept up to date (slate_el_scroll) */
+    float sx, sy;               /* drawn position (SCROLL_X, SCROLL_Y); the children are drawn at -round() of it */
+    int16_t cw, ch;             /* explicit content size, 0 = from the children */
+    uint8_t ind;                /* scroll bars' alpha, 0..255 */
+    bool stale;                 /* the children's extent and the physics' limits are to compute again */
+    float ux0, uy0, ux1, uy1;   /* derived: the union of the visible children's boxes (shadows included), content
+                                   coordinates; ux0 >= ux1: none */
+    float aw, ah;               /* derived: the automatic content size (the children's box from (0, 0)) */
+} slate_scroll_el_t;
+
 typedef struct {
     slate_el_t *first, *last;   /* children, bottom .. top */
     float w, h;                 /* clip box */
     slate_shadow_t shadow;
     int16_t blur;
+    slate_scroll_el_t *scroll;  /* NULL: not a scroll */
 } slate_group_t;
 typedef struct { float r, from, to, width; slate_paint_t color; uint8_t caps; } slate_arc_t;
 typedef struct { float x1, y1, width; uint32_t argb; uint8_t caps; } slate_line_t;
@@ -223,6 +279,8 @@ struct slate_el {
     uint8_t alpha;                       /* opacity * 255, rounded */
     bool visible : 1, clip : 1, cached : 1, opaque : 1, ext_ok : 1;   /* clip, cached: GROUP properties */
     bool under : 1;                      /* the compositor's: e is drawn in its underlay (compose.c) */
+    bool anim : 1;                       /* the engine's: e may have tweens or ease settings (engine.c); a hint,
+                                            nothing here reads it */
     union {
         slate_group_t g;
         slate_shape_t shape;
@@ -268,6 +326,15 @@ bool slate_el_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slat
 void slate_el_move(slate_el_t *e, const slate_value_t *x, const slate_value_t *y, slate_dirty_t *d, int sw, int sh,
                    bool *ok_x, bool *ok_y);
 
+/* The current value of an animatable property of e (tween.h), for the engine's tweens: NUM for X, Y, OPACITY (the
+   stored alpha / 255), W and H (ROUNDRECT, GROUP), BLUR (GROUP), RADIUS (ROUNDRECT), BORDER (ROUNDRECT, CIRCLE), R
+   (CIRCLE, ARC), FROM and TO (ARC), WIDTH (ARC, LINE), X1 and Y1 (LINE), SCROLL_X and SCROLL_Y (a scroll: only the
+   engine animates them, scrollTo); COLOR for FILL (ROUNDRECT, CIRCLE),
+   BORDER_COLOR (ROUNDRECT, CIRCLE) and COLOR (ARC, LINE, TEXT). false when e's kind does not animate prop (X, Y and
+   OPACITY are every kind's; a CANVAS's W and H are not animated, nor any other property) or the paint is a gradient
+   now. */
+bool slate_el_anim_get(const slate_el_t *e, slate_prop_t prop, slate_value_t *out);
+
 /* Screen origin of e's parent (0, 0 for a root). */
 void slate_el_parent_origin(const slate_el_t *e, float *ox, float *oy);
 /* True for the elements drawn through a cache (a GROUP with cache, a built shadow or a built blur; a ROUNDRECT or
@@ -299,6 +366,28 @@ bool slate_el_has_shadow(const slate_el_t *e);
    owner; after writing call slate_canvas_dirty (r in the canvas's own pixels, clipped to it; NULL = whole). */
 uint16_t *slate_canvas_px(slate_el_t *e, int *w, int *h);
 void slate_canvas_dirty(slate_el_t *e, const slate_rect_t *r, slate_dirty_t *d, int sw, int sh);
+
+/* Scroll (see "Scroll" above). The physics state of scroll e with its limits up to date (view, content), NULL when
+   e is not a scroll. */
+slate_scroll_t *slate_el_scroll(slate_el_t *e);
+/* The content size of scroll e: the explicit one (CONTENT_W/H) or, for 0, the children's box from (0, 0) (0 x 0 when
+   e is not a scroll). */
+void slate_el_scroll_extent(slate_el_t *e, float *cw, float *ch);
+/* The area the children of scroll e can draw, in content coordinates (whole pixels, AA margin included): the area of
+   its content image when cached; on an axis the scroll cannot move, cut to the view's span at the position written
+   there. Empty when it has none or is not a scroll. */
+slate_rect_t slate_el_scroll_area(slate_el_t *e);
+/* The scroll bars of scroll e at its drawn position, whatever their alpha: up to two boxes in e's own coordinates
+   (the view's top-left at (0, 0)), the vertical one first; returns how many (0 when e is not a scroll). */
+int slate_el_scroll_bars(slate_el_t *e, slate_rect_t bars[2]);
+/* The drawn position of e rounded to whole pixels (0, 0 when e is not a scroll): e's children are drawn shifted by
+   minus that. */
+static inline void slate_el_scroll_px(const slate_el_t *e, int *dx, int *dy)
+{
+    const slate_scroll_el_t *s = e->kind == SLATE_EL_GROUP ? e->u.g.scroll : NULL;
+    *dx = s ? (int)floorf(s->sx + 0.5f) : 0;
+    *dy = s ? (int)floorf(s->sy + 0.5f) : 0;
+}
 
 /* Image: when e is an IMAGE whose image is READY but not shown yet, shows it (its box and the opaque flag change)
    and adds its box to d, as any change does; true then. false (nothing done) otherwise. */
