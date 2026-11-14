@@ -6,6 +6,7 @@ see_also:
   - { href: './images.md', meta: 'API' }
   - { href: './animations.md', meta: 'API' }
   - { href: './scroll.md', meta: 'API' }
+  - { href: './touch.md', meta: 'API' }
   - { href: './effects-and-options.md', meta: 'API' }
   - { href: 'package:php-baremetal/ext-display', meta: 'Extension', label: 'ext-display' }
 prev: { label: 'Scenes and pages', href: './scenes.md' }
@@ -25,6 +26,9 @@ it is handed over (see [Scenes and pages](./scenes.md)).
 | `$x`, `$y` | `int\|float` | Position relative to the parent group (the scene for a top element), -32767 to 32767. Fractions are drawn anti-aliased. |
 | `$visible` | `bool` | `false` hides the element (a group with its children). Default `true`. |
 | `$opacity` | `float` | 0 (transparent) to 1 (opaque). A group's opacity applies to the group as a whole. Default 1. |
+| `$touchable` | `bool` | The element takes touches (`onPress()`..`onCancel()`, the callbacks of `on()`): see [Touch](./touch.md). Default `false` (`Scroll`: `true`). |
+| `$hitPad` | `int` | Pixels added to the touch area on every side, 0 to 64. Default 0. |
+| `$holdMs` | `int` | Milliseconds before `Hold`, 0 to 10000 (0: none). Default 500. |
 
 <!-- @method name="Element::set(mixed ...$props): static" returns="static" -->
 
@@ -44,6 +48,12 @@ properties read their final values at once; the returned `Tween` tells when it e
 
 From now on, writes of the named properties slide to their values instead of jumping: `$el->ease(['x', 'y'])`;
 `ease([])` makes them jump again. See [Animations](./animations.md).
+
+<!-- @method name="Element::on(TouchType $type, \Closure $fn): static" returns="static" -->
+
+The callback of one kind of touch (`TouchType::Tap`, ...); the element then takes touches. `off(TouchType $type)`
+removes it. The methods `onPress(Touch $t)`, `onMove()`, `onRelease()`, `onTap()`, `onHold()` and `onCancel()` are
+empty, for a component of your own to override. See [Touch](./touch.md).
 
 ## Positions and coordinates
 
@@ -219,7 +229,7 @@ preloading and errors are in [Images](./images.md).
 | Thrown | When |
 | --- | --- |
 | `\ValueError` | A property that cannot be animated, in `animate()`, `then()` and `ease()` (see [Animations](./animations.md#errors)). |
-| `\ValueError` | A value out of range: `Baremetal\Slate\RoundRect::$opacity must be between 0 and 1`, `...::$w must be between 0 and 32767`, `...::$x must be a finite number between -32767 and 32767`, `...::$fill must be a color, 0xRRGGBB or 0xAARRGGBB, or a gradient`, `...::$clip needs $w and $h greater than 0 (the clip box)`, an unknown font, an image path (`Baremetal\Slate\Image::$src must be an absolute path`, `...::$src must end in .sli or .png`). The old value stays. |
+| `\ValueError` | A value out of range: `Baremetal\Slate\RoundRect::$opacity must be between 0 and 1`, `...::$hitPad must be between 0 and 64`, `...::$holdMs must be between 0 and 10000`, `...::$w must be between 0 and 32767`, `...::$x must be a finite number between -32767 and 32767`, `...::$fill must be a color, 0xRRGGBB or 0xAARRGGBB, or a gradient`, `...::$clip needs $w and $h greater than 0 (the clip box)`, an unknown font, an image path (`Baremetal\Slate\Image::$src must be an absolute path`, `...::$src must end in .sli or .png`). The old value stays. |
 | `\TypeError` | A value of the wrong type (PHP's own message for typed properties). |
 | `\LogicException` | A second parent, or a group that would contain itself. |
 | `\RuntimeException` | The compositor failed (`Slate: the panel did not finish a band within 2000 ms`, `Slate: the panel refused the bands (error 0x..)`) or is out of memory for the changes. |

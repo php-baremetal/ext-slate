@@ -260,7 +260,7 @@ and without `slate-debug`, the same within 1 frame per second:
 
 ## Scroll
 
-A `Scroll` costs nothing in PHP either: the script forwards the touches, and the compositor runs the drag, the
+A `Scroll` costs nothing in PHP either: Slate routes the touches to it, and the compositor runs the drag, the
 inertia, the snapping and the springs at every refresh of the panel, composing only the view. Measured on an
 ESP32-S3 at 240 MHz with the 360 x 360 QSPI panel and its TE pin, on the pages of the `06-display/slate-scroll`
 example (views of 240 x 240 and 240 x 180), with touches sent by a timer every 16 ms, two rounds of each case:
@@ -297,6 +297,41 @@ example (views of 240 x 240 and 240 x 180), with touches sent by a timer every 1
 - **Memory.** Through all of the above, without Wi-Fi: at least 77 KB of internal RAM free at every frame, PSRAM
   free never under 560 KB (with the cache of the 12-row list), and the compositor's task used at most 4.1 KB of its
   10 KB stack.
+
+## Touch
+
+A scene without touchable elements costs nothing more for touch: no table, no work per frame. With touchable
+elements the compositor writes a table of where they are after each frame that changed something, on its own task,
+once the frame has gone to the panel, and PHP looks the finger up in it at each `Pressed`. Measured on an ESP32-S3
+at 240 MHz with the 360 x 360 QSPI panel, with touch events built by a timer and delivered through the same path as
+the touch screen's, two rounds of each case:
+
+| Scene | Entries in the table | Building the table, average / longest | Frames |
+| --- | --- | --- | --- |
+| 50 touchable rectangles, a spinner that changes every frame | 50 | 0.43 / 0.58 ms, after every frame | 60 per second, 13.6 ms on average: as with none touchable (60, 13.5 ms) |
+| The same, nothing moving | 50 | none: no frame, no table | none |
+| The busy scene above, its 18 moving elements touchable | 18 | 0.34 / 1.8 ms, after every frame | 55.8 to 55.9 per second, against 56.2 to 56.5 with none touchable; compose 12.6 to 12.7 ms in both |
+| A list of 40 touchable rows (a group of four elements each) in a `Scroll`, while it scrolls | 8 to 9 | 0.75 / 1.9 ms, after every frame | drag 60, inertia 55 per second: as before the rows were touchable |
+| A carousel of eight touchable cards (`06-display/slate-touch`) while it moves | 4 to 5 | 0.32 to 0.36 / 0.76 ms | |
+
+- **It does not lengthen a frame.** The table is built after the frame, in the time the compositor would otherwise
+  wait for the next refresh. Only a scene whose frames already fill the refresh loses frames to it: the busy scene,
+  about half a frame per second. Scrolling scenes that are bound by the refresh can lose up to about one frame per
+  second: a list springing back 53.6 against 54.7, a 2D area at its corner 52.4 against 53.3, a 2D drag 59.5 against
+  60.1. These differences are within the spread between measuring sessions, so they are not proof of a cost, but do
+  not expect them to be zero.
+- **It grows with the touchable elements walked, not with the ones you see.** The 40 rows of the list are all
+  walked at every frame of a scroll, although five are in the view, and the box of a touchable group is the box of
+  its children. Make a row or a card touchable as a whole (its children are part of its area) rather than each of
+  its parts, and keep the touchable elements of a long list few.
+- **From the touch to the handler.** From the `$time` of the touch event to the first line of `onPress()` or of
+  the `Tap` callback, through Slate's routing on the PHP task: 0.4 to 0.5 ms (median) on a still screen, 0.7 ms
+  while the compositor draws every refresh, 1.7 ms at most. The time the touch controller takes to report the
+  finger comes before it.
+- **Memory**, in external RAM: two tables of 20 bytes per touchable element (the one read and the one being
+  written) and an index of the touchable elements; about 3.6 KB for 50. The tables keep their largest size while
+  the Slate runs: a scene with many touchable elements leaves that memory in use after it is left, until the
+  Slate stops.
 
 ## Measuring
 

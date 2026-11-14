@@ -73,6 +73,16 @@ static void touch(slate_el_t *e)
     }
 }
 
+/* ---- touchables ---- */
+
+/* delta touchables more in group g's subtree and in its ancestors' (g NULL: nothing). */
+static void touch_count(slate_el_t *g, int delta)
+{
+    for (; g && delta; g = g->parent) {
+        g->u.g.touch_n = (uint32_t)((int64_t)g->u.g.touch_n + delta);
+    }
+}
+
 /* ---- effects that are built ---- */
 
 static slate_shadow_t *shadow_ptr(slate_el_t *e)
@@ -175,6 +185,7 @@ static void detach(slate_el_t *c)
         p->u.g.last = c->prev;
     }
     c->parent = c->prev = c->next = NULL;
+    touch_count(p, -(int)slate_el_touchables(c));
     touch(p);
     invalidate_up(p);
     slate_cache_stale(p, true, true);
@@ -673,6 +684,7 @@ bool slate_el_add(slate_el_t *group, slate_el_t *child, slate_dirty_t *d, int sw
         g->first = child;
     }
     g->last = child;
+    touch_count(group, (int)slate_el_touchables(child));
     touch(group);
     touch(child);
     invalidate_up(group);
@@ -703,6 +715,7 @@ static unsigned prop_kinds(slate_prop_t p)
 {
     switch (p) {
     case SLATE_PROP_X: case SLATE_PROP_Y: case SLATE_PROP_VISIBLE: case SLATE_PROP_OPACITY:
+    case SLATE_PROP_TOUCHABLE: case SLATE_PROP_HIT_PAD:
         return K_ALL;
     case SLATE_PROP_W: case SLATE_PROP_H:
         return K(SLATE_EL_ROUNDRECT) | K(SLATE_EL_CANVAS) | K(SLATE_EL_GROUP);
@@ -738,7 +751,7 @@ static unsigned prop_kinds(slate_prop_t p)
 static bool type_ok(slate_prop_t p, slate_val_type_t t)
 {
     switch (p) {
-    case SLATE_PROP_VISIBLE: case SLATE_PROP_CLIP: case SLATE_PROP_CACHE:
+    case SLATE_PROP_VISIBLE: case SLATE_PROP_CLIP: case SLATE_PROP_CACHE: case SLATE_PROP_TOUCHABLE:
         return t == SLATE_VAL_BOOL;
     case SLATE_PROP_FILL: case SLATE_PROP_COLOR: case SLATE_PROP_BORDER_COLOR:
         return t == SLATE_VAL_PAINT || t == SLATE_VAL_COLOR;
@@ -1143,6 +1156,18 @@ bool slate_el_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slat
     }
     if (v->type == SLATE_VAL_NUM && !isfinite(v->v.num)) {
         return false;
+    }
+    if (prop == SLATE_PROP_TOUCHABLE) {   /* no pixel changes: nothing dirty, no stamp (see "Touch") */
+        if (e->touchable != v->v.b) {
+            e->touchable = v->v.b;
+            touch_count(e->kind == SLATE_EL_GROUP ? e : e->parent, v->v.b ? 1 : -1);
+        }
+        return true;
+    }
+    if (prop == SLATE_PROP_HIT_PAD) {
+        int n = iround(v->v.num);
+        e->hit_pad = (uint8_t)(n < 0 ? 0 : n > SLATE_HIT_PAD_MAX ? SLATE_HIT_PAD_MAX : n);
+        return true;
     }
     if (prop >= SLATE_PROP_SCROLL) {
         return scroll_set(e, prop, v, d, sw, sh);

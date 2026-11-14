@@ -32,8 +32,8 @@ namespace Baremetal\Slate {
         public ?int $keptBudget = null;
 
         /**
-         * Takes the panel of $display and starts the compositor; with $touch, the active scene gets its touch
-         * events through Scene::onTouch().
+         * Takes the panel of $display and starts the compositor; with $touch, Slate routes its touch events to
+         * the elements of the scene shown (see Touch) and the rest to Scene::onTouch().
          *
          * @param \Baremetal\Output\Display $display A display whose driver has the band path.
          * @param \Baremetal\Input\Touch|null $touch The touch device of the same screen, or null.
@@ -128,8 +128,10 @@ namespace Baremetal\Slate {
         public function onLeave(): void {}
 
         /**
-         * Called for each touch event of the Slate's touch device while this scene is shown (Pressed, Moved,
-         * Released, Gesture).
+         * Called with the raw touch events (Pressed, Moved, Released, Gesture) of the Slate's touch device while this
+         * scene is shown, for the touches whose Pressed hit no touchable element (the background; a Scroll is
+         * touchable by default; a scene without touchable elements gets them all), the Gesture of such a touch
+         * included (also when it comes after the Released). Not during a transition.
          */
         public function onTouch(\Baremetal\Input\TouchEvent $e): void {}
     }
@@ -154,6 +156,30 @@ namespace Baremetal\Slate {
 
         /** 0 (transparent) to 1 (opaque); a group's opacity applies to the group as a whole. */
         public float $opacity;
+
+        /**
+         * Whether the element takes touches: the finger on its area (its box on the screen, for a group with its
+         * children, grown by $hitPad, cut by the clip of its ancestors) gives it Press, Move, Release, Tap, Hold and
+         * Cancel (the methods onPress()..onCancel() and the callbacks of on()). An element with a callback takes
+         * touches also while this is false. Declare it `public bool $touchable = true;` in a component of your own.
+         */
+        public bool $touchable = false;
+
+        /**
+         * Pixels added to the touch area on every side, 0 to 64 (a small target made easier to hit). A default
+         * of a subclass out of range is not checked: the nearest limit is used.
+         *
+         * @throws \ValueError When out of range ("Baremetal\Slate\<Class>::$hitPad must be between 0 and 64").
+         */
+        public int $hitPad = 0;
+
+        /**
+         * Milliseconds the finger stays down (within 8 px) before Hold, 0 to 10000; 0: never a Hold. A default
+         * of a subclass out of range is not checked: the nearest limit is used.
+         *
+         * @throws \ValueError When out of range ("Baremetal\Slate\<Class>::$holdMs must be between 0 and 10000").
+         */
+        public int $holdMs = 500;
 
         /**
          * Sets several properties at once, by name: $el->set(x: 10, opacity: 0.5).
@@ -199,6 +225,98 @@ namespace Baremetal\Slate {
          * @throws \ValueError When a property is not animatable, or ms < 1.
          */
         public function ease(array $props, int $ms = 300, Ease $ease = Ease::OutCubic): static {}
+
+        /**
+         * Sets the callback of one kind of touch (one per kind: a new one replaces the old one). The element takes
+         * touches while it has a callback, also with $touchable false. With a method and a callback, the method runs
+         * first.
+         *
+         * @param \Closure(Touch): void $fn
+         */
+        public function on(TouchType $type, \Closure $fn): static {}
+
+        /**
+         * Removes the callback of one kind of touch (nothing when there is none).
+         */
+        public function off(TouchType $type): static {}
+
+        /**
+         * The finger came down on the element: from now on the touch is the element's (it captures it). Overriding
+         * these methods does not make the element take touches: set $touchable (or a callback with on()) as well.
+         */
+        public function onPress(Touch $t): void {}
+
+        /** The finger moved, anywhere on the screen. */
+        public function onMove(Touch $t): void {}
+
+        /** The finger came up, anywhere on the screen. */
+        public function onRelease(Touch $t): void {}
+
+        /**
+         * After onRelease(), when the finger stayed within 8 px of the press, no Hold came and it came up on the area
+         * (decided at the release: removing the element in onRelease() does not stop it).
+         */
+        public function onTap(Touch $t): void {}
+
+        /** The finger stayed down $holdMs milliseconds without moving past 8 px (once; no Tap after it). */
+        public function onHold(Touch $t): void {}
+
+        /**
+         * The touch ended without Release or Tap: the element (or an ancestor) was removed or hidden, the element
+         * stopped taking touches, another scene was shown or a transition started.
+         */
+        public function onCancel(Touch $t): void {}
+    }
+
+    /**
+     * The kinds of a touch on an element.
+     */
+    enum TouchType
+    {
+        case Press;
+        case Move;
+        case Release;
+        case Tap;
+        case Hold;
+        case Cancel;
+    }
+
+    /**
+     * A touch on an element, given to its methods onPress()..onCancel() and to its callbacks.
+     */
+    final class Touch
+    {
+        public readonly TouchType $type;
+
+        /** The element that has the touch. */
+        public readonly Element $element;
+
+        /** The finger on the screen, in pixels. */
+        public readonly int $x;
+
+        public readonly int $y;
+
+        /** The finger from the element's (x, y) on the screen (with the positions of the Scrolls it is in). */
+        public readonly int $localX;
+
+        public readonly int $localY;
+
+        /**
+         * When, as \Baremetal\Event::$time: nanoseconds on the base of hrtime(true), an int where PHP integers are
+         * 64-bit, a float where they are 32-bit. The $time of the touch event; for Hold the press time plus $holdMs;
+         * for Cancel the time of the last event.
+         */
+        public readonly int|float $time;
+
+        /** Made by Slate only. */
+        private function __construct() {}
+    }
+
+    /**
+     * @internal Slate's own: the Hold timer of a touch came due. Slate handles it; it has no use for a listener.
+     */
+    final class HoldDue extends \Baremetal\Event
+    {
     }
 
     /**
@@ -250,16 +368,25 @@ namespace Baremetal\Slate {
 
     /**
      * A view (0, 0, w, h), always clipped, over its children, the content: they are placed in content coordinates
-     * and drawn shifted by the scroll position. The finger drags the content (forward the touches with touch()), a
-     * release flings it on with inertia, past an edge it stretches and springs back, and it can snap to steps; bars
-     * show the position while it moves. The compositor runs all of it at the pace of the panel; PHP is told when a
-     * motion ends (ScrollEnded). Extend it to build a list of your own.
+     * and drawn shifted by the scroll position. The finger drags the content (the scroll takes the touches by itself:
+     * $touchable is true; touch() routes them by hand), a release flings it on with inertia, past an edge it
+     * stretches and springs back, and it can snap to steps; bars show the position while it moves. The compositor
+     * runs all of it at the pace of the panel; PHP is told when a motion ends (ScrollEnded). Extend it to build a
+     * list of your own.
      *
      * $w and $h (inherited) are the view, 1..32767; $clip is always true (writing false throws \ValueError
      * "Baremetal\Slate\Scroll::$clip is always true"); $cache keeps the whole content as one image.
      */
     class Scroll extends Group
     {
+        /**
+         * The scroll takes the touches that hit it (its view, where no touchable child is on top) and, past 8 px on
+         * an axis it can move, the ones of its touchable children (they get Cancel); a press while it moves stops it
+         * (the element under the finger gets nothing). Nested scrolls: the innermost that can move that way. Those
+         * touches no longer reach Scene::onTouch(). false: it takes none (route them by hand with touch()).
+         */
+        public bool $touchable = true;
+
         /** The content's width, 0..32767; 0: the box of the children from (0, 0), kept up to date. */
         public int $contentW;
 
@@ -272,7 +399,10 @@ namespace Baremetal\Slate {
         /** Past an edge the content stretches and springs back; false: it stops at the edge. */
         public bool $bounce;
 
-        /** Snap step on x in pixels (the content comes to rest on a multiple of it, or on the end), 0..32767; 0: none. */
+        /**
+         * Snap step on x in pixels (the content comes to rest on a multiple of it, or on the end),
+         * 0..32767; 0: none.
+         */
         public int $snapX;
 
         /** Snap step on y in pixels, 0..32767; 0: none. */
@@ -308,7 +438,9 @@ namespace Baremetal\Slate {
                                     int $contentH = 0, float $opacity = 1.0, bool $cache = false) {}
 
         /**
-         * Gives the scroll a touch event (usually from Scene::onTouch()). True when the touch belongs to the scroll:
+         * Gives the scroll a touch event by hand (usually from Scene::onTouch(), for a scroll with $touchable false,
+         * or for a touch that hit nothing). While the scroll has a touch of its own ($touchable), touch() does
+         * nothing and returns false: no touch is fed twice. True when the touch belongs to the scroll:
          * a Moved past 8 px from the press (on the axis allowed; with Both, the distance) and the ones after it, the
          * Released that ends a drag (the content flings on); and a catch: a Pressed inside the view while the content
          * moves (it stops there), with every Moved and the Released of that touch (never a tap; a drag may still

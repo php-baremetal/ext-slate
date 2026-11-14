@@ -15,7 +15,8 @@
  * The module `slate` and Baremetal\Slate\Slate: the object that takes a display's panel (display_claim()), starts
  * the compositor task (engine.h) on its band path, paces it on the TE pulses (display_vsync_hook()) when the
  * panel has them, shows one Scene at a time (at once, or with a transition: php_slate_anim.c, transitions) and
- * forwards the touch events of its Touch device to that scene (none during a transition).
+ * routes the touch events of its Touch device to the elements of that scene, or to its onTouch() (php_slate_touch.c;
+ * none during a transition).
  *
  * Delivery. The commands of the PHP task are handed to the compositor when the PHP task returns to the event loop
  * (bm_events_on_idle() of ext-events: after each delivered event in the event-driven runtime, after each loop()
@@ -57,6 +58,7 @@ typedef struct {
     zend_object *display, *touch, *source, *scene;
     slate_engine_t *engine;
     bool hook;                                   /* display_vsync_hook() set */
+    bool touching;                               /* sl_touch_start() done */
     zend_class_entry *touch_ce[TOUCH_CLASSES];   /* the touch event classes watched */
     zend_object std;
 } sl_slate_t;
@@ -215,12 +217,12 @@ static void call0(zend_object *obj, const char *lcname)
     }
 }
 
-/* A touch event of the bus: the active scene's onTouch(), when the event comes from this Slate's Touch; none
-   while a transition runs (from its show() to its end). */
+/* A touch event of the bus, when it comes from this Slate's Touch: to the elements of the active scene or to its
+   onTouch() (php_slate_touch.c); none while a transition runs (from its show() to its end). */
 static void sl_touch(zend_object *event, void *arg)
 {
     sl_slate_t *s = arg;
-    if (!s->engine || !s->scene || !s->touch || sl_trans_running()) {
+    if (!s->engine || !s->scene || !s->touch) {
         return;
     }
     zval rv;
@@ -228,16 +230,12 @@ static void sl_touch(zend_object *event, void *arg)
     if (!dev || Z_TYPE_P(dev) != IS_OBJECT || Z_OBJ_P(dev) != s->touch) {
         return;
     }
-    zend_object *scene = s->scene;
-    zend_function *fn = zend_hash_str_find_ptr(&scene->ce->function_table, "ontouch", sizeof("ontouch") - 1);
-    if (!fn) {
+    if (sl_trans_running()) {
+        sl_touch_unseen(event);
         return;
     }
-    GC_ADDREF(scene);   /* onTouch() may show another scene */
-    zval ev;
-    ZVAL_OBJ(&ev, event);
-    zend_call_known_instance_method_with_1_params(fn, scene, NULL, &ev);
-    OBJ_RELEASE(scene);
+    sl_anim_flush();
+    sl_touch_route(event, s->scene);
 }
 
 static const char *const touch_classes[TOUCH_CLASSES] = {
@@ -253,6 +251,10 @@ static void sl_stop(sl_slate_t *s)
                 bm_events_unwatch(s->touch_ce[i], sl_touch, s);
                 s->touch_ce[i] = NULL;
             }
+        }
+        if (s->touching) {
+            sl_touch_stop(s->engine);   /* the touch under way goes; the hit table and the Hold watch too */
+            s->touching = false;
         }
         sl_idle_use(SL_IDLE_SLATE, false);
         if (s->hook) {
@@ -370,6 +372,11 @@ static bool sl_start(sl_slate_t *s, zend_object *display, zend_object *touch)
             if (ce && bm_events_watch(ce, sl_touch, s)) {
                 s->touch_ce[i] = ce;
             }
+        }
+        s->touching = true;
+        if (!sl_touch_start(e)) {
+            sl_stop(s);
+            return false;
         }
     }
     return true;
@@ -572,7 +579,14 @@ PHP_METHOD(SlateSlate, show)
     slate_trans_t tr;
     bool trans = sl_transition_of(tobj, &tr);
     if (trans && (!sl_trans_ready() || !sl_trans_reserve())) {
+        RETURN_THROWS();   /* the scene stays, and the touch with it */
+    }
+    sl_touch_cancel_now();   /* the element holding the finger: Cancel before any onLeave() */
+    if (EG(exception) || !s->engine) {
         RETURN_THROWS();
+    }
+    if (trans && !sl_trans_reserve()) {
+        RETURN_THROWS();   /* again: an onCancel() that ran a transition of its own used the node (else at once) */
     }
     if (!sl_trans_leave() || !s->engine) {
         RETURN_THROWS();
@@ -771,6 +785,7 @@ PHP_MINIT_FUNCTION(slate)
     sl_images_register();
     sl_anim_register();
     sl_scroll_register();
+    sl_touch_register();
 
     memcpy(&slate_handlers, zend_get_std_object_handlers(), sizeof slate_handlers);
     slate_handlers.offset = XtOffsetOf(sl_slate_t, std);
@@ -810,6 +825,7 @@ PHP_RSHUTDOWN_FUNCTION(slate)
     sl_images_rshutdown();
     sl_anim_rshutdown();
     sl_scroll_rshutdown();
+    sl_touch_rshutdown();
     return SUCCESS;
 }
 

@@ -25,6 +25,12 @@
  * too; unset() of one throws, and so does foreach by reference over an element (its references would change the
  * properties without validation, as a reference taken one by one would).
  *
+ * Touch ($touchable, $hitPad, $holdMs, declared on Element with their defaults: a subclass may give its own, as
+ * `public bool $touchable = true;`). $touchable becomes a SET of TOUCHABLE that is true also while the element has a
+ * callback of on(); $hitPad a SET of HIT_PAD; $holdMs stays in PHP (php_slate_touch.c reads it at a Press). None is
+ * animatable. The methods onPress()..onCancel() are empty here, for subclasses to override; on() and off() keep the
+ * callbacks (php_slate_touch.c).
+ *
  * A Scroll's own properties do not all become SETs: $axis, $bounce, $snapX, $snapY, $snapMax and $indicators are its
  * set-up (a SCROLL CONFIG with all of them), $scrollX and $scrollY its position (a SCROLL JUMP: a SET would be
  * overwritten by the physics); reading those two gives the position drawn (php_slate_scroll.c), so their reads are
@@ -36,6 +42,7 @@
 #include "php.h"
 #include "zend_enum.h"
 #include "zend_exceptions.h"
+#include "zend_closures.h"
 #include "zend_interfaces.h"
 #if PHP_VERSION_ID >= 80400
 #include "zend_property_hooks.h"
@@ -78,10 +85,13 @@ typedef enum {
     PT_CLIPON,    /* bool, a Scroll's $clip: always true */
     PT_AXIS,      /* ScrollAxis */
     PT_SPOS,      /* int|float, a scroll position: finite (clamped by the engine) */
+    PT_TOUCH,     /* bool, $touchable: TOUCHABLE is sent true also while the element has a callback */
+    PT_HITPAD,    /* int, 0..SLATE_HIT_PAD_MAX */
+    PT_HOLDMS,    /* int, 0..10000 (PHP only) */
 } sl_ptype_t;
 
-/* How a write reaches the engine. */
-enum { HOW_SET = 0, HOW_CONFIG, HOW_JUMP };
+/* How a write reaches the engine (HOW_NONE: it does not, the PHP layer reads it). */
+enum { HOW_SET = 0, HOW_CONFIG, HOW_JUMP, HOW_NONE };
 
 typedef struct {
     const char *name;
@@ -96,13 +106,20 @@ typedef struct {
     uint32_t offset;
 } sl_prop_t;
 
-#define PROPS_MAX 24
+#define PROPS_MAX 28
 
+/* The first COMMON_DRAWN are declared without a default (sl_obj_create gives each element its own); the touch ones
+   after them with their defaults, which a subclass may redeclare (sl_obj_create keeps the class's). */
+#define COMMON_DRAWN 4
+#define HOLD_MS_MAX 10000
 static const sl_pdef_t common_defs[] = {
     { "x", SLATE_PROP_X, PT_COORD, HOW_SET },
     { "y", SLATE_PROP_Y, PT_COORD, HOW_SET },
     { "visible", SLATE_PROP_VISIBLE, PT_BOOL, HOW_SET },
     { "opacity", SLATE_PROP_OPACITY, PT_OPACITY, HOW_SET },
+    { "touchable", SLATE_PROP_TOUCHABLE, PT_TOUCH, HOW_SET },
+    { "hitPad", SLATE_PROP_HIT_PAD, PT_HITPAD, HOW_SET },
+    { "holdMs", SLATE_PROP_HIT_PAD, PT_HOLDMS, HOW_NONE },   /* prop unused */
 };
 static const sl_pdef_t group_defs[] = {
     { "w", SLATE_PROP_W, PT_SIZE, HOW_SET },
@@ -451,6 +468,26 @@ static bool to_value(sl_obj_t *o, const sl_prop_t *p, zval *v, slate_value_t *ou
         }
         *out = slate_v_num(isfinite(d) ? (float)d : 0.0f);   /* sent in a JUMP, never as a SET */
         return true;
+    case PT_TOUCH:
+        *out = slate_v_bool(Z_TYPE_P(v) == IS_TRUE || sl_touch_has_cb(o));
+        return true;
+    case PT_HITPAD:
+        if (!num_in(v, 0, SLATE_HIT_PAD_MAX, &d)) {
+            if (check) {
+                bad_value(o, p, "must be between 0 and 64");
+                return false;
+            }
+            d = d > 0 ? SLATE_HIT_PAD_MAX : 0;   /* a subclass's default out of range */
+        }
+        *out = slate_v_num((float)d);
+        return true;
+    case PT_HOLDMS:
+        if (!num_in(v, 0, HOLD_MS_MAX, &d) && check) {
+            bad_value(o, p, "must be between 0 and 10000");
+            return false;
+        }
+        *out = slate_v_num(0);   /* never sent */
+        return true;
     }
     return false;
 }
@@ -559,6 +596,9 @@ static zend_result sl_assign(sl_obj_t *o, const sl_prop_t *p, zval *value)
     if (p->def->how == HOW_JUMP) {
         return sl_scroll_jumped(o) ? SUCCESS : FAILURE;   /* always: the slot may have been behind the screen */
     }
+    if (p->def->how == HOW_NONE) {
+        return SUCCESS;   /* $holdMs: read at the next Press */
+    }
     if (p->def->how == HOW_CONFIG) {
         if (!changed) {
             return SUCCESS;   /* a CONFIG of the same set-up changes nothing */
@@ -577,6 +617,12 @@ static zend_result sl_assign(sl_obj_t *o, const sl_prop_t *p, zval *value)
     }
     if (!same && realized(o) && !push_set(o, p, &v)) {
         return FAILURE;
+    }
+    if (p->def->type == PT_TOUCH && Z_TYPE_P(slot) == IS_TRUE) {
+        sl_touch_note(o);
+    }
+    if (changed && (p->def->type == PT_TOUCH || p->def->prop == SLATE_PROP_VISIBLE)) {
+        sl_touch_recheck();   /* the captured element (or an ancestor) hidden, or no longer touchable */
     }
     return SUCCESS;
 }
@@ -664,6 +710,7 @@ static HashTable *sl_get_gc(zend_object *obj, zval **table, int *n)
             zend_get_gc_buffer_add_zval(buf, zv);
         } ZEND_HASH_FOREACH_END();
     }
+    sl_touch_gc(o, buf);   /* the callbacks of on() (a closure may hold the element) */
     zend_get_gc_buffer_use(buf, table, n);
     return obj->properties;
 }
@@ -698,6 +745,7 @@ static void sl_free_obj(zend_object *obj)
     if (o->sc) {
         sl_scroll_free(o);
     }
+    sl_touch_forget(o);
     zend_object_std_dtor(obj);
 }
 
@@ -800,12 +848,18 @@ zend_object *sl_obj_create(zend_class_entry *ce)
     }
     for (int i = 0; i < s_nprops[o->base]; i++) {
         const sl_prop_t *p = &s_props[o->base][i];
+        if (p->def->type == PT_TOUCH || p->def->type == PT_HITPAD || p->def->type == PT_HOLDMS) {
+            continue;   /* the class's default (a subclass may declare its own) */
+        }
         zval *slot = prop_slot(o, p);
         zval_ptr_dtor(slot);
         default_of(o->base, p->def, slot);
     }
     if (o->base == SL_IMAGE) {
         sl_image_init(o);
+    }
+    if (o->base != SL_SCENE && slot_true(o, "touchable")) {
+        sl_touch_note(o);
     }
     return &o->std;
 }
@@ -833,6 +887,9 @@ bool sl_realize(sl_obj_t *o)
         slate_value_t v;
         slate_paint_grad_t grad;
         to_value(o, p, prop_slot(o, p), &v, &grad, false);
+        if ((p->def->type == PT_TOUCH && !v.v.b) || (p->def->type == PT_HITPAD && v.v.num == 0)) {
+            continue;   /* the engine's default after NEW: no command for an element that takes no touch */
+        }
         if (!push_set(o, p, &v)) {
             return false;
         }
@@ -905,7 +962,15 @@ void sl_children_add(sl_obj_t *o, zval *args, uint32_t argc)
     }
 }
 
+static void children_remove(sl_obj_t *o, zval *args, uint32_t argc);
+
 void sl_children_remove(sl_obj_t *o, zval *args, uint32_t argc)
+{
+    children_remove(o, args, argc);
+    sl_touch_recheck();   /* the captured element (or an ancestor) taken out of the scene */
+}
+
+static void children_remove(sl_obj_t *o, zval *args, uint32_t argc)
 {
     for (uint32_t i = 0; i < argc; i++) {
         sl_obj_t *c = sl_obj(Z_OBJ(args[i]));
@@ -1100,6 +1165,74 @@ PHP_METHOD(SlateGroup, remove)
     }
     RETURN_OBJ_COPY(Z_OBJ_P(ZEND_THIS));
 }
+
+/* ---- touch: on(), off(), the empty methods ---- */
+
+PHP_METHOD(SlateElement, on)
+{
+    zend_object *type;
+    zval *fn;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_OBJ_OF_CLASS(type, sl_touch_type_ce)
+        Z_PARAM_OBJECT_OF_CLASS(fn, zend_ce_closure)
+    ZEND_PARSE_PARAMETERS_END();
+    sl_anim_flush();
+    sl_obj_t *o = sl_obj(Z_OBJ_P(ZEND_THIS));
+    bool was = sl_touch_has_cb(o);
+    sl_touch_set_cb(o, sl_touch_kind_of(type), fn);
+    sl_touch_note(o);
+    if (!was && !slot_true(o, "touchable") && realized(o)) {
+        const sl_prop_t *p = find_prop_c(o, "touchable");
+        slate_value_t v = slate_v_bool(true);
+        if (p && !push_set(o, p, &v)) {
+            RETURN_THROWS();
+        }
+    }
+    RETURN_OBJ_COPY(&o->std);
+}
+
+PHP_METHOD(SlateElement, off)
+{
+    zend_object *type;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJ_OF_CLASS(type, sl_touch_type_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    sl_anim_flush();
+    sl_obj_t *o = sl_obj(Z_OBJ_P(ZEND_THIS));
+    bool was = sl_touch_has_cb(o);
+    sl_touch_set_cb(o, sl_touch_kind_of(type), NULL);
+    if (was && !sl_touch_has_cb(o) && !slot_true(o, "touchable")) {
+        if (realized(o)) {
+            const sl_prop_t *p = find_prop_c(o, "touchable");
+            slate_value_t v = slate_v_bool(false);
+            if (p && !push_set(o, p, &v)) {
+                RETURN_THROWS();
+            }
+        }
+        sl_touch_recheck();   /* the captured element no longer touchable */
+        if (EG(exception)) {
+            RETURN_THROWS();
+        }
+    }
+    RETURN_OBJ_COPY(&o->std);
+}
+
+/* onPress() .. onCancel(): empty, for a subclass to override (php_slate_touch.c skips these when not overridden). */
+#define SL_TOUCH_METHOD(name)                     \
+    PHP_METHOD(SlateElement, name)                \
+    {                                             \
+        zend_object *t;                           \
+        ZEND_PARSE_PARAMETERS_START(1, 1)         \
+            Z_PARAM_OBJ_OF_CLASS(t, sl_touch_ce)  \
+        ZEND_PARSE_PARAMETERS_END();              \
+        (void)t;                                  \
+    }
+SL_TOUCH_METHOD(onPress)
+SL_TOUCH_METHOD(onMove)
+SL_TOUCH_METHOD(onRelease)
+SL_TOUCH_METHOD(onTap)
+SL_TOUCH_METHOD(onHold)
+SL_TOUCH_METHOD(onCancel)
 
 /* ---- animate(), ease() ---- */
 
@@ -1383,6 +1516,19 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_element_ease, 0, 1, IS_STATIC, 0
     ZEND_ARG_OBJ_INFO_WITH_DEFAULT_VALUE(0, ease, Baremetal\\Slate\\Ease, 0, "\\Baremetal\\Slate\\Ease::OutCubic")
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_element_on, 0, 2, IS_STATIC, 0)
+    ZEND_ARG_OBJ_INFO(0, type, Baremetal\\Slate\\TouchType, 0)
+    ZEND_ARG_OBJ_INFO(0, fn, Closure, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_element_off, 0, 1, IS_STATIC, 0)
+    ZEND_ARG_OBJ_INFO(0, type, Baremetal\\Slate\\TouchType, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_element_touch, 0, 1, IS_VOID, 0)
+    ZEND_ARG_OBJ_INFO(0, t, Baremetal\\Slate\\Touch, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_group_children, 0, 0, IS_STATIC, 0)
     ZEND_ARG_VARIADIC_OBJ_INFO(0, e, Baremetal\\Slate\\Element, 0)
 ZEND_END_ARG_INFO()
@@ -1457,6 +1603,14 @@ static const zend_function_entry element_methods[] = {
     PHP_ME(SlateElement, set, arginfo_element_set, ZEND_ACC_PUBLIC)
     PHP_ME(SlateElement, animate, arginfo_element_animate, ZEND_ACC_PUBLIC)
     PHP_ME(SlateElement, ease, arginfo_element_ease, ZEND_ACC_PUBLIC)
+    PHP_ME(SlateElement, on, arginfo_element_on, ZEND_ACC_PUBLIC)
+    PHP_ME(SlateElement, off, arginfo_element_off, ZEND_ACC_PUBLIC)
+    PHP_ME(SlateElement, onPress, arginfo_element_touch, ZEND_ACC_PUBLIC)
+    PHP_ME(SlateElement, onMove, arginfo_element_touch, ZEND_ACC_PUBLIC)
+    PHP_ME(SlateElement, onRelease, arginfo_element_touch, ZEND_ACC_PUBLIC)
+    PHP_ME(SlateElement, onTap, arginfo_element_touch, ZEND_ACC_PUBLIC)
+    PHP_ME(SlateElement, onHold, arginfo_element_touch, ZEND_ACC_PUBLIC)
+    PHP_ME(SlateElement, onCancel, arginfo_element_touch, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 static const zend_function_entry group_methods[] = {
@@ -1494,6 +1648,7 @@ static zend_type type_of(uint8_t t)
     case PT_OPACITY:
         return (zend_type)ZEND_TYPE_INIT_CODE(IS_DOUBLE, 0, 0);
     case PT_BOOL:
+    case PT_TOUCH:
         return (zend_type)ZEND_TYPE_INIT_CODE(_IS_BOOL, 0, 0);
     case PT_NCOLOR:
         return (zend_type)ZEND_TYPE_INIT_MASK(T_NUM | MAY_BE_NULL);
@@ -1518,6 +1673,8 @@ static zend_type type_of(uint8_t t)
     case PT_BLUR:
     case PT_PIXELS:
     case PT_CSIZE:
+    case PT_HITPAD:
+    case PT_HOLDMS:
         return (zend_type)ZEND_TYPE_INIT_CODE(IS_LONG, 0, 0);
     default:   /* COORD, SIZE, ANGLE, COLOR, VIEW, SPOS */
         return (zend_type)ZEND_TYPE_INIT_MASK(T_NUM);
@@ -1594,7 +1751,19 @@ void sl_elements_register(void)
 #if PHP_VERSION_ID >= 80400
     sl_element_ce->get_iterator = sl_get_iterator;   /* inherited by every element class */
 #endif
-    declare(sl_element_ce, common_defs, N(common_defs));
+    declare(sl_element_ce, common_defs, COMMON_DRAWN);
+    /* the touch properties, with their defaults (Scroll redeclares $touchable with true, below) */
+    for (int i = COMMON_DRAWN; i < N(common_defs); i++) {
+        zval dv;
+        if (common_defs[i].type == PT_TOUCH) {
+            ZVAL_FALSE(&dv);
+        } else {
+            ZVAL_LONG(&dv, common_defs[i].type == PT_HOLDMS ? 500 : 0);
+        }
+        zend_declare_typed_property(sl_element_ce,
+                                    zend_string_init_interned(common_defs[i].name, strlen(common_defs[i].name), 1),
+                                    &dv, ZEND_ACC_PUBLIC, NULL, type_of(common_defs[i].type));
+    }
 
     sl_group_ce = leaf("Baremetal\\Slate\\Group", group_methods, group_defs, N(group_defs), false);
     sl_scroll_axis_register();
@@ -1602,6 +1771,13 @@ void sl_elements_register(void)
     sl_scroll_ce = zend_register_internal_class_ex(&ce, sl_group_ce);   /* not final: a list of an app extends it */
     sl_scroll_ce->ce_flags |= ZEND_ACC_NOT_SERIALIZABLE;
     declare(sl_scroll_ce, scroll_defs + SCROLL_INHERITED, N(scroll_defs) - SCROLL_INHERITED);
+    /* a Scroll takes the touch by itself: $touchable true by default (redeclared: the same slot as Element's) */
+    {
+        zval dv;
+        ZVAL_TRUE(&dv);
+        zend_declare_typed_property(sl_scroll_ce, zend_string_init_interned("touchable", sizeof("touchable") - 1, 1),
+                                    &dv, ZEND_ACC_PUBLIC, NULL, type_of(PT_TOUCH));
+    }
     sl_roundrect_ce = leaf("Baremetal\\Slate\\RoundRect", roundrect_methods, roundrect_defs, N(roundrect_defs), true);
     sl_circle_ce = leaf("Baremetal\\Slate\\Circle", circle_methods, circle_defs, N(circle_defs), true);
     sl_arc_ce = leaf("Baremetal\\Slate\\Arc", arc_methods, arc_defs, N(arc_defs), true);

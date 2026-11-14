@@ -8,7 +8,7 @@ see_also:
   - { href: './performance.md', meta: 'API' }
   - { href: 'package:php-baremetal/ext-input', meta: 'Extension', label: 'ext-input' }
 prev: { label: 'Animations', href: './animations.md' }
-next: { label: 'Effects and build options', href: './effects-and-options.md' }
+next: { label: 'Touch', href: './touch.md' }
 ---
 
 # Scroll
@@ -16,14 +16,14 @@ next: { label: 'Effects and build options', href: './effects-and-options.md' }
 A `Scroll` is a `Group` with a view: the box (0, 0, `$w`, `$h`), always clipped. Its children are the content, placed
 in content coordinates from (0, 0); the compositor draws them shifted by the scroll position. The content moves under
 the finger, goes on with inertia when it is released, stretches past an edge and springs back, and can come to rest
-on a step (a row, a page). All of it runs in the compositor at the pace of the panel, like the animations: PHP
-forwards the touches and is told when the content comes to rest.
+on a step (a row, a page). All of it runs in the compositor at the pace of the panel, like the animations. A scroll
+takes the touches by itself (it is touchable by default, see [Touch](./touch.md)); PHP is told when the content comes
+to rest.
 
 <!-- @code-block language="php" label="A list" -->
 ```php
 <?php
-use Baremetal\Input\{Released, TouchEvent};
-use Baremetal\Slate\{RoundRect, Scene, Scroll, ScrollAxis, Text};
+use Baremetal\Slate\{Group, RoundRect, Scene, Scroll, ScrollAxis, Text, Touch, TouchType};
 
 final class Contacts extends Scene
 {
@@ -33,27 +33,16 @@ final class Contacts extends Scene
     {
         $this->list = new Scroll(x: 20, y: 60, w: 320, h: 240, axis: ScrollAxis::Vertical, snapY: 48);
         foreach (['Ada', 'Alan', 'Grace', 'Linus', 'Margaret'] as $i => $name) {
-            $this->list->add(
-                new RoundRect(0, $i * 48, 320, 46, radius: 8, fill: 0x202830),
-                new Text(16, $i * 48 + 14, $name),
-            );
+            $row = new Group(0, $i * 48);
+            $row->add(new RoundRect(0, 0, 320, 46, radius: 8, fill: 0x202830), new Text(16, 14, $name));
+            $row->on(TouchType::Tap, fn (Touch $t) => $this->open($name));   // a tap; a drag scrolls the list
+            $this->list->add($row);
         }
         $this->add($this->list);
     }
 
-    public function onTouch(TouchEvent $e): void
+    private function open(string $name): void
     {
-        if ($this->list->touch($e)) {
-            return;   // a drag: not a tap
-        }
-        if ($e instanceof Released) {
-            $this->tapAt($e->x, $e->y);
-        }
-    }
-
-    private function tapAt(int $x, int $y): void
-    {
-        $row = intdiv($y - 60 + (int) round($this->list->scrollY), 48);   // the row under the finger
         // ...
     }
 }
@@ -97,13 +86,53 @@ the view.
 
 A class of your own can extend `Scroll` (a list with its rows, for example).
 
-## touch() and taps
+## Touch
+
+A `Scroll` is touchable by default (`$touchable` is `true`): Slate routes the touches to it, with no code in the
+script. The rules are those of [Touch](./touch.md); for a scroll:
+
+- **A press on the scroll** (its view, where no touchable child is on top): the touch is the scroll's. The content
+  follows the finger once it is more than **8 px** from the press, on the axis allowed (with `Both`, the distance),
+  from that point, without a jump. A release after a drag flings the content on with the speed of the finger (the
+  last 80 ms). A short touch does nothing.
+- **A press on a touchable child** (a row, a card, a button): the child gets `Press`. When the finger moves more than
+  8 px before a `Hold`, the axis of the larger movement (vertical on a tie) decides: if the scroll can move on it,
+  the child gets `Cancel` (never a `Tap`) and the scroll takes the touch, as if it had started there (the press point
+  and time), and follows the finger from the point where it passed 8 px, without a jump. If it cannot (a vertical
+  list and a sideways move, or a content that fits the view), the child keeps the finger. The axis is decided once,
+  at that point: a sideways move first keeps the finger with the child even if it goes down later. (A press on the
+  scroll's own space has no such decision: the threshold applies on its axis, so on a vertical list a sideways move
+  of 30 px and then 9 px down starts the drag.) After a `Hold`, the child keeps it as well.
+- **A press while the content moves** (inertia, spring, snap, `scrollTo()`): it stops there, and the touch is a
+  **catch**: the scroll's for its whole life, never a tap. The element under the finger gets nothing.
+- **Scrolls in scrolls**: the touch goes to the innermost one that can move in the direction of the drag. A
+  horizontal carousel in a vertical list takes the sideways drags, the list the vertical ones, from a card or from
+  the carousel itself; the outer scroll takes the touch only when the inner one cannot move on that axis at all (its
+  axis locked, or a content that fits the view). An inner scroll at its edge can still move on that axis: it keeps
+  the finger and stretches past the edge.
+- **The end of a touch.** When the scroll is removed or hidden (it or an ancestor), made not touchable, its page is
+  left with `Slate::show()`, a page transition starts, or the `Released` is lost (a new `Pressed` comes first), its
+  drag ends as a release without speed: no inertia, the content rests where it is (or springs back from past an
+  edge, or settles on a snap step), and `ScrollEnded` follows once a drag had started. The rest of the touch reaches
+  nobody.
+- **Handlers.** A scroll gets no `Touch`: its methods `onPress()`..`onCancel()` and its callbacks of `on()` are
+  never called. A callback still makes it take touches (also with `$touchable = false`), so do not set one on a
+  scroll.
+
+A touch that hits a scroll no longer reaches `Scene::onTouch()` (a swipe on the scroll moves the content, not the
+page). The touches that hit nothing still do.
+
+When the script writes `$scrollX`/`$scrollY`, calls `scrollTo()` or changes `$axis`, `$bounce`, `$snapX`, `$snapY`,
+`$snapMax` during a touch, the compositor ends the drag where it is (no inertia, no `ScrollEnded`), and the content no
+longer follows that touch.
+
+### touch(): routing by hand
 
 <!-- @method name="Scroll::touch(\Baremetal\Input\TouchEvent $e): bool" returns="bool" -->
 
-Slate does not decide which element a touch is for: the script forwards the touch events to the scroll, usually from
-`Scene::onTouch()`. `touch()` returns `true` when the touch belongs to the scroll (a drag, or a catch of a moving
-content), so the script knows that it is not a tap:
+For a scroll that should not take the touches itself (`$touchable = false`), or for touches that hit nothing, the
+script can still forward the touch events to it, usually from `Scene::onTouch()`. `touch()` returns `true` when the
+touch belongs to the scroll (a drag, or a catch of a moving content), so the script knows that it is not a tap:
 
 | Event | Returns |
 | --- | --- |
@@ -112,26 +141,40 @@ content), so the script knows that it is not a tap:
 | `Moved` after a `Pressed` inside | `false` until the finger is more than **8 px** from the press, on the axis allowed (with `Both`, the distance); from there the drag starts and every `Moved` returns `true`. The content follows the finger from that point, without a jump. In a catch every `Moved` returns `true`, and a drag starts past 8 px as usual. |
 | `Released` | After a drag: `true`, and the content goes on with the speed of the finger (the last 80 ms). After a catch: `true` (stopping the content is not a tap). Otherwise: `false` (a tap). |
 | `Gesture` | `false`, ignored. |
-| Any, on a scroll that is not in the scene shown (or not visible, or during a page transition) | `false`, nothing happens. |
+| Any, on a scroll that is not in the scene shown (or not visible, more than 64 levels below the scene, or during a page transition) | `false`, nothing happens. |
+| Any, while Slate routes a touch to this scroll | `false`, nothing happens: no touch is fed twice. |
 
 The view is found on the screen from the PHP properties: the `$x`, `$y` of the scroll and of the groups it is in,
 minus the position of the scrolls it is in, cut by every clipping ancestor (the view of each scroll it is in, the box
-of each group with `$clip`): a press on a part of the view that is not on the screen is outside. A scroll inside
-another scroll works; with the same touch for both, the script decides which one gets it. The properties are the PHP
+of each group with `$clip` and a `$w` and `$h` above 0): a press on a part of the view that is not on the screen is
+outside. With the same touch for two scrolls, the script decides which one gets it. The properties are the PHP
 values: while the scroll or an ancestor animates, the touch is tested against where it is going, not where it is
 drawn.
 
 Once a touch is the scroll's (a drag started, or its `Pressed` caught a moving content), it stays so to its end: its
-`Moved` and `Released` return `true` even when the content stops following it. That happens when the script writes
-`$scrollX`/`$scrollY`, calls `scrollTo()` or changes `$axis`, `$bounce`, `$snapX`, `$snapY`, `$snapMax` during the
-touch (the
-compositor ends the drag where it is: no inertia, no `ScrollEnded`), and when the scroll leaves the screen meanwhile
-(removed, hidden, its page left: the compositor ends the drag as a release without speed). From then on nothing more
-is sent for that touch, and no new drag starts before the next `Pressed`.
+`Moved` and `Released` return `true` even when the content stops following it (a write of the position, `scrollTo()`,
+a new set-up, as above), and when the scroll leaves the screen meanwhile (removed or its page left: the compositor
+ends the drag as a release without speed; hidden: the drag ends that way at the `Released`). From then on nothing
+more is sent for that touch, and no new drag starts before the next `Pressed`.
 
-In `onTouch()` of the example above, a drag of the list (or a touch that stopped it) never reaches `tapAt()`; a
-short touch on a list at rest does, and the
-row under the finger is the touch's `y` relative to the view plus `$scrollY`.
+<!-- @code-block language="php" label="Routing by hand" -->
+```php
+<?php
+use Baremetal\Input\{Released, TouchEvent};
+
+// in a Scene whose $this->list has $touchable = false
+public function onTouch(TouchEvent $e): void
+{
+    if ($this->list->touch($e)) {
+        return;   // a drag: not a tap
+    }
+    if ($e instanceof Released) {
+        $row = intdiv($e->y - 60 + (int) round($this->list->scrollY), 48);   // the row under the finger
+        // ...
+    }
+}
+```
+<!-- @endcode-block -->
 
 ## Snapping
 

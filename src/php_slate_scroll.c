@@ -19,7 +19,8 @@
  * Commands. A Scroll is a GROUP made a scroll by a SCROLL CONFIG, sent right after its NEW and again (with every
  * value) when $axis, $bounce, $snapX, $snapY, $snapMax or $indicators change. A write of $scrollX/$scrollY is a JUMP
  * (both axes: the other one where it is); touch() sends PRESS, DRAG and RELEASE with the time it runs (bm_hal_now_us(), the
- * clock of the engine); scrollTo() is a TWEEN of SCROLL_X and SCROLL_Y through the Tween of php_slate_anim.c.
+ * clock of the engine), the touch routing (php_slate_touch.c) the same with the time of each touch event, and CANCEL
+ * for a touch it ends without its Released; scrollTo() is a TWEEN of SCROLL_X and SCROLL_Y through the Tween of php_slate_anim.c.
  *
  * Position. The engine publishes the position it draws into a small block shared with this object
  * (slate_scroll_pub_t, cmd.h, made at the first realization): reading $scrollX/$scrollY gives it, without a lock.
@@ -30,7 +31,9 @@
  * the position of the ancestors that are scrolls. A Pressed inside starts a touch; the move past 8 px (on the axis
  * allowed; with Both, the distance) starts the drag, and that point is the first DRAG (the engine anchors there: no
  * jump). A Pressed that stops a motion makes the whole touch a catch: its Moved and Released are the scroll's too
- * (true; a drag may still start from it). The engine stops a running scrollTo() on a PRESS, a JUMP and a new set-up without a done: its Tween is
+ * (true; a drag may still start from it). The same state machine serves the touch routing (sl_scroll_take,
+ * sl_scroll_take_drag, sl_scroll_event, sl_scroll_drop: a Scroll is touchable by default); while it drives a touch
+ * (autod), touch() does nothing and returns false, so no touch is fed twice. The engine stops a running scrollTo() on a PRESS, a JUMP and a new set-up without a done: its Tween is
  * marked stopped here (sl_tween_silenced).
  *
  * Ends. The engine queues an end (element id, position) when a motion ends by itself and calls the tween listener
@@ -76,6 +79,9 @@ typedef struct sl_scroll {
     bool cut;                  /* the engine ended this touch (a jump, a scrollTo, a new set-up, the scroll off the
                                   screen): nothing more is sent until the next Pressed */
     float px, py;              /* the Pressed point */
+    bool autod;                /* the touch routing (php_slate_touch.c) drives this touch: touch() ignores it */
+    bool hid;                  /* seen off the screen during the touch (removed, hidden, its page left): the engine
+                                  does not end a drag for a hidden scroll, so its end is a CANCEL */
 } sl_scroll_t;
 
 static const char *const axis_names[] = { "Both", "Vertical", "Horizontal" };   /* slate_scroll_axis_t order */
@@ -157,6 +163,9 @@ static void alive_del(uint32_t id)
     bm_hal_lock_exit(l);
 }
 
+/* On the engine task only (its tween listener). No in-flight guard like the tweens' s_emitting: RSHUTDOWN stops and
+   joins the engine (sl_stop) before sl_scroll_rshutdown, so no drain can run while the state below is torn down;
+   that order is required. */
 void sl_scroll_pull(slate_engine_t *e)
 {
     if (!e || !__atomic_load_n(&s_lock, __ATOMIC_ACQUIRE)) {
@@ -379,7 +388,7 @@ bool sl_scroll_realize_config(sl_obj_t *o)
     sl_scroll_sync(o);     /* the position of an earlier Slate (or the one written): the JUMP after the children */
     sc->local = true;
     sc->wseq = 0;
-    sc->down = sc->dragging = sc->owned = sc->cut = false;
+    sc->down = sc->dragging = sc->owned = sc->cut = sc->autod = sc->hid = false;
     return push_config(o);
 }
 
@@ -438,7 +447,8 @@ static zend_class_entry *touch_class(int i)
 /* Whether o is drawn in the scene the Slate shows (not during a transition: the touch goes to no scene then), visible
    with its ancestors; *box: the part of its view on the screen, cut by every clipping ancestor (the views of the
    scrolls it is in, the boxes of groups with $clip); empty when none of it shows. The PHP values are used: an ancestor
-   that animates is taken at its final x, y. */
+   that animates is taken at its final x, y. An element more than DEPTH_MAX levels below the scene (a child of the
+   scene is at level 1) is taken as not on screen: false, so touch() ignores the touch (docs/usage/scroll.md). */
 #define DEPTH_MAX 64
 typedef struct { double x0, y0, x1, y1; } box_t;
 
@@ -467,8 +477,10 @@ static bool on_screen(sl_obj_t *o, box_t *box)
         sl_obj_t *e = chain[i];
         ox += sl_slot_num(e, "x");
         oy += sl_slot_num(e, "y");
-        if (e->base == SL_SCROLL || sl_slot_true(e, "clip")) {
-            double x1 = ox + sl_slot_num(e, "w"), y1 = oy + sl_slot_num(e, "h");
+        double w = sl_slot_num(e, "w"), h = sl_slot_num(e, "h");
+        /* as the engine clips (slate_el_clips): a scroll always, a group with $clip only with a box (w and h > 0) */
+        if (e->base == SL_SCROLL || (sl_slot_true(e, "clip") && w > 0 && h > 0)) {
+            double x1 = ox + w, y1 = oy + h;
             clip.x0 = ox > clip.x0 ? ox : clip.x0;
             clip.y0 = oy > clip.y0 ? oy : clip.y0;
             clip.x1 = x1 < clip.x1 ? x1 : clip.x1;
@@ -491,10 +503,155 @@ static float event_coord(zend_object *ev, const char *name)
     return v ? (float)zval_get_double(v) : 0.0f;
 }
 
-static bool push_touch(sl_obj_t *o, uint8_t op, float x, float y)
+static bool push_touch(sl_obj_t *o, uint8_t op, float x, float y, int64_t t_us)
 {
-    slate_scroll_cmd_t d = { .op = op, .x = x, .y = y, .t_us = bm_hal_now_us() };
+    slate_scroll_cmd_t d = { .op = op, .x = x, .y = y, .t_us = t_us };
     return push_scroll(o, &d);
+}
+
+/* Moving now: a drag, an inertia, a snap, a spring or a scrollTo (also one asked and not delivered yet). A scrollTo
+   that ended in the engine whose done is not pulled yet still counts (rare): a press then is a catch and its Tween is
+   marked stopped, while its TweenDone (a stand-in) and ScrollEnded are already queued. */
+bool sl_scroll_moving(sl_obj_t *o)
+{
+    sl_scroll_t *sc = o->sc;
+    return sc && ((sc->pub && slate_scroll_pub_moving(sc->pub)) || (sc->to_tween && sl_tween_running(sc->to_tween)));
+}
+
+/* ---- the touch state machine (touch() and the routing of php_slate_touch.c) ---- */
+
+/* A new touch pressed at (x, y) at t_us: PRESS, which stops a motion (the whole touch is then a catch). false with
+   an exception. */
+static bool tm_press(sl_obj_t *o, float x, float y, int64_t t_us)
+{
+    sl_scroll_t *sc = o->sc;
+    sc->down = sc->dragging = sc->owned = sc->cut = sc->hid = false;
+    bool moving = sl_scroll_moving(o);
+    if (!push_touch(o, SLATE_SCROLL_OP_PRESS, x, y, t_us)) {
+        return false;
+    }
+    silence(o);   /* the PRESS stops a scrollTo without a done */
+    sc->down = true;
+    sc->owned = moving;   /* a catch: the whole touch is the scroll's, never a tap */
+    sc->px = x;
+    sc->py = y;
+    return true;
+}
+
+/* A Moved of the touch: 1 when it is the scroll's (a drag, or a catch), 0 when not (yet), -1 with an exception.
+   shown: the scroll is on the screen now (else the engine ended the drag: nothing more is sent). */
+static int tm_move(sl_obj_t *o, float x, float y, int64_t t_us, bool shown)
+{
+    sl_scroll_t *sc = o->sc;
+    if (!shown) {
+        sc->dragging = false;
+        sc->cut = sc->hid = true;
+    }
+    if (!sc->dragging) {
+        if (sc->cut) {
+            return sc->owned;   /* the engine ended this touch: no new drag until a Pressed */
+        }
+        float dx = x - sc->px, dy = y - sc->py, dist;
+        switch (sl_scroll_axis_of(sl_slot(o, "axis"))) {
+        case SLATE_SCROLL_V:
+            dist = fabsf(dy);
+            break;
+        case SLATE_SCROLL_H:
+            dist = fabsf(dx);
+            break;
+        default:
+            dist = sqrtf(dx * dx + dy * dy);
+            break;
+        }
+        if (!(dist > DRAG_THRESHOLD)) {
+            return sc->owned;   /* not a drag yet: a tap, unless the press caught a motion */
+        }
+        sc->dragging = sc->owned = true;   /* this point is the first DRAG: the engine anchors there */
+    }
+    return push_touch(o, SLATE_SCROLL_OP_DRAG, x, y, t_us) ? 1 : -1;
+}
+
+/* The Released of the touch (op RELEASE), or its loss (op CANCEL: a release without velocity): 1 when the touch
+   was the scroll's, 0 when not, -1 with an exception. A scroll seen off the screen during the touch (or now) gets a
+   CANCEL: the engine ends a drag by itself only for a scroll removed or whose page is left, not for a hidden one
+   (a CANCEL after its own end does nothing). Nothing after the engine ended the touch (a jump, a scrollTo, a new
+   set-up) on the screen. */
+static int tm_release(sl_obj_t *o, uint8_t op, int64_t t_us, bool shown)
+{
+    sl_scroll_t *sc = o->sc;
+    bool off = sc->hid || !shown;
+    bool owned = sc->owned, send = !sc->cut || off;
+    if (off) {
+        op = SLATE_SCROLL_OP_CANCEL;
+    }
+    sc->down = sc->dragging = sc->owned = sc->cut = sc->hid = false;
+    /* also after a tap: the engine resumes a snap the press stopped, or springs back from past an edge */
+    if (send && !push_touch(o, op, 0, 0, t_us)) {
+        return -1;
+    }
+    return owned;
+}
+
+static bool shown_now(sl_obj_t *o)
+{
+    box_t box;
+    return on_screen(o, &box);
+}
+
+bool sl_scroll_take(sl_obj_t *o, const sl_touch_t *t)
+{
+    if (!tm_press(o, (float)t->x, (float)t->y, t->t_us)) {
+        return false;
+    }
+    o->sc->autod = true;   /* touch() leaves this touch alone */
+    return true;
+}
+
+bool sl_scroll_take_drag(sl_obj_t *o, const sl_touch_t *press, const sl_touch_t *t)
+{
+    sl_scroll_t *sc = o->sc;
+    if (!tm_press(o, (float)press->x, (float)press->y, press->t_us)) {
+        return false;
+    }
+    sc->autod = true;
+    sc->dragging = sc->owned = true;   /* the hand-off point is the first DRAG: the engine anchors there, no jump */
+    return push_touch(o, SLATE_SCROLL_OP_DRAG, (float)t->x, (float)t->y, t->t_us);
+}
+
+bool sl_scroll_owns(const sl_obj_t *o)
+{
+    return o->sc && o->sc->owned;
+}
+
+bool sl_scroll_event(sl_obj_t *o, const sl_touch_t *t, bool released)
+{
+    sl_scroll_t *sc = o->sc;
+    if (!sc->autod || !sc->down) {
+        return true;
+    }
+    bool shown = shown_now(o);
+    if (released) {
+        sc->autod = false;
+        return tm_release(o, SLATE_SCROLL_OP_RELEASE, t->t_us, shown) >= 0;
+    }
+    return tm_move(o, (float)t->x, (float)t->y, t->t_us, shown) >= 0;
+}
+
+bool sl_scroll_drop(sl_obj_t *o, bool send)
+{
+    sl_scroll_t *sc = o->sc;
+    if (!sc || !sc->autod) {
+        return true;
+    }
+    sc->autod = false;
+    if (!sc->down) {
+        return true;
+    }
+    if (!send) {
+        sc->down = sc->dragging = sc->owned = sc->cut = sc->hid = false;
+        return true;
+    }
+    return tm_release(o, SLATE_SCROLL_OP_CANCEL, bm_hal_now_us(), shown_now(o)) >= 0;
 }
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_scroll_touch, 0, 1, _IS_BOOL, 0)
@@ -502,7 +659,8 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_scroll_touch, 0, 1, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
 /* touch(): true when the touch belongs to the scroll: a drag, or a catch (a press that stopped its motion: all its
-   events, Released included); see docs/usage/scroll.md. */
+   events, Released included); see docs/usage/scroll.md. While the routing drives the scroll (a touch that hit it, or
+   one it took over from an element), touch() does nothing and returns false: no touch is fed twice. */
 PHP_METHOD(SlateScroll, touch)
 {
     zend_object *ev;
@@ -516,77 +674,36 @@ PHP_METHOD(SlateScroll, touch)
     sl_anim_flush();
     sl_obj_t *o = sl_obj(Z_OBJ_P(ZEND_THIS));
     sl_scroll_t *sc = o->sc;
-    if (!sc) {
-        RETURN_FALSE;   /* never: every Scroll has its state */
+    if (!sc || sc->autod) {
+        RETURN_FALSE;   /* never without a state; the routing's touch */
     }
     box_t box;
     bool shown = on_screen(o, &box);
     zend_class_entry *ce = ev->ce;
+    int r;
     if (ce == touch_class(0)) {   /* Pressed: a new touch */
         sc->down = sc->dragging = sc->owned = sc->cut = false;
         float x = event_coord(ev, "x"), y = event_coord(ev, "y");
         if (!shown || x < box.x0 || y < box.y0 || x >= box.x1 || y >= box.y1) {
             RETURN_FALSE;   /* not shown, or outside the part of the view on the screen: not its touch */
         }
-        /* moving: a drag, an inertia, a snap, a spring or a scrollTo (also one asked and not delivered yet). A
-           scrollTo that ended in the engine whose done is not pulled yet still counts (rare): the press is a catch and
-           its Tween is marked stopped, while its TweenDone (a stand-in) and ScrollEnded are already queued. */
-        bool moving = slate_scroll_pub_moving(sc->pub) || (sc->to_tween && sl_tween_running(sc->to_tween));
-        if (!push_touch(o, SLATE_SCROLL_OP_PRESS, x, y)) {
+        if (!tm_press(o, x, y, bm_hal_now_us())) {
             RETURN_THROWS();
         }
-        silence(o);   /* the PRESS stops a scrollTo without a done */
-        sc->down = true;
-        sc->owned = moving;   /* a catch: the whole touch is the scroll's, never a tap */
-        sc->px = x;
-        sc->py = y;
-        RETURN_BOOL(moving);
+        RETURN_BOOL(sc->owned);
     }
     if (!sc->down || (ce != touch_class(1) && ce != touch_class(2))) {
         RETURN_FALSE;   /* no touch of its own, or a Gesture */
     }
-    if (!shown) {
-        /* gone from the screen during the touch: the engine ended the drag (as a release); the touch stays the
-           scroll's if it was, and nothing more is sent */
-        sc->dragging = false;
-        sc->cut = true;
-    }
     if (ce == touch_class(1)) {   /* Moved */
-        float x = event_coord(ev, "x"), y = event_coord(ev, "y");
-        if (!sc->dragging) {
-            if (sc->cut) {
-                RETURN_BOOL(sc->owned);   /* the engine ended this touch: no new drag until a Pressed */
-            }
-            float dx = x - sc->px, dy = y - sc->py, dist;
-            switch (sl_scroll_axis_of(sl_slot(o, "axis"))) {
-            case SLATE_SCROLL_V:
-                dist = fabsf(dy);
-                break;
-            case SLATE_SCROLL_H:
-                dist = fabsf(dx);
-                break;
-            default:
-                dist = sqrtf(dx * dx + dy * dy);
-                break;
-            }
-            if (!(dist > DRAG_THRESHOLD)) {
-                RETURN_BOOL(sc->owned);   /* not a drag yet: a tap, unless the press caught a motion */
-            }
-            sc->dragging = sc->owned = true;   /* this point is the first DRAG: the engine anchors there */
-        }
-        if (!push_touch(o, SLATE_SCROLL_OP_DRAG, x, y)) {
-            RETURN_THROWS();
-        }
-        RETURN_TRUE;
+        r = tm_move(o, event_coord(ev, "x"), event_coord(ev, "y"), bm_hal_now_us(), shown);
+    } else {                      /* Released: off the screen, a CANCEL (tm_release) */
+        r = tm_release(o, SLATE_SCROLL_OP_RELEASE, bm_hal_now_us(), shown);
     }
-    /* Released */
-    bool owned = sc->owned, send = !sc->cut;
-    sc->down = sc->dragging = sc->owned = sc->cut = false;
-    /* also after a tap: the engine resumes a snap the press stopped, or springs back from past an edge */
-    if (send && !push_touch(o, SLATE_SCROLL_OP_RELEASE, 0, 0)) {
+    if (r < 0) {
         RETURN_THROWS();
     }
-    RETURN_BOOL(owned);
+    RETURN_BOOL(r);
 }
 
 /* ---- scrollTo() ---- */
@@ -654,7 +771,8 @@ PHP_METHOD(SlateScroll, scrollTo)
         RETURN_THROWS();
     }
     o->sc->to_tween = spec.tween;
-    cut_touch(o);   /* the scrollTo jumps the physics where it is */   /* an earlier one runs on to its done (this one takes the position over) */
+    /* an earlier scrollTo runs on to its done (this one takes the position over) */
+    cut_touch(o);   /* the scrollTo jumps the physics where it is */
 }
 
 /* ---- registration ---- */

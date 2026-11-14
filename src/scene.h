@@ -45,7 +45,7 @@
    It also marks stale the caches it affects (cache.h).
 
    Size: a common header (52 bytes) plus the largest kind (ROUNDRECT / CIRCLE, 40 bytes): 92 bytes per element
-   on the ESP32-S3 (120 on a 64-bit host), from the scene allocator (slate_scene_set_alloc); texts, gradients and
+   on the ESP32-S3 (128 on a 64-bit host), from the scene allocator (slate_scene_set_alloc); texts, gradients and
    canvas pixels are allocated apart, and a cache record (76 bytes) only for elements that use a cache.
 
    Opaque. e->opaque is true when the element covers its interior with fully opaque pixels: a ROUNDRECT or
@@ -77,7 +77,14 @@
    and by slate_el_free) and the image's pixels once seen READY (u.image.sli: what the compositor draws). The
    image becomes READY in the loader task, at any moment: the element shows it only from slate_el_image_sync on
    (the engine calls it when images finished loading), which marks its box dirty, so a frame never shows an image
-   that its dirty set does not cover. slate_el_set of an image that is READY already shows it at once. */
+   that its dirty set does not cover. slate_el_set of an image that is READY already shows it at once.
+
+   Touch. TOUCHABLE and HIT_PAD (hit.h) change no pixel: their SET records nothing dirty, stamps nothing and marks no
+   cache stale. Every GROUP counts the touchable elements of its subtree, itself included (u.g.touch_n, kept by
+   slate_el_set of TOUCHABLE, slate_el_add, slate_el_remove and slate_el_free: a change costs a walk up the
+   ancestors, as the change stamps do); slate_el_touchables reads it (0 or 1 for any other kind). Counts are 32-bit
+   (they cannot wrap: elements are far fewer). TOUCHABLE and HIT_PAD fit the header's spare bit and byte, the count
+   the group's spare bytes on the board: the element stays 92 bytes there (128 on a 64-bit host, 120 before). */
 #ifndef SLATE_SCENE_H
 #define SLATE_SCENE_H
 
@@ -101,6 +108,8 @@
 #define SLATE_SCROLL_BAR_GAP 2
 #define SLATE_SCROLL_BAR_MIN 16
 #define SLATE_SCROLL_BAR_ARGB 0x99808080u
+
+#define SLATE_HIT_PAD_MAX 64   /* HIT_PAD: 0..64 px (see "Touch" above) */
 
 typedef enum {
     SLATE_EL_GROUP = 1,
@@ -149,6 +158,8 @@ typedef enum {
     SLATE_PROP_CONTENT_W,     /* NUM: scroll only, whole pixels 0..32767, 0 = from the children */
     SLATE_PROP_CONTENT_H,     /* NUM */
     SLATE_PROP_INDICATOR_A,   /* NUM: scroll only, alpha of the scroll bars, clamped to 0..1 */
+    SLATE_PROP_TOUCHABLE,     /* BOOL: every kind (see "Touch" above) */
+    SLATE_PROP_HIT_PAD,       /* NUM: every kind, px added to its hit box on each side, rounded, clamped to 0..64 */
 } slate_prop_t;
 
 typedef enum {
@@ -246,6 +257,7 @@ typedef struct {
     float w, h;                 /* clip box */
     slate_shadow_t shadow;
     int16_t blur;
+    uint32_t touch_n;           /* touchables in its subtree, itself included (see "Touch" above) */
     slate_scroll_el_t *scroll;  /* NULL: not a scroll */
 } slate_group_t;
 typedef struct { float r, from, to, width; slate_paint_t color; uint8_t caps; } slate_arc_t;
@@ -281,6 +293,8 @@ struct slate_el {
     bool under : 1;                      /* the compositor's: e is drawn in its underlay (compose.c) */
     bool anim : 1;                       /* the engine's: e may have tweens or ease settings (engine.c); a hint,
                                             nothing here reads it */
+    bool touchable : 1;                  /* TOUCHABLE */
+    uint8_t hit_pad;                     /* HIT_PAD, 0..SLATE_HIT_PAD_MAX px */
     union {
         slate_group_t g;
         slate_shape_t shape;
@@ -334,6 +348,12 @@ void slate_el_move(slate_el_t *e, const slate_value_t *x, const slate_value_t *y
    OPACITY are every kind's; a CANVAS's W and H are not animated, nor any other property) or the paint is a gradient
    now. */
 bool slate_el_anim_get(const slate_el_t *e, slate_prop_t prop, slate_value_t *out);
+
+/* The touchable elements of e's subtree, e included (see "Touch" above). */
+static inline uint32_t slate_el_touchables(const slate_el_t *e)
+{
+    return e->kind == SLATE_EL_GROUP ? e->u.g.touch_n : (uint32_t)e->touchable;
+}
 
 /* Screen origin of e's parent (0, 0 for a root). */
 void slate_el_parent_origin(const slate_el_t *e, float *ox, float *oy);

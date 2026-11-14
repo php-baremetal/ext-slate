@@ -4,8 +4,9 @@
 
    Threads.
      PHP task       slate_engine_start / stop / cmds / deliver / kick / stats / set_cache_budget / set_keep / tween_done /
-                    set_tween_listener / transition_done / in_transition / scroll_done (tween_done, transition_done
-                    and scroll_done also from the tween listener); the slate_scroll_pub_* reads (cmd.h), any task
+                    set_tween_listener / transition_done / in_transition / scroll_done / set_hit_pub (tween_done,
+                    transition_done and scroll_done also from the tween listener); the slate_scroll_pub_* reads
+                    (cmd.h) and the slate_hit_* reads (hit.h), any task
      TE interrupt   slate_engine_vsync (give it to display_vsync_hook(): ISR-safe; notes the pulse, wakes the task)
      engine task    everything else: the scene, the compositor, every call of the band ops (buf_alloc, begin,
                     push, end, buf_free), the debug output
@@ -192,8 +193,10 @@
        shown: a SHOW of another scene, a REMOVE or FREE of an ancestor; or a transition started: the PHP side ignores
        the touch meanwhile) ends as a release without velocity (slate_scroll_cancel: a spring back from past an edge,
        a snap, or rest; the drag's end), then pauses with its scene. REMOVE of the scroll itself (not put back in the
-       same delivery) stops its motion and drag, without an end, and its bars go; FREE drops it, without an end. After every delivery a scroll at
-       rest is brought into its limits when they moved (rows removed under it).
+       same delivery) stops its motion and drag, without an end, and its bars go; FREE drops it, without an end. After every delivery, and at
+       every tick where a tween wrote a value (an animated w / h of the scroll, or box of a child), a scroll at rest is
+       brought into its limits when they moved (rows removed under it, a view that grew), and a scrollTo's targets
+       follow limits that shrank.
      - Bars (CONFIG indicators): INDICATOR_A 1 while the content moves (drag, inertia, snap, spring, scrollTo), held
        SC_HOLD_US (500 ms, the scroll's clock) after it stops, then linear to 0 in SC_FADE_US (200 ms). During the
        hold nothing ticks: the task sleeps until its end (a timed wake-up), then ticks while the bars fade; when no
@@ -212,6 +215,25 @@
    slate-debug, the first frame that composes a cached scroll directly (its content image refused: stats
    scroll_nocache) prints one line, once per engine.
 
+   Touch (hit.h). The engine publishes where the touchable elements of the frame shown are, for the PHP task to
+   route a touch without a lock: a hit table in the block given by slate_engine_set_hit_pub (none given: nothing is
+   built). A SET of TOUCHABLE notes the element's id (the table names elements by id; out of memory for it: the SET
+   is refused, counted in cmd_errors).
+     - The table is built again after a frame composed with a scene change, and after a command that changes the
+       subtree of a touchable of the scene shown without drawing anything (TOUCHABLE, HIT_PAD, a move off the
+       screen); while a frame is still to come (something dirty, the panel awake) it waits for that frame, so it
+       always describes the last frame composed. A still screen builds nothing.
+     - Zero touchables in the root shown (an O(1) count, scene.h "Touch"): no walk at all; the table goes empty once
+       when the last one goes.
+     - SHOW publishes an empty table at once: empty until the first frame of what is shown. During a transition
+       nothing is built (the PHP task ignores the touch meanwhile); its end gives a frame, and the table.
+     - The walk (slate_hit_build) runs on the engine task after the frame's last band is handed over, outside the
+       frame's timings. A table that needs more memory than the scene allocator gives is not built: the one
+       published stays, stats.hit_nomem counts it (with slate-debug, one line, once per engine), and it is tried
+       again after the next frame composed with a scene change or 100 ms later (HIT_RETRY_US), whichever comes
+       first (so also on a still screen).
+   Stats: hit_builds (walks), hit_entries (entries of the table published), hit_nomem.
+
    One engine at a time (the compositor and the rasterizers are not reentrant). */
 #ifndef SLATE_ENGINE_H
 #define SLATE_ENGINE_H
@@ -223,6 +245,7 @@
 #include "cmd.h"
 #include "compose.h"
 #include "display_band.h"
+#include "hit.h"
 
 #ifndef SLATE_ENGINE_STACK
 #define SLATE_ENGINE_STACK 10240       /* bytes */
@@ -278,6 +301,10 @@ typedef struct {
     uint32_t scrolls_active;     /* scrolls in motion (drag, inertia, snap, spring, scrollTo) or with bars fading,
                                     paused ones included (see Scrolls) */
     uint32_t anim_ticks;         /* ticks of the animations (tweens, transitions, scrolls) since the start */
+    uint32_t hit_builds;         /* hit tables built (see Touch) */
+    uint32_t hit_entries;        /* entries of the hit table published last */
+    uint32_t hit_nomem;          /* hit tables not built: the scene allocator refused a larger table (the one
+                                    published stays) */
 } slate_engine_stats_t;
 
 /* Starts the engine task for a panel of w x h pixels with the band path ops (ops->begin etc.; panel is the
@@ -348,5 +375,10 @@ bool slate_engine_in_transition(slate_engine_t *e);
 /* Takes the oldest scroll end (see Scrolls): the scroll's element id and its position then (whole pixels); false
    when none waits. Any task (not an ISR), under the engine's lock: the PHP task, and the tween listener. */
 bool slate_engine_scroll_done(slate_engine_t *e, uint32_t *el_id, int *x, int *y);
+
+/* Where the engine publishes its hit table (see Touch; hit.h): the engine takes a reference (given back when another
+   block or NULL replaces it, and at stop) and gives the one it held back. Applied at the task's next wake-up (this
+   call wakes it). PHP task. */
+void slate_engine_set_hit_pub(slate_engine_t *e, slate_hit_pub_t *p);
 
 #endif

@@ -515,16 +515,12 @@ typedef void (*sink_fn)(cx_t *cx, const slate_bufa_t *strip, void *arg);
    RGB565 + A8 strips from scratch (half of what is left, or less when the groups nested in g need the rest:
    strip_bytes) and hands each to sink. false (nothing done) when
    scratch cannot hold one row: offscreen work never blends in slow memory. */
-static bool produce(cx_t *cx, slate_el_t *g, float pox, float poy, slate_rect_t R, slate_rect_t cc, sink_fn sink,
-                    void *arg)
+/* The rows of strip (R's width) the scratch gives produce for the children of g over R, at most h (asked for first
+   from scratch_grow when nothing lives in the scratch); 0: not one row. */
+static int strip_rows(cx_t *cx, slate_el_t *g, int w, int h)
 {
-    int w = R.x1 - R.x0, h = R.y1 - R.y0;
-    if (w <= 0 || h <= 0) {
-        return true;
-    }
     size_t row = ((size_t)w * 3 + 3) & ~(size_t)3;
-    size_t top = cx->ar_top;
-    if (top == 0 && cx->t->scratch_grow) {
+    if (cx->ar_top == 0 && cx->t->scratch_grow) {
         /* the strips scratch_max gives, and room for the groups nested in g (each level gets half of what is
            left; theirs are no wider than g's strip) */
         size_t max = cx->t->scratch_max, kmax = max / 2 / row, want = 2 * row * (kmax < (size_t)h ? kmax : (size_t)h);
@@ -539,7 +535,18 @@ static bool produce(cx_t *cx, slate_el_t *g, float pox, float poy, slate_rect_t 
         arena_need(cx, want);
     }
     size_t avail = cx->ar ? strip_bytes(g, row, cx->ar_size - cx->ar_top) : 0;
-    int k = (int)(avail / row < (size_t)h ? avail / row : (size_t)h);
+    return (int)(avail / row < (size_t)h ? avail / row : (size_t)h);
+}
+
+static bool produce(cx_t *cx, slate_el_t *g, float pox, float poy, slate_rect_t R, slate_rect_t cc, sink_fn sink,
+                    void *arg)
+{
+    int w = R.x1 - R.x0, h = R.y1 - R.y0;
+    if (w <= 0 || h <= 0) {
+        return true;
+    }
+    size_t top = cx->ar_top;
+    int k = strip_rows(cx, g, w, h);
     if (k < 1) {
         return false;
     }
@@ -841,6 +848,14 @@ __attribute__((noinline, cold)) static slate_cache_t *resolve_scroll(cx_t *cx, s
     }
     c->content_ok = c->shadow_ok = false;
     int w = rel.x1 - rel.x0, h = rel.y1 - rel.y0;
+    if (strip_rows(cx, e, w, h) < 1) {
+        /* no scratch for one row (produce would refuse it): the image is not allocated, cleared and freed for
+           nothing every frame. Composed directly until the scratch can hold a row (asked for again each frame through
+           scratch_grow, which waits a second after a refusal), with no cache memory held in between */
+        c->crel = EMPTY;
+        cx->st->scroll_nocache++;
+        return NULL;
+    }
     size_t pxb = ((size_t)w * h * 2 + 3) & ~(size_t)3;
     if (!slate_cache_mem(c, (void **)&c->px, &c->cbytes, pxb + (size_t)w * h, el_alloc, t->cache_free, t->ctx)) {
         c->crel = EMPTY;

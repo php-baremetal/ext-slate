@@ -114,8 +114,10 @@ typedef enum {
     SLATE_SCROLL_OP_JUMP,      /* the position (x, y), clamped to the limits; stops every motion, no end */
     SLATE_SCROLL_OP_CONFIG,    /* makes the group a scroll (or changes its set-up): axis, bounce, snap_x, snap_y,
                                   snap_max, indicators, pub */
+    SLATE_SCROLL_OP_CANCEL,    /* the touch is lost (its Released will not come) at t_us: a release without velocity
+                                  (slate_scroll_cancel: a spring, a snap or rest; a drag still ends) */
 } slate_scroll_op_t;
-#define SLATE_SCROLL_OP_COUNT 5
+#define SLATE_SCROLL_OP_COUNT 6
 
 /* The data of a SCROLL. */
 typedef struct {
@@ -126,7 +128,7 @@ typedef struct {
     int32_t snap_x, snap_y;   /* CONFIG: px, 0 = none */
     int32_t snap_max;      /* CONFIG: snap steps a release may travel (slate_scroll_snap_max), 0 = no limit */
     float x, y;            /* PRESS, DRAG: the finger (any fixed frame, the screen's); JUMP: the position */
-    int64_t t_us;          /* PRESS, DRAG, RELEASE: when PHP saw the touch (bm_hal_now_us()) */
+    int64_t t_us;          /* PRESS, DRAG, RELEASE, CANCEL: when PHP saw the touch (bm_hal_now_us()) */
     uint32_t seq;          /* JUMP, CONFIG: published back when applied (slate_scroll_pub_seq) */
     slate_scroll_pub_t *pub;   /* CONFIG: where to publish (a reference is taken at push); NULL: keep the one there */
 } slate_scroll_cmd_t;

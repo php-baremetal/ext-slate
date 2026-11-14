@@ -15,8 +15,9 @@
  * Scene: what Slate shows, one at a time. Its elements hang from a root group of its own (the scene is not an
  * Element: it cannot go inside a group). A page of an application extends it: build() adds the components
  * (called once, before the first show), onEnter() and onLeave() run when it is shown and replaced (with a
- * transition: onEnter() at its start, onLeave() at its end), onTouch() gets the touch events while it is the active
- * scene (not during a transition). All four are empty here.
+ * transition: onEnter() at its start, onLeave() at its end), onTouch() gets the raw touch events of the touches no
+ * element takes while it is the active scene (not during a transition; php_slate_touch.c routes them). All four are
+ * empty here.
  *
  * protected bool $keepCache = true: when the scene is left, its element caches stay for a return to it while there
  * is room (Slate::$keepScenes, Slate::$keptBudget; engine.h, Kept scenes); false: they go when it is left. Read by

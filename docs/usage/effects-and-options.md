@@ -6,7 +6,7 @@ see_also:
   - { href: './images.md', meta: 'API' }
   - { href: './performance.md', meta: 'API' }
   - { href: './debug.md', meta: 'API' }
-prev: { label: 'Scroll', href: './scroll.md' }
+prev: { label: 'Touch', href: './touch.md' }
 next: { label: 'Performance', href: './performance.md' }
 ---
 

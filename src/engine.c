@@ -49,6 +49,7 @@ enum { CTL_FAILED = 0x534C0A01, CTL_READY, CTL_JOINED };
 #define SC_HOLD_US 500000      /* the bars stay this long after a scroll stops ... */
 #define SC_FADE_US 200000      /* ... then fade to 0 in this */
 #define SC_IDLE_TICK_US 50000  /* while the panel sleeps: a moving scroll is stepped this often (no frames) */
+#define HIT_RETRY_US 100000    /* a hit table refused memory: tried again this much later */
 #define SLATE_STR(x) SLATE_STR2(x)
 #define SLATE_STR2(x) #x
 
@@ -121,6 +122,7 @@ struct slate_engine {
     bm_hal_queue_t *ack;           /* the engine answers a reclaim with the last request number it served (even), bit 0
                                       set when it freed something */
     uint32_t reclaim_req;          /* atomic: the last request number (the loader's; steps of 2) */
+    int hit_flag;                  /* slate_engine_set_hit_pub() gave a block (hit_new, under lock) */
     bool reclaim_stuck;            /* stop: a reclaim did not end in time; e and its queues are left allocated */
     int keep_scenes_req;           /* the limits asked for */
     size_t keep_budget_req;
@@ -139,6 +141,7 @@ struct slate_engine {
     uint32_t trq_head, trq_n;
     sce_t *scq;                    /* the scroll end queue, a ring (grown by the engine, as dq) */
     uint32_t scq_cap, scq_head, scq_n;
+    slate_hit_pub_t *hit_new;      /* the block slate_engine_set_hit_pub() gave (a reference), not taken yet */
 
     /* driver task only (the dones, one after the other) */
     int64_t drv_done_us;           /* the last done */
@@ -218,6 +221,11 @@ struct slate_engine {
     sc_t *scs;                     /* the scrolls driven */
     int sc_run;                    /* scrolls that need ticks (shown, moving or bars fading) */
     int64_t sc_wake;               /* the end of the earliest bars' hold (ticks' time; INT64_MAX: none): a timed wake */
+    slate_hit_pub_t *hit;          /* where the hit table goes (a reference), NULL: nowhere (engine.h, Touch) */
+    slate_hit_ids_t hit_ids;       /* the ids of the touchable elements */
+    bool hit_due;                  /* the table is to build again (after the frame that comes, if one comes) */
+    int64_t hit_retry_us;          /* after a build refused memory: the next try not before this (0: none due) */
+    int hit_n;                     /* entries of the table published */
 #if SLATE_DEBUG
     slate_debug_t dbg;
     slate_el_t *ovl, *ovl_bg, *ovl_text;
@@ -225,6 +233,8 @@ struct slate_engine {
     char dbg_line[200];            /* the statistics line still to print ("" none) */
     uint8_t dbg_nocache;           /* 1: a cached scroll was composed directly, its line still to print; 2: printed
                                       (once per engine) */
+    uint8_t dbg_hitnomem;          /* 1: a hit table was refused memory, its line still to print; 2: printed (once
+                                      per engine) */
 #endif
 };
 
@@ -734,6 +744,97 @@ static void dirty_all(slate_engine_t *e)
     e->scene_dirty = true;
 }
 
+/* ---- the hit table (engine.h, Touch) ---- */
+
+/* A change of el (a command): when touchables of the scene shown are in its subtree, the table is due again (the
+   frame the change gives, if any, builds it; a change that draws nothing, such as TOUCHABLE or HIT_PAD, too). */
+static void hit_touch(slate_engine_t *e, const slate_el_t *el)
+{
+    if (e->hit && slate_el_touchables(el) > 0 && shown(e, el)) {
+        e->hit_due = true;
+        e->hit_retry_us = 0;   /* a new cause: no wait after a refusal */
+    }
+}
+
+static void hit_stats(slate_engine_t *e, bool built, bool nomem)
+{
+    bm_hal_lock_enter(e->lock);
+    e->st.hit_builds += built;
+    e->st.hit_nomem += nomem;
+    e->st.hit_entries = (uint32_t)e->hit_n;
+    bm_hal_lock_exit(e->lock);
+}
+
+/* An empty table (SHOW: until the new scene's first frame). */
+static void hit_clear(slate_engine_t *e)
+{
+    if (e->hit) {
+        slate_hit_pub_publish(e->hit, 0);
+        e->hit_n = 0;
+        hit_stats(e, false, false);
+        e->hit_due = true;
+    }
+}
+
+/* At the end of a wake-up: the table built again when due, unless a transition runs (touches are ignored meanwhile)
+   or a frame is still to come (the table follows the frame composed). Zero touchables in the root shown: no walk
+   (an empty table published once). */
+static void hit_sync(slate_engine_t *e)
+{
+    if (load(&e->hit_flag)) {
+        bm_hal_lock_enter(e->lock);
+        slate_hit_pub_t *p = e->hit_new;
+        e->hit_new = NULL;
+        store(&e->hit_flag, 0);
+        bm_hal_lock_exit(e->lock);
+        slate_hit_pub_put(e->hit);
+        e->hit = p;
+        e->hit_n = 0;
+        e->hit_due = p != NULL;
+        e->hit_retry_us = 0;
+        if (p) {
+            slate_hit_pub_publish(p, 0);   /* a block given again starts empty: never another scene's entries */
+            hit_stats(e, false, false);
+        }
+    }
+    if (e->scene_dirty && e->dirty.n == 0) {
+        /* the scene shown changed without a pixel (rows added outside a scroll's view, a scroll's limits or axis):
+           no frame comes, the table follows now */
+        e->scene_dirty = false;
+        e->hit_due |= e->hit != NULL;
+    }
+    if (!e->hit_due || !e->hit || e->tr.on || (e->dirty.n > 0 && !failed(e) && !load(&e->paused))) {
+        return;
+    }
+    if (e->hit_retry_us && now_us() < e->hit_retry_us) {
+        return;   /* refused memory a moment ago: the timed wake-up (sleep_ms) tries again */
+    }
+    e->hit_due = false;
+    e->hit_retry_us = 0;
+    if (!e->scene || slate_el_touchables(e->scene) == 0) {
+        if (e->hit_n > 0) {
+            slate_hit_pub_publish(e->hit, 0);
+            e->hit_n = 0;
+            hit_stats(e, false, false);
+        }
+        return;
+    }
+    int n = slate_hit_build(e->hit, e->scene, e->w, e->h, &e->hit_ids);
+    if (n < 0) {
+#if SLATE_DEBUG
+        if (e->dbg_hitnomem == 0) {
+            e->dbg_hitnomem = 1;   /* printed by debug_print(), once */
+        }
+#endif
+        hit_stats(e, false, true);
+        e->hit_due = true;   /* tried again HIT_RETRY_US later, even on a still screen */
+        e->hit_retry_us = now_us() + HIT_RETRY_US;
+        return;
+    }
+    e->hit_n = n;
+    hit_stats(e, true, false);
+}
+
 static uint16_t rgb565(uint32_t argb)
 {
     return (uint16_t)((((argb >> 19) & 0x1F) << 11) | (((argb >> 10) & 0x3F) << 5) | ((argb >> 3) & 0x1F));
@@ -754,6 +855,7 @@ static void scratch_trim(slate_engine_t *e, size_t want, int64_t now);
 static void tw_forget(slate_engine_t *e, slate_el_t *el);
 static void tw_sync(slate_engine_t *e, int64_t now);
 static void sc_sync(slate_engine_t *e, int64_t now);
+static void sc_limits(slate_engine_t *e, sc_t *sc);
 static sc_t *sc_of(slate_engine_t *e, const slate_el_t *el);
 static sc_t *sc_new(slate_engine_t *e, slate_el_t *el, uint32_t id);
 static int64_t sc_clock(const sc_t *sc, int64_t t);
@@ -1085,6 +1187,7 @@ static bool apply_free(slate_engine_t *e, uint32_t id)
     if (e->tr.on && (el == e->tr.p.from || el == e->tr.p.to)) {
         tr_finish(e);   /* a scene of the transition goes: it ends first (its done) */
     }
+    hit_touch(e, el);
     if (el == e->scene) {
         slate_el_remove(el, NULL, e->w, e->h);
         e->scene = NULL;
@@ -1113,6 +1216,9 @@ static bool apply_free(slate_engine_t *e, uint32_t id)
     }
     if (el->anim || e->tws) {
         tw_forget(e, el);   /* its tweens stop, those of its children pause (tw_sync) */
+    }
+    if (el->touchable) {
+        slate_hit_ids_del(&e->hit_ids, el);
     }
     slate_el_free(el);
     map_del(e, id);
@@ -1449,6 +1555,7 @@ static void tw_tick(slate_engine_t *e, int64_t now)
         now = e->tw_last_us;
     }
     e->tw_last_us = now;
+    bool wrote = false;
     for (tw_t *en = e->tws; en; en = en->next) {
         for (tw_t *c = en; c && !c->dead && !c->hidden;) {
             slate_tween_prop_t v[SLATE_TWEEN_PROPS_MAX];
@@ -1456,6 +1563,7 @@ static void tw_tick(slate_engine_t *e, int64_t now)
             bool done = slate_tween_sample(c->t, now, v, &n);
             if (n > 0) {
                 slate_tween_write(c->el, v, n, dirty_for(e, c->el), e->w, e->h);
+                wrote = true;
             }
             if (!done) {
                 break;
@@ -1482,6 +1590,12 @@ static void tw_tick(slate_engine_t *e, int64_t now)
         if (en->sc_done) {
             en->sc_done = false;
             sc_tween_end(e, en, true, now);   /* after the tween dones: TweenDone comes before ScrollEnded */
+        }
+    }
+    if (wrote) {
+        /* a tween of a geometry (the scroll's w / h, a child's box) moves the limits with no delivery (sc_sync) */
+        for (sc_t *sc = e->scs; sc; sc = sc->next) {
+            sc_limits(e, sc);
         }
     }
     tw_sweep(e, NULL);
@@ -1990,6 +2104,30 @@ static void sc_tick(slate_engine_t *e, int64_t now)
     sc_count(e, now);
 }
 
+/* The limits of sc may have moved (a delivery, or a tween that wrote a geometry: the scroll's w / h, a child's box):
+   a scrollTo's targets follow limits that shrank; a scroll at rest is brought into them (drawn and published, no
+   end), so that the view shows no space past the edge and the next press anchors where the content is drawn. */
+static void sc_limits(slate_engine_t *e, sc_t *sc)
+{
+    slate_scroll_t *ph = slate_el_scroll(sc->el);   /* the limits brought up to date first */
+    if (!ph) {
+        return;
+    }
+    if (sc->tween) {
+        tw_t *en = tw_find(e, sc->tween);
+        if (en) {
+            sc_tween_clamp(en);   /* content that shrank: it ends inside the limits */
+        }
+    } else if (slate_scroll_state(ph) == SLATE_SC_IDLE && !ph->armed) {
+        float x, y;
+        slate_scroll_pos(ph, &x, &y);
+        if (x != sc->el->u.g.scroll->sx || y != sc->el->u.g.scroll->sy) {
+            sc_write(e, sc);
+            sc_publish(sc);
+        }
+    }
+}
+
 /* After batches: a scroll whose element had a REMOVE and has no parent now stops (no end) and loses its bars; a drag
    whose Released cannot come any more (the scroll is no longer shown, or a transition runs: the PHP side ignores the
    touch then) ends as a release without velocity (a spring back, a snap, or rest; its end); the scrolls no longer
@@ -2036,20 +2174,7 @@ static void sc_sync(slate_engine_t *e, int64_t now)
             sc->off += now - sc->hid_at;
             sc->hidden = false;
         }
-        if (sc->tween) {
-            tw_t *en = tw_find(e, sc->tween);
-            if (en) {
-                sc_tween_clamp(en);   /* content that shrank: it ends inside the limits */
-            }
-        } else if (slate_scroll_state(ph) == SLATE_SC_IDLE && !ph->armed) {
-            /* at rest: the limits (content, view) may have moved it into them */
-            float x, y;
-            slate_scroll_pos(ph, &x, &y);
-            if (x != sc->el->u.g.scroll->sx || y != sc->el->u.g.scroll->sy) {
-                sc_write(e, sc);
-                sc_publish(sc);
-            }
-        }
+        sc_limits(e, sc);
     }
     sc_count(e, now);
 }
@@ -2106,6 +2231,7 @@ static bool apply_scroll(slate_engine_t *e, const slate_cmd_t *c)
         sc->ind_on = s->indicators;
         if (reset) {
             sc_write(e, sc);
+            hit_touch(e, el);   /* the axis flags may change without a pixel */
         }
         sc_update(e, sc, sc_clock(sc, batch_us(e)));
         sc_count(e, batch_us(e));
@@ -2128,7 +2254,12 @@ static bool apply_scroll(slate_engine_t *e, const slate_cmd_t *c)
         sc_write(e, sc);
         break;
     case SLATE_SCROLL_OP_RELEASE:
-        slate_scroll_release(ph, s->t_us - off);
+    case SLATE_SCROLL_OP_CANCEL:
+        if (s->op == SLATE_SCROLL_OP_CANCEL) {
+            slate_scroll_cancel(ph, s->t_us - off);
+        } else {
+            slate_scroll_release(ph, s->t_us - off);
+        }
         sc_write(e, sc);
         if (slate_scroll_take_end(ph)) {
             sc_end(e, sc);   /* a drag that leaves no motion ends at once */
@@ -2170,6 +2301,22 @@ static bool apply(slate_engine_t *e, const slate_cmd_t *c)
     case SLATE_CMD_SET: {
         el = map_find(e, c->id);
         bool ok;
+        if (el && c->prop == SLATE_PROP_TOUCHABLE && c->v.type == SLATE_VAL_BOOL) {
+            /* the id noted first (the walk needs it), forgotten when it is no longer touchable */
+            if (c->v.v.b && !slate_hit_ids_put(&e->hit_ids, el, c->id)) {
+                return false;   /* out of memory: not touchable */
+            }
+            hit_touch(e, el);   /* before (it may stop being touchable) and after (it may become touchable) */
+            slate_el_set(el, c->prop, &c->v, NULL, e->w, e->h);
+            if (!c->v.v.b) {
+                slate_hit_ids_del(&e->hit_ids, el);
+            }
+            hit_touch(e, el);
+            return true;
+        }
+        if (el) {
+            hit_touch(e, el);
+        }
         if (el && el->anim) {
             ok = apply_set_anim(e, el, c);
         } else {
@@ -2192,6 +2339,7 @@ static bool apply(slate_engine_t *e, const slate_cmd_t *c)
         if (!g || !el || !slate_el_add(g, el, dirty_for(e, g), e->w, e->h)) {
             return false;
         }
+        hit_touch(e, el);
         kept_take(e, el);   /* a kept root inside a group: no longer a scene left */
         if (kept_top(e, g) >= 0) {   /* caches brought into a kept scene count in its bytes */
             kept_trim(e);
@@ -2202,6 +2350,7 @@ static bool apply(slate_engine_t *e, const slate_cmd_t *c)
         if (!el || el->parent == e->screen || el == e->scene || (e->tr.on && el == e->tr.p.from)) {
             return false;   /* a scene root leaves the screen through SHOW */
         }
+        hit_touch(e, el);
         bool in_kept = el->parent && kept_top(e, el) >= 0;
         if (in_kept) {
             slate_cache_drop_tree(el);   /* out of a kept scene: its caches go with it, out of reach otherwise */
@@ -2227,7 +2376,11 @@ static bool apply(slate_engine_t *e, const slate_cmd_t *c)
     case SLATE_CMD_FREE:
         return apply_free(e, c->id);
     case SLATE_CMD_SHOW:
-        return apply_show(e, c);
+        if (!apply_show(e, c)) {
+            return false;
+        }
+        hit_clear(e);   /* empty until the first frame of what is shown now */
+        return true;
     case SLATE_CMD_PIXELS:
         return apply_pixels(e, c);
     case SLATE_CMD_TWEEN:
@@ -2298,6 +2451,7 @@ static void apply_all(slate_engine_t *e, bool pulse)
                     tw_drop_prop(e, el, SLATE_PROP_Y, NULL);
                 }
                 if (el) {
+                    hit_touch(e, el);
                     slate_el_move(el, &c[i].v, &c[i + 1].v, dirty_for(e, el), e->w, e->h, &ok_x, &ok_y);
                 }
                 errors += !ok_x + !ok_y;
@@ -2452,6 +2606,11 @@ static void debug_print(slate_engine_t *e)
         printf("slate: a cached Scroll's content does not fit the cache: it is composed directly\n");
         any = true;
     }
+    if (e->dbg_hitnomem == 1) {
+        e->dbg_hitnomem = 2;
+        printf("slate: no memory for the touch table: touches use the previous one\n");
+        any = true;
+    }
     if (any) {
         fflush(stdout);
     }
@@ -2502,6 +2661,10 @@ static void frame(slate_engine_t *e)
     }
     e->scene_dirty = false;
     e->drawn = true;
+    if (scene && e->hit) {
+        e->hit_due = true;   /* the table follows the frame composed (hit_sync, after it) */
+        e->hit_retry_us = 0;
+    }
     if (e->retry.n > 0) {
         /* bands the panel refused: sent again by the next frames, a few times in a row at most */
         if (++e->retry_frames <= RETRY_FRAMES) {
@@ -2572,6 +2735,12 @@ static uint32_t sleep_ms(slate_engine_t *e)
     }
     if (e->sc_wake < until) {
         until = e->sc_wake;   /* a scroll's bars end their hold: their fade starts */
+    }
+    if (e->hit_retry_us && e->hit_due && e->hit_retry_us < until && !e->tr.on &&
+        !(e->dirty.n > 0 && !failed(e) && !load(&e->paused))) {
+        /* a hit table refused memory: its next try, only when hit_sync can act then (no transition, no frame to
+           come first: the end of a transition and a frame give their own wake-ups and clear the wait) */
+        until = e->hit_retry_us;
     }
     if (until == INT64_MAX) {
         return UINT32_MAX;
@@ -2659,6 +2828,7 @@ static void run(slate_engine_t *e)
         debug_tick(e);
 #endif
         step(e, pulse);
+        hit_sync(e);
         scratch_trim(e, SIZE_MAX, now_us());
 #if SLATE_DEBUG
         debug_print(e);
@@ -2859,6 +3029,14 @@ static void teardown(slate_engine_t *e)
     e->ezs = NULL;
     ext_free(e->fin);
     e->fin = NULL;
+    slate_hit_pub_put(e->hit);   /* and the block given and not taken yet */
+    e->hit = NULL;
+    bm_hal_lock_enter(e->lock);
+    slate_hit_pub_t *hn = e->hit_new;
+    e->hit_new = NULL;
+    bm_hal_lock_exit(e->lock);
+    slate_hit_pub_put(hn);
+    slate_hit_ids_free(&e->hit_ids);
     /* Detach every element first: a group frees its children with it, and they have their own ids. */
     for (uint32_t i = 0; i < e->map_cap; i++) {
         slate_el_t *el = e->map[i].el;
@@ -3213,4 +3391,16 @@ void slate_engine_set_tween_listener(void (*cb)(void *arg), void *arg)
 {
     s_tw_cb = cb;
     s_tw_arg = arg;
+}
+
+void slate_engine_set_hit_pub(slate_engine_t *e, slate_hit_pub_t *p)
+{
+    slate_hit_pub_ref(p);
+    bm_hal_lock_enter(e->lock);
+    slate_hit_pub_t *old = e->hit_new;   /* given before and not taken yet */
+    e->hit_new = p;
+    store(&e->hit_flag, 1);
+    bm_hal_lock_exit(e->lock);
+    slate_hit_pub_put(old);
+    slate_engine_kick(e);
 }

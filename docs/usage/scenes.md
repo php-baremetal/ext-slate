@@ -4,6 +4,7 @@ lede:    'A Slate shows one Scene at a time, at once or with a transition; a pag
 see_also:
   - { href: './elements.md', meta: 'API' }
   - { href: './animations.md', meta: 'API' }
+  - { href: './touch.md', meta: 'API' }
   - { href: '../overview.md', meta: 'Overview' }
   - { href: 'package:php-baremetal/ext-input', meta: 'Extension', label: 'ext-input' }
 prev: { label: 'Overview', href: '../overview.md' }
@@ -72,7 +73,7 @@ Takes elements out; they stay usable and can be added again, here or elsewhere.
 | `protected build(): void` | Once, by the first `show()` of the scene, before `onEnter()`: add the components here. |
 | `onEnter(): void` | Each time the scene is shown; with a transition, when it starts. |
 | `onLeave(): void` | When another scene replaces it; with a transition, when it ends. |
-| `onTouch(TouchEvent $e): void` | For each `Pressed`, `Moved`, `Released` and `Gesture` of the Slate's touch device while the scene is shown. |
+| `onTouch(TouchEvent $e): void` | For each `Pressed`, `Moved`, `Released` and `Gesture` of the Slate's touch device while the scene is shown, for the touches that no element takes (see [Touch](#touch)). |
 
 All four are empty in `Scene`. A scene can also be built without a class:
 
@@ -207,7 +208,7 @@ What happens, in order:
 | Thrown by `show()` with a transition | When |
 | --- | --- |
 | `\RuntimeException` `Slate: cannot run a transition: the table of ext-events' idle hooks is full` | Other extensions took the four idle hooks ext-events keeps (Slate uses one, shared by all its parts). |
-| `\RuntimeException` `Slate: cannot run a transition: the table of ext-events' watches is full` | Other extensions took the eight watches ext-events keeps (Slate uses up to five: four for the touch, one for `TransitionDone`). |
+| `\RuntimeException` `Slate: cannot run a transition: the table of ext-events' watches is full` | Other extensions took the eight watches ext-events keeps (Slate uses up to six: four for the touch, one for `Hold`, one for `TransitionDone`). |
 | `\RuntimeException` `Slate: out of memory for the transition` | No memory for the few bytes that carry its end. Nothing changed. |
 
 A frame during a transition costs about as much as the two scenes together, and the whole screen is sent at
@@ -255,16 +256,18 @@ Like the elements' properties, they cannot be taken by reference or unset (`\Err
 
 ## Touch
 
-Slate forwards the touch events of its `Touch` to `onTouch()` of the scene shown when the event is delivered;
-the other scenes get nothing. The events come from the event bus of ext-events, so they arrive in the
+Slate routes the touch events of its `Touch` when the event is delivered: a `Pressed` on an element that takes
+touches (`$touchable`, or a callback of `on()`) makes the whole touch that element's (`onPress()`..`onCancel()`,
+see [Touch](./touch.md)); a `Scroll` takes touches by default (see [Scroll](./scroll.md#touch)); the touches whose `Pressed` hits no such element go to `onTouch()` of the scene shown, as
+the raw `TouchEvent`s (`Pressed`, `Moved`, `Released`, `Gesture`). A `Gesture` the touch controller reports after
+the `Released` belongs to that touch: the scene gets it only when the touch was the scene's (a swipe that drags a
+slider or a carousel is not a page change). A scene without touchable elements gets every event. The other scenes get nothing. The events come from the event bus of ext-events, so they arrive in the
 `event-driven` runtime (in `init-loop` source events are not delivered). Listeners of the same classes
-registered with `Events::listen()` still get them, after the scene. During a transition no scene gets them
-(the listeners still do).
+registered with `Events::listen()` still get them all, after Slate. During a transition neither the elements nor
+the scenes get them (the listeners still do).
 
-<!-- @callout variant="note" -->
-This part of Slate passes the event as it is; finding which element was touched is up to the scene (compare
-`$e->x` and `$e->y` with the elements' boxes).
-<!-- @endcallout -->
+`show()` of another scene (and the start of a transition) ends a touch an element holds: the element gets
+`onCancel()` before `onLeave()` of the scene left (a `Scroll` that holds one stops its drag without speed).
 
 ## Lifetime
 

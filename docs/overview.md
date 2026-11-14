@@ -38,7 +38,7 @@ ext-slate is platform-neutral C: it has no HAL of its own.
 | --- | --- |
 | `php-baremetal/ext-display` `^1.1` | The display object and the band path of its panel driver. The driver must implement the band path: on the esp32 SDK, [esp32-display-st77916](package:php-baremetal/esp32-display-st77916) 1.2 or later does. |
 | `php-baremetal/ext-events` `^1.2` | The task of the compositor, its queues and memory (the events HAL, `php-baremetal/events-hal` 1.5, provided on esp32 by `esp32-events-hal`, which conductor adds for the project's platform), and the moment PHP returns to the event loop, when the changes are handed over. |
-| `php-baremetal/ext-input` `^1.0` | The touch events forwarded to the scene. |
+| `php-baremetal/ext-input` `^1.0` | The touch events, routed to the elements and the scene. |
 | `php-baremetal/bm-common` `^1.1` | The board's blocks, for `Slate::onboard()`. |
 
 On the board the compositor task runs on core 0, while PHP runs on core 1; elements, texts, element caches and
@@ -160,9 +160,9 @@ Touch events reach `Scene::onTouch()` in the `event-driven` runtime, where ext-e
 - Animations run in the compositor, sampled at the panel's refresh: `$card->animate(['x' => 200], ms: 300)`
   returns a `Tween`, and `TweenDone` comes when it ends. A screen with no animation running composes no frame.
   `$slate->show($menu, Transition::push(Direction::Left))` slides to another page the same way.
-- A `Scroll` gets the touches the script forwards to it (`$list->touch($e)` in `Scene::onTouch()`); the drag, the
-  inertia, the spring past an edge and the snapping run in the compositor, and `ScrollEnded` comes when the content
-  rests.
+- A `Scroll` takes the touches by itself, and a drag that starts on one of its touchable rows passes to it past
+  8 px; the drag, the inertia, the spring past an edge and the snapping run in the compositor, and `ScrollEnded`
+  comes when the content rests.
 
 See [Scenes and pages](./usage/scenes.md), [Elements](./usage/elements.md), [Images](./usage/images.md),
 [Animations](./usage/animations.md), [Scroll](./usage/scroll.md),

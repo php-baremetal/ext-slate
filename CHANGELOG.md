@@ -2,6 +2,49 @@
 
 ## 1.2.0
 
+- Added: touch on elements. An element takes the finger when `Element::$touchable` is `true` (`bool`, default
+  `false`; a component of your own declares `public bool $touchable = true;`) or when it has a callback:
+  `Element::on(TouchType $type, \Closure $fn): static` (one per kind, a new one replaces the old one) and
+  `Element::off(TouchType $type): static`. The kinds reach the element's methods `onPress()`, `onMove()`,
+  `onRelease()`, `onTap()`, `onHold()`, `onCancel()` (public, `(Touch $t): void`, empty, for subclasses to override)
+  and then its callback. The area is what the finger sees in the frame shown (a group with its children, a clipping
+  group its whole clip box), grown by `Element::$hitPad` (0..64 px, default 0) and cut by the clips of its
+  ancestors; the touchable drawn on top wins, and children that take no touch are part of their touchable ancestor.
+  `Press` captures the finger (`Move` and `Release` come wherever it goes); `Tap` follows `Release` when the finger
+  stayed within 8 px of the press, no `Hold` came and it came up on the area; `Hold` comes once after
+  `Element::$holdMs` (0..10000 ms, default 500; 0: never) without a move past 8 px, and then no `Tap`; `Cancel` (no
+  `Release`, no `Tap`) when a `Scroll` it is in takes the finger, the element or an ancestor is removed or hidden,
+  the element stops taking touches, or `Slate::show()` shows another scene or starts a transition (a cause inside a
+  touch handler: right after it returns; `show()`: at once, before `onLeave()`). An element hidden (also at
+  `$opacity` 0), made not touchable or removed takes no new touch at once, before the next frame. A `Scroll` takes
+  the touches by itself (`Scroll::$touchable` defaults to `true`), with the state machine of `Scroll::touch()`: a
+  press on its view drives it; a touchable element inside it that moves more than 8 px before a `Hold`, on the axis
+  the scroll can move (the larger movement), gets `Cancel` and the scroll takes the touch from the press point and
+  time, following the finger from the point past 8 px without a jump (no axis it can move: the element keeps it); a
+  press while it moves is a catch (the element under the finger gets nothing); scrolls inside scrolls: the innermost
+  that can move in that direction. A scroll's touch that ends without its `Released` (the causes of `Cancel`, or a
+  new `Pressed` first) stops its drag without speed (`ScrollEnded` follows once a drag had started). A scroll hidden
+  during a drag routed by hand with `touch()` now ends it as well (at its `Released`: before, it stayed armed and the
+  next press was a catch). `Scroll::touch()` stays for routing by
+  hand (`$touchable = false`, or touches that hit nothing) and does nothing (returns `false`) for a touch Slate
+  routes to that scroll. `final class Touch`, made by Slate only (private constructor; read-only
+  `TouchType $type`, `Element $element`, `int $x`, `$y`, `$localX`, `$localY` from the element's origin on the
+  screen, `int|float $time` as `Event::$time`: ns on the base of `hrtime(true)`, a float on 32-bit PHP), `enum
+  TouchType` (`Press`, `Move`, `Release`, `Tap`, `Hold`, `Cancel`). **Changed**: `Scene::onTouch()` now
+  gets only the touches whose `Pressed` hits no touchable element (a scene without touchable elements gets them all,
+  as before); since a `Scroll` is touchable by default, the touches that hit a scroll no longer reach
+  `Scene::onTouch()` (set `$touchable = false` on it to keep routing them by hand with `touch()`); nor does the
+  `Gesture` of a touch an element or a scroll took, which the touch controller may report after the `Released`.
+  Touches stay ignored during a transition. Slate takes one more of ext-events' eight watches (six: four for the touch events,
+  one for the `Hold` timer through the internal coalescing event `HoldDue`, one for `TransitionDone`).
+  `\ValueError` `Baremetal\Slate\<Class>::$hitPad must be between 0 and 64`, `...::$holdMs must be between 0 and
+  10000`, `...::$<name> cannot be animated` for the three properties; `\RuntimeException` `Slate: cannot take the
+  touch: the table of ext-events' watches is full`. A scene without touchable elements does no more work. Engine
+  side: the properties `SLATE_PROP_TOUCHABLE` and `SLATE_PROP_HIT_PAD`, a table of the touchables' boxes published
+  after each frame that changed something (`src/hit.h`; none with zero touchables), `slate_engine_set_hit_pub`, the
+  stats `hit_builds`, `hit_entries`, `hit_nomem`, and the scroll command `SLATE_SCROLL_OP_CANCEL` (a release without
+  velocity). Docs: `docs/usage/touch.md`, `docs/usage/scroll.md` (touch); IDE stub. The `06-display/slate-scroll`
+  example uses touchable rows instead of its own hit maths.
 - Added: animations, run by the compositor at the pace of the panel (no PHP timer). `Element::animate(array $props,
   int $ms = 300, Ease $ease = Ease::OutCubic, int $delay = 0, int $repeat = 0, bool $yoyo = false): Tween` moves
   properties from their values on the screen to the ones given; the properties read their final values at once.
@@ -38,7 +81,8 @@
   value written until it is drawn; written: a jump kept within `0..max(0, content - view)`, which stops any motion and
   ends a drag), `$clip` always `true`, `$w`, `$h` 1..32767; `$cache` keeps the whole content as one image copied at each
   position (composed directly when it does not fit the cache; with `slate-debug` the console says so once).
-  `touch(\Baremetal\Input\TouchEvent $e): bool`: the script forwards the touches (usually from `Scene::onTouch()`);
+  `touch(\Baremetal\Input\TouchEvent $e): bool`: touches routed by hand (usually from `Scene::onTouch()`; a scroll
+  also takes them by itself, see touch on elements);
   `true` when the touch is a drag of the scroll (past 8 px from the press on the axis allowed, with `Both` the distance;
   the Released that ends it) or a catch (a press inside the view that stopped its motion, with every Moved and the
   Released of that touch); `false` for a press outside the view, a tap, a `Gesture` and a scroll not in the scene shown.
