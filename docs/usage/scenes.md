@@ -68,6 +68,16 @@ Adds elements on top of the scene's elements: the last one added is drawn on top
 
 Takes elements out; they stay usable and can be added again, here or elsewhere.
 
+<!-- @method name="Scene::open(Dialog $d): static" returns="static" -->
+
+Opens a [dialog](./controls.md#dialog) above the scene: above all its elements and the dialogs open already, with
+its opening animation (300 ms). A dialog belongs to its scene: when another scene is shown it stays open, and it
+shows again when the scene comes back; closed while the scene is not shown, it goes at once (and still calls
+`onClose()`). While dialogs are open, `add()` keeps them on top of what it adds, and `remove()` of an open dialog
+closes it at once; a dialog still closing when another scene is shown ends at once. `open()` ends the touch under
+way (see [Controls, Dialog](./controls.md#dialog)). `add()` of a `Dialog` throws `\Error`. `open()` of a dialog that is open already, here or in another scene, throws `\Error`
+(`Baremetal\Slate\Dialog is already open`). Not built without `slate-controls`.
+
 | Method | Called |
 | --- | --- |
 | `protected build(): void` | Once, by the first `show()` of the scene, before `onEnter()`: add the components here. |
@@ -208,7 +218,7 @@ What happens, in order:
 | Thrown by `show()` with a transition | When |
 | --- | --- |
 | `\RuntimeException` `Slate: cannot run a transition: the table of ext-events' idle hooks is full` | Other extensions took the four idle hooks ext-events keeps (Slate uses one, shared by all its parts). |
-| `\RuntimeException` `Slate: cannot run a transition: the table of ext-events' watches is full` | Other extensions took the eight watches ext-events keeps (Slate uses up to six: four for the touch, one for `Hold`, one for `TransitionDone`). |
+| `\RuntimeException` `Slate: cannot run a transition: the table of ext-events' watches is full` | Other extensions took the eight watches ext-events keeps (Slate uses up to six: four for the touch, one for `HoldDue` (the `Hold` of a touch and the ends of the controls' animations), one for `TransitionDone`). |
 | `\RuntimeException` `Slate: out of memory for the transition` | No memory for the few bytes that carry its end. Nothing changed. |
 
 A frame during a transition costs about as much as the two scenes together, and the whole screen is sent at

@@ -35,6 +35,11 @@
  * set-up (a SCROLL CONFIG with all of them), $scrollX and $scrollY its position (a SCROLL JUMP: a SET would be
  * overwritten by the physics); reading those two gives the position drawn (php_slate_scroll.c), so their reads are
  * not cached.
+ *
+ * Controls (php_slate_control.c) are groups of their own bases: Control ($enabled on top of Group's properties) and
+ * Slate's controls (their $w and $h read-only: the size laid out). Their own properties ($text, $on, ...) are not in
+ * the tables here: the handlers pass them to sl_ctl_is_prop() / sl_ctl_write(). $enabled false sends OPACITY times
+ * SLATE_CTL_DISABLED and TOUCHABLE false (the PHP values stay as written).
  */
 #include <math.h>
 #include <string.h>
@@ -52,6 +57,7 @@
 
 #include "display_font.h"
 #include "php_slate.h"
+#include "raster.h"
 #include "slate_config.h"
 
 zend_class_entry *sl_element_ce, *sl_group_ce, *sl_roundrect_ce, *sl_circle_ce, *sl_arc_ce, *sl_line_ce,
@@ -59,6 +65,14 @@ zend_class_entry *sl_element_ce, *sl_group_ce, *sl_roundrect_ce, *sl_circle_ce, 
 
 static zend_object_handlers sl_handlers;
 static uint32_t s_next_id;
+
+uint32_t sl_id_new(void)
+{
+    if (++s_next_id == 0 || s_next_id == UINT32_MAX) {
+        s_next_id = 1;
+    }
+    return s_next_id;
+}
 
 /* ---- property descriptors ---- */
 
@@ -88,6 +102,10 @@ typedef enum {
     PT_TOUCH,     /* bool, $touchable: TOUCHABLE is sent true also while the element has a callback */
     PT_HITPAD,    /* int, 0..SLATE_HIT_PAD_MAX */
     PT_HOLDMS,    /* int, 0..10000 (PHP only) */
+#if SLATE_HAS_CONTROLS
+    PT_ENABLED,   /* bool, a control's $enabled: OPACITY and TOUCHABLE sent again (prop unused) */
+    PT_CTLSIZE,   /* int|float, $w / $h of a Slate control: the size laid out, read-only */
+#endif
 } sl_ptype_t;
 
 /* How a write reaches the engine (HOW_NONE: it does not, the PHP layer reads it). */
@@ -194,18 +212,62 @@ static const sl_pdef_t canvas_defs[] = {
 static const sl_pdef_t image_defs[] = {
     { "src", SLATE_PROP_IMAGE, PT_SRC, HOW_SET },
 };
+#if SLATE_HAS_CONTROLS
+/* Control (a user class that extends it directly): Group's, then $enabled */
+static const sl_pdef_t control_defs[] = {
+    { "w", SLATE_PROP_W, PT_SIZE, HOW_SET },
+    { "h", SLATE_PROP_H, PT_SIZE, HOW_SET },
+    { "clip", SLATE_PROP_CLIP, PT_BOOL, HOW_SET },
+    { "cache", SLATE_PROP_CACHE, PT_BOOL, HOW_SET },
+    { "blur", SLATE_PROP_BLUR, PT_BLUR, HOW_SET },
+    { "shadow", SLATE_PROP_SHADOW, PT_SHADOW, HOW_SET },
+    { "enabled", SLATE_PROP_TOUCHABLE, PT_ENABLED, HOW_NONE },   /* prop unused */
+};
+/* Slate's controls: the same with $w and $h the size laid out (sent, never written by PHP) */
+static const sl_pdef_t ctl_defs[] = {
+    { "w", SLATE_PROP_W, PT_CTLSIZE, HOW_SET },
+    { "h", SLATE_PROP_H, PT_CTLSIZE, HOW_SET },
+    { "clip", SLATE_PROP_CLIP, PT_BOOL, HOW_SET },
+    { "cache", SLATE_PROP_CACHE, PT_BOOL, HOW_SET },
+    { "blur", SLATE_PROP_BLUR, PT_BLUR, HOW_SET },
+    { "shadow", SLATE_PROP_SHADOW, PT_SHADOW, HOW_SET },
+    { "enabled", SLATE_PROP_TOUCHABLE, PT_ENABLED, HOW_NONE },   /* prop unused */
+};
+#endif
 
 #define N(a) (int)(sizeof(a) / sizeof((a)[0]))
 
-/* index SL_BASE_COUNT: a user class that extends Element directly (no properties of Slate, an empty group) */
-static sl_prop_t s_props[SL_BASE_COUNT + 1][PROPS_MAX];
-static int s_nprops[SL_BASE_COUNT + 1];
+/* The property tables: one per base up to SL_SCENE, then Control's, the one Slate's controls share (their properties
+   here are all inherited from Element, Group and Control: the same slots in every control class) and the empty one of
+   a user class that extends Element directly. */
+#if SLATE_HAS_CONTROLS
+enum { TAB_CONTROL = SL_SCENE + 1, TAB_CTL, TAB_USER, TAB_COUNT };
+
+static inline int tab_of(int base)
+{
+    return base <= SL_SCENE ? base : base == SL_CONTROL ? TAB_CONTROL : base == SL_BASE_COUNT ? TAB_USER : TAB_CTL;
+}
+#else
+enum { TAB_USER = SL_SCENE + 1, TAB_COUNT };
+
+static inline int tab_of(int base)
+{
+    return base <= SL_SCENE ? base : TAB_USER;
+}
+#endif
+
+static sl_prop_t s_props[TAB_COUNT][PROPS_MAX];
+static int s_nprops[TAB_COUNT];
 static zend_class_entry *s_base_ce[SL_BASE_COUNT];
+/* the controls: groups */
 static const uint8_t s_kind[SL_BASE_COUNT + 1] = {
     [SL_GROUP] = SLATE_EL_GROUP, [SL_ROUNDRECT] = SLATE_EL_ROUNDRECT, [SL_CIRCLE] = SLATE_EL_CIRCLE,
     [SL_ARC] = SLATE_EL_ARC, [SL_LINE] = SLATE_EL_LINE, [SL_TEXT] = SLATE_EL_TEXT, [SL_CANVAS] = SLATE_EL_CANVAS,
     [SL_IMAGE] = SLATE_EL_IMAGE, [SL_SCROLL] = SLATE_EL_GROUP, [SL_SCENE] = SLATE_EL_GROUP,
-    [SL_BASE_COUNT] = SLATE_EL_GROUP,
+    [SL_CONTROL] = SLATE_EL_GROUP, [SL_BUTTON] = SLATE_EL_GROUP, [SL_TOGGLE] = SLATE_EL_GROUP,
+    [SL_SLIDER] = SLATE_EL_GROUP, [SL_CHOICE] = SLATE_EL_GROUP, [SL_SETTING_ROW] = SLATE_EL_GROUP,
+    [SL_DIALOG] = SLATE_EL_GROUP, [SL_PROGRESS_RING] = SLATE_EL_GROUP, [SL_PROGRESS_BAR] = SLATE_EL_GROUP,
+    [SL_SPINNER] = SLATE_EL_GROUP, [SL_STEP_LIST] = SLATE_EL_GROUP, [SL_BASE_COUNT] = SLATE_EL_GROUP,
 };
 
 static zend_string *s_gradient_name, *s_shadow_name, *s_caps_name, *s_align_name, *s_axis_name;
@@ -218,8 +280,9 @@ const char *sl_short_name(zend_class_entry *ce)
 
 static const sl_prop_t *find_prop(const sl_obj_t *o, zend_string *name)
 {
-    const sl_prop_t *p = s_props[o->base];
-    for (int i = 0; i < s_nprops[o->base]; i++) {
+    int t = tab_of(o->base);
+    const sl_prop_t *p = s_props[t];
+    for (int i = 0; i < s_nprops[t]; i++) {
         if (p[i].name == name || zend_string_equals(p[i].name, name)) {
             return &p[i];
         }
@@ -229,8 +292,9 @@ static const sl_prop_t *find_prop(const sl_obj_t *o, zend_string *name)
 
 static const sl_prop_t *find_prop_c(const sl_obj_t *o, const char *name)
 {
-    const sl_prop_t *p = s_props[o->base];
-    for (int i = 0; i < s_nprops[o->base]; i++) {
+    int t = tab_of(o->base);
+    const sl_prop_t *p = s_props[t];
+    for (int i = 0; i < s_nprops[t]; i++) {
         if (strcmp(p[i].def->name, name) == 0) {
             return &p[i];
         }
@@ -245,7 +309,7 @@ static zval *prop_slot(sl_obj_t *o, const sl_prop_t *p)
 
 /* ---- values ---- */
 
-static const struct display_font_entry *font_find(const char *name, size_t len)
+const struct display_font_entry *sl_font_find(const char *name, size_t len)
 {
     for (size_t i = 0; i < display_fonts_count; i++) {
         const struct display_font_entry *e = &display_fonts[i];
@@ -261,7 +325,7 @@ static void bad_value(sl_obj_t *o, const sl_prop_t *p, const char *what)
     zend_value_error("%s::$%s %s", ZSTR_VAL(o->std.ce->name), p->def->name, what);
 }
 
-static void bad_font(sl_obj_t *o, zend_string *name)
+void sl_font_error(const char *cls, const char *prop, zend_string *name)
 {
     smart_str list = {0};
     for (size_t i = 0; i < display_fonts_count; i++) {
@@ -273,8 +337,8 @@ static void bad_font(sl_obj_t *o, zend_string *name)
         }
     }
     smart_str_0(&list);
-    zend_value_error("%s::$font must be a font of the firmware: unknown font '%s' (available: %s)",
-                     ZSTR_VAL(o->std.ce->name), ZSTR_VAL(name), list.s ? ZSTR_VAL(list.s) : "none");
+    zend_value_error("%s::$%s must be a font of the firmware: unknown font '%s' (available: %s)", cls, prop,
+                     ZSTR_VAL(name), list.s ? ZSTR_VAL(list.s) : "none");
     smart_str_free(&list);
 }
 
@@ -337,7 +401,7 @@ static bool to_value(sl_obj_t *o, const sl_prop_t *p, zval *v, slate_value_t *ou
             bad_value(o, p, "must be between 0 and 1");
             return false;
         }
-        *out = slate_v_num((float)d);
+        *out = slate_v_num(SL_CTL(o) ? (float)d * sl_ctl_opacity(o) : (float)d);   /* a control not enabled: x 0.4 */
         return true;
     case PT_BOOL:
         *out = slate_v_bool(Z_TYPE_P(v) == IS_TRUE);
@@ -390,9 +454,10 @@ static bool to_value(sl_obj_t *o, const sl_prop_t *p, zval *v, slate_value_t *ou
         return true;
     case PT_FONT: {
         const struct display_font_entry *f =
-            Z_TYPE_P(v) == IS_STRING ? font_find(Z_STRVAL_P(v), Z_STRLEN_P(v)) : NULL;
+            Z_TYPE_P(v) == IS_STRING ? sl_font_find(Z_STRVAL_P(v), Z_STRLEN_P(v)) : NULL;
         if (!f && check) {
-            bad_font(o, Z_TYPE_P(v) == IS_STRING ? Z_STR_P(v) : ZSTR_EMPTY_ALLOC());
+            sl_font_error(ZSTR_VAL(o->std.ce->name), "font",
+                          Z_TYPE_P(v) == IS_STRING ? Z_STR_P(v) : ZSTR_EMPTY_ALLOC());
             return false;
         }
         *out = slate_v_font(f);
@@ -469,7 +534,7 @@ static bool to_value(sl_obj_t *o, const sl_prop_t *p, zval *v, slate_value_t *ou
         *out = slate_v_num(isfinite(d) ? (float)d : 0.0f);   /* sent in a JUMP, never as a SET */
         return true;
     case PT_TOUCH:
-        *out = slate_v_bool(Z_TYPE_P(v) == IS_TRUE || sl_touch_has_cb(o));
+        *out = slate_v_bool((Z_TYPE_P(v) == IS_TRUE || sl_touch_has_cb(o)) && (!SL_CTL(o) || sl_ctl_enabled(o)));
         return true;
     case PT_HITPAD:
         if (!num_in(v, 0, SLATE_HIT_PAD_MAX, &d)) {
@@ -488,6 +553,15 @@ static bool to_value(sl_obj_t *o, const sl_prop_t *p, zval *v, slate_value_t *ou
         }
         *out = slate_v_num(0);   /* never sent */
         return true;
+#if SLATE_HAS_CONTROLS
+    case PT_ENABLED:
+        *out = slate_v_bool(Z_TYPE_P(v) == IS_TRUE);   /* never sent */
+        return true;
+    case PT_CTLSIZE:
+        num_in(v, 0, 32767, &d);   /* written by the control's C code only */
+        *out = slate_v_num(isfinite(d) ? (float)d : 0.0f);
+        return true;
+#endif
     }
     return false;
 }
@@ -523,8 +597,8 @@ bool sl_slot_true(sl_obj_t *o, const char *name)
 /* Rules between properties, after p changed: a clipping group needs a clip box. */
 static bool cross_check(sl_obj_t *o, const sl_prop_t *p)
 {
-    if (o->base == SL_GROUP && (p->def->prop == SLATE_PROP_CLIP || p->def->prop == SLATE_PROP_W
-                                || p->def->prop == SLATE_PROP_H)) {
+    if ((o->base == SL_GROUP || sl_base_control(o->base))
+        && (p->def->prop == SLATE_PROP_CLIP || p->def->prop == SLATE_PROP_W || p->def->prop == SLATE_PROP_H)) {
         if (slot_true(o, "clip") && (slot_num(o, "w") <= 0 || slot_num(o, "h") <= 0)) {
             zend_value_error("%s::$clip needs $w and $h greater than 0 (the clip box)", ZSTR_VAL(o->std.ce->name));
             return false;
@@ -549,11 +623,44 @@ static bool push_set(sl_obj_t *o, const sl_prop_t *p, const slate_value_t *v)
     return sl_push(&c);
 }
 
+#if SLATE_HAS_CONTROLS
+/* The SET of property name of a realized o, with the value its slot gives now (nothing when o has no such property). */
+static bool push_slot(sl_obj_t *o, const char *name)
+{
+    const sl_prop_t *p = find_prop_c(o, name);
+    if (!p || !realized(o)) {
+        return true;
+    }
+    slate_value_t v;
+    slate_paint_grad_t grad;
+    to_value(o, p, prop_slot(o, p), &v, &grad, false);
+    return push_set(o, p, &v);
+}
+
+/* A control's $enabled changed: its OPACITY (x SLATE_CTL_DISABLED or not) and TOUCHABLE (false when not enabled) sent
+   again; a capture of it ends (Cancel, which calls pressed(false)). */
+static bool enabled_changed(sl_obj_t *o)
+{
+    if (!push_slot(o, "opacity") || !push_slot(o, "touchable")) {
+        return false;
+    }
+    sl_touch_recheck();
+    return !EG(exception);
+}
+#endif
+
 /* A write of a Slate property: PHP's typed write, then validation (the old value back on a refusal), then the
    SET of a realized element. */
 static zend_result sl_assign(sl_obj_t *o, const sl_prop_t *p, zval *value)
 {
     sl_anim_flush();   /* a PHP call: what plain C left to release goes now */
+#if SLATE_HAS_CONTROLS
+    if (p->def->type == PT_CTLSIZE) {
+        zend_throw_error(NULL, "Cannot modify %s::$%s: the size of a control comes from its constructor and the theme",
+                         ZSTR_VAL(o->std.ce->name), p->def->name);
+        return FAILURE;
+    }
+#endif
     if (p->def->how == HOW_JUMP) {
         sl_scroll_sync(o);   /* both slots at the position drawn: the JUMP keeps the other axis where it is */
     }
@@ -596,6 +703,11 @@ static zend_result sl_assign(sl_obj_t *o, const sl_prop_t *p, zval *value)
     if (p->def->how == HOW_JUMP) {
         return sl_scroll_jumped(o) ? SUCCESS : FAILURE;   /* always: the slot may have been behind the screen */
     }
+#if SLATE_HAS_CONTROLS
+    if (p->def->type == PT_ENABLED) {
+        return !changed || enabled_changed(o) ? SUCCESS : FAILURE;
+    }
+#endif
     if (p->def->how == HOW_NONE) {
         return SUCCESS;   /* $holdMs: read at the next Press */
     }
@@ -624,15 +736,31 @@ static zend_result sl_assign(sl_obj_t *o, const sl_prop_t *p, zval *value)
     if (changed && (p->def->type == PT_TOUCH || p->def->prop == SLATE_PROP_VISIBLE)) {
         sl_touch_recheck();   /* the captured element (or an ancestor) hidden, or no longer touchable */
     }
+#if SLATE_HAS_CONTROLS
+    if (changed && o->base == SL_DIALOG && p->def->prop == SLATE_PROP_VISIBLE && Z_TYPE_P(slot) != IS_TRUE
+        && !EG(exception) && !sl_dialog_hidden(o)) {
+        return FAILURE;   /* a dialog hidden while it closes ends now (its tween would wait, paused) */
+    }
+#endif
     return SUCCESS;
 }
 
 /* ---- handlers ---- */
 
+/* A property of the class of a Slate control ($text, $on, ...): written by sl_ctl_write(). */
+static bool ctl_prop(const sl_obj_t *o, zend_string *name)
+{
+    return SL_CTL(o) && sl_ctl_is_prop(o, name);
+}
+
 static zval *sl_write_property(zend_object *obj, zend_string *name, zval *value, void **cache_slot)
 {
     const sl_prop_t *p = find_prop(sl_obj(obj), name);
     if (!p) {
+        if (ctl_prop(sl_obj(obj), name)) {
+            sl_anim_flush();
+            return sl_ctl_write(sl_obj(obj), name, value);
+        }
         return zend_std_write_property(obj, name, value, cache_slot);
     }
     if (sl_assign(sl_obj(obj), p, value) != SUCCESS) {
@@ -645,7 +773,7 @@ static zval *sl_write_property(zend_object *obj, zend_string *name, zval *value,
    reference would change it without validation and without reaching the compositor. Reads are plain. */
 static zval *sl_read_property(zend_object *obj, zend_string *name, int type, void **cache_slot, zval *rv)
 {
-    if (type != BP_VAR_R && type != BP_VAR_IS && find_prop(sl_obj(obj), name)) {
+    if (type != BP_VAR_R && type != BP_VAR_IS && (find_prop(sl_obj(obj), name) || ctl_prop(sl_obj(obj), name))) {
         zend_throw_error(NULL, "Cannot take a reference to %s::$%s", ZSTR_VAL(obj->ce->name), ZSTR_VAL(name));
         return &EG(uninitialized_zval);
     }
@@ -663,7 +791,7 @@ static zval *sl_read_property(zend_object *obj, zend_string *name, int type, voi
 
 static zval *sl_get_property_ptr_ptr(zend_object *obj, zend_string *name, int type, void **cache_slot)
 {
-    if (find_prop(sl_obj(obj), name)) {
+    if (find_prop(sl_obj(obj), name) || ctl_prop(sl_obj(obj), name)) {
         return NULL;   /* compound assignments and ++ go through read + write */
     }
     return zend_std_get_property_ptr_ptr(obj, name, type, cache_slot);
@@ -671,7 +799,7 @@ static zval *sl_get_property_ptr_ptr(zend_object *obj, zend_string *name, int ty
 
 static void sl_unset_property(zend_object *obj, zend_string *name, void **cache_slot)
 {
-    if (find_prop(sl_obj(obj), name)) {
+    if (find_prop(sl_obj(obj), name) || ctl_prop(sl_obj(obj), name)) {
         zend_throw_error(NULL, "Cannot unset %s::$%s", ZSTR_VAL(obj->ce->name), ZSTR_VAL(name));
         return;
     }
@@ -711,6 +839,9 @@ static HashTable *sl_get_gc(zend_object *obj, zval **table, int *n)
         } ZEND_HASH_FOREACH_END();
     }
     sl_touch_gc(o, buf);   /* the callbacks of on() (a closure may hold the element) */
+    if (SL_CTL(o)) {
+        sl_ctl_gc(o, buf);   /* changed() and the like, the state's zvals */
+    }
     zend_get_gc_buffer_use(buf, table, n);
     return obj->properties;
 }
@@ -718,6 +849,9 @@ static HashTable *sl_get_gc(zend_object *obj, zval **table, int *n)
 static void sl_free_obj(zend_object *obj)
 {
     sl_obj_t *o = sl_obj(obj);
+    if (SL_CTL(o)) {
+        sl_ctl_free(o);   /* its parts (FREE: a FREE of the group would leave them alive), its state, its callbacks */
+    }
     if (realized(o)) {
         /* no exception from here: a refusal only leaves the element in the engine until it stops */
         slate_cmd_t c = { .kind = SLATE_CMD_FREE, .id = o->id };
@@ -833,22 +967,24 @@ zend_object *sl_obj_create(zend_class_entry *ce)
     o->std.handlers = &sl_handlers;
     o->base = (uint8_t)base_of(ce);
     o->kind = s_kind[o->base];
-    if (++s_next_id == 0 || s_next_id == UINT32_MAX) {
-        s_next_id = 1;
-    }
-    o->id = s_next_id;
+    o->id = sl_id_new();
     o->dx0 = o->dy0 = 0;
     o->dx1 = o->dy1 = 0;
-    if (o->base == SL_GROUP || o->base == SL_SCROLL || o->base == SL_SCENE) {
+    if (sl_base_group(o->base)) {
         zend_hash_init(&o->children, 4, NULL, ZVAL_PTR_DTOR, 0);
         o->has_children = true;
     }
     if (o->base == SL_SCROLL) {
         sl_scroll_init(o);
     }
-    for (int i = 0; i < s_nprops[o->base]; i++) {
-        const sl_prop_t *p = &s_props[o->base][i];
-        if (p->def->type == PT_TOUCH || p->def->type == PT_HITPAD || p->def->type == PT_HOLDMS) {
+    int t = tab_of(o->base);
+    for (int i = 0; i < s_nprops[t]; i++) {
+        const sl_prop_t *p = &s_props[t][i];
+        if (p->def->type == PT_TOUCH || p->def->type == PT_HITPAD || p->def->type == PT_HOLDMS
+#if SLATE_HAS_CONTROLS
+            || p->def->type == PT_ENABLED
+#endif
+            ) {
             continue;   /* the class's default (a subclass may declare its own) */
         }
         zval *slot = prop_slot(o, p);
@@ -857,6 +993,9 @@ zend_object *sl_obj_create(zend_class_entry *ce)
     }
     if (o->base == SL_IMAGE) {
         sl_image_init(o);
+    }
+    if (sl_base_control(o->base)) {
+        sl_ctl_init(o);   /* its ctl, and $theme */
     }
     if (o->base != SL_SCENE && slot_true(o, "touchable")) {
         sl_touch_note(o);
@@ -879,8 +1018,9 @@ bool sl_realize(sl_obj_t *o)
     if (o->base == SL_SCROLL && !sl_scroll_realize_config(o)) {   /* it is a scroll before its properties */
         return false;
     }
-    for (int i = 0; i < s_nprops[o->base]; i++) {
-        const sl_prop_t *p = &s_props[o->base][i];
+    int t = tab_of(o->base);
+    for (int i = 0; i < s_nprops[t]; i++) {
+        const sl_prop_t *p = &s_props[t][i];
         if (p->def->how != HOW_SET) {
             continue;   /* in the CONFIG, or the JUMP after the children */
         }
@@ -890,6 +1030,11 @@ bool sl_realize(sl_obj_t *o)
         if ((p->def->type == PT_TOUCH && !v.v.b) || (p->def->type == PT_HITPAD && v.v.num == 0)) {
             continue;   /* the engine's default after NEW: no command for an element that takes no touch */
         }
+#if SLATE_HAS_CONTROLS
+        if (p->def->type == PT_CTLSIZE && (o->base == SL_PROGRESS_RING || o->base == SL_SPINNER)) {
+            continue;   /* drawn around its x, y: no clip box at (0, 0)-(w, h), which would cut 3/4 of it */
+        }
+#endif
         if (!push_set(o, p, &v)) {
             return false;
         }
@@ -904,6 +1049,9 @@ bool sl_realize(sl_obj_t *o)
             return false;
         }
     }
+    if (SL_CTL(o) && !sl_ctl_realize(o)) {   /* its parts, under its PHP children */
+        return false;
+    }
     if (o->has_children) {
         zval *zv;
         ZEND_HASH_FOREACH_VAL(&o->children, zv) {
@@ -911,7 +1059,8 @@ bool sl_realize(sl_obj_t *o)
             if (!sl_realize(ch)) {
                 return false;
             }
-            slate_cmd_t add = { .kind = SLATE_CMD_ADD, .id = ch->id, .parent = o->id };
+            slate_cmd_t add = { .kind = SLATE_CMD_ADD, .id = ch->id,
+                                .parent = SL_CTL(o) ? sl_ctl_parent_of(o, ch) : o->id };
             if (!sl_push(&add)) {
                 return false;
             }
@@ -934,6 +1083,11 @@ void sl_children_add(sl_obj_t *o, zval *args, uint32_t argc)
             not_an_element(c->std.ce);   /* made without its constructor (reflection) */
             return;
         }
+#if SLATE_HAS_CONTROLS
+        if (c->base == SL_DIALOG && !sl_dialog_add_ok(c)) {
+            return;
+        }
+#endif
         if (c->parent) {
             zend_throw_exception_ex(spl_ce_LogicException, 0,
                                     "%s already belongs to a group: remove() it from there first",
@@ -954,7 +1108,7 @@ void sl_children_add(sl_obj_t *o, zval *args, uint32_t argc)
             if (!sl_realize(c)) {
                 return;
             }
-            slate_cmd_t add = { .kind = SLATE_CMD_ADD, .id = c->id, .parent = o->id };
+            slate_cmd_t add = { .kind = SLATE_CMD_ADD, .id = c->id, .parent = SL_CTL(o) ? sl_ctl_parent_of(o, c) : o->id };
             if (!sl_push(&add)) {
                 return;
             }
@@ -1003,6 +1157,186 @@ static void children_remove(sl_obj_t *o, zval *args, uint32_t argc)
         }
         zend_hash_index_del(&o->children, idx);   /* may free c (FREE after REMOVE) */
     }
+}
+
+void sl_children_raise(sl_obj_t *o, sl_obj_t *c)
+{
+    if (c->parent != o) {
+        return;
+    }
+    zend_ulong idx;
+    zval *zv;
+    ZEND_HASH_FOREACH_NUM_KEY_VAL(&o->children, idx, zv) {
+        if (Z_OBJ_P(zv) == &c->std) {
+            zval keep;
+            ZVAL_COPY(&keep, zv);
+            zend_hash_index_del(&o->children, idx);      /* our copy keeps it alive */
+            zend_hash_next_index_insert(&o->children, &keep);   /* the table takes our reference */
+            if (realized(o) && realized(c)) {
+                /* a move for the engine: REMOVE and ADD in one batch keep its tweens (engine.h) */
+                slate_cmd_t rm = { .kind = SLATE_CMD_REMOVE, .id = c->id };
+                slate_cmd_t add = { .kind = SLATE_CMD_ADD, .id = c->id,
+                                    .parent = SL_CTL(o) ? sl_ctl_parent_of(o, c) : o->id };
+                if (sl_push(&rm)) {
+                    sl_push(&add);   /* an exception is the caller's */
+                }
+            }
+            return;
+        }
+    } ZEND_HASH_FOREACH_END();
+}
+
+bool sl_write_num(sl_obj_t *o, const char *name, int v)
+{
+    zval zv;
+    ZVAL_LONG(&zv, v);
+    zend_string *n = zend_string_init(name, strlen(name), 0);
+    o->std.handlers->write_property(&o->std, n, &zv, NULL);
+    zend_string_release(n);
+    return !EG(exception);
+}
+
+/* ---- extents ---- */
+
+/* A declared property of o's class read as a number (0 when absent): Image::$w, $h. */
+static double class_num(sl_obj_t *o, const char *name)
+{
+    zend_property_info *pi = zend_hash_str_find_ptr(&o->std.ce->properties_info, name, strlen(name));
+    if (!pi || (pi->flags & ZEND_ACC_STATIC)) {
+        return 0;
+    }
+    zval *v = OBJ_PROP(&o->std, pi->offset);
+    return Z_TYPE_P(v) == IS_LONG || Z_TYPE_P(v) == IS_DOUBLE ? zval_get_double(v) : 0;
+}
+
+static void grow(int *x0, int *y0, int *x1, int *y1, double a0, double b0, double a1, double b1, bool *any)
+{
+    int ia0 = (int)floor(a0), ib0 = (int)floor(b0), ia1 = (int)ceil(a1), ib1 = (int)ceil(b1);
+    if (!*any) {
+        *x0 = ia0;
+        *y0 = ib0;
+        *x1 = ia1;
+        *y1 = ib1;
+        *any = true;
+        return;
+    }
+    *x0 = ia0 < *x0 ? ia0 : *x0;
+    *y0 = ib0 < *y0 ? ib0 : *y0;
+    *x1 = ia1 > *x1 ? ia1 : *x1;
+    *y1 = ib1 > *y1 ? ib1 : *y1;
+}
+
+/* The box (a0, b0)-(a1, b1), rounded outward. */
+static void put(int *x0, int *y0, int *x1, int *y1, double a0, double b0, double a1, double b1)
+{
+    bool any = false;
+    grow(x0, y0, x1, y1, a0, b0, a1, b1, &any);
+}
+
+/* The box of the visible children of o in o's coordinates; false: none. */
+static bool children_box(sl_obj_t *o, int *x0, int *y0, int *x1, int *y1)
+{
+    bool any = false;
+    if (!o->has_children) {
+        return false;
+    }
+    zval *zv;
+    ZEND_HASH_FOREACH_VAL(&o->children, zv) {
+        int a0, b0, a1, b1;
+        if (sl_obj_box(sl_obj(Z_OBJ_P(zv)), &a0, &b0, &a1, &b1)) {
+            grow(x0, y0, x1, y1, a0, b0, a1, b1, &any);
+        }
+    } ZEND_HASH_FOREACH_END();
+    return any;
+}
+
+bool sl_obj_box(sl_obj_t *c, int *x0, int *y0, int *x1, int *y1)
+{
+    if (!slot_true(c, "visible")) {
+        return false;
+    }
+    double x = slot_num(c, "x"), y = slot_num(c, "y");
+    double r, half;
+    switch (c->base) {
+    case SL_ROUNDRECT:
+    case SL_CANVAS:
+        put(x0, y0, x1, y1, x, y, x + slot_num(c, "w"), y + slot_num(c, "h"));
+        return true;
+    case SL_CIRCLE:
+        r = slot_num(c, "r");
+        put(x0, y0, x1, y1, x - r, y - r, x + r, y + r);
+        return true;
+    case SL_ARC:
+        r = slot_num(c, "r") + slot_num(c, "width") / 2;
+        put(x0, y0, x1, y1, x - r, y - r, x + r, y + r);
+        return true;
+    case SL_LINE: {
+        double xa = slot_num(c, "x1"), ya = slot_num(c, "y1");
+        half = slot_num(c, "width") / 2;
+        put(x0, y0, x1, y1, (x < xa ? x : xa) - half, (y < ya ? y : ya) - half, (x > xa ? x : xa) + half,
+             (y > ya ? y : ya) + half);
+        return true;
+    }
+    case SL_TEXT: {
+        const sl_prop_t *pt = find_prop_c(c, "text"), *pf = find_prop_c(c, "font"), *pa = find_prop_c(c, "align");
+        zval *tz = pt ? prop_slot(c, pt) : NULL, *fz = pf ? prop_slot(c, pf) : NULL;
+        const struct display_font_entry *f =
+            fz && Z_TYPE_P(fz) == IS_STRING ? sl_font_find(Z_STRVAL_P(fz), Z_STRLEN_P(fz)) : NULL;
+        if (!f || !tz || Z_TYPE_P(tz) != IS_STRING) {
+            return false;
+        }
+        slate_rect_t b = slate_text_bbox((int)x, (int)y, Z_STRVAL_P(tz), f,
+                                         (slate_align_t)(pa ? enum_index(prop_slot(c, pa), align_names, 3) : 0),
+                                         (int)slot_num(c, "maxWidth"));
+        if (b.x0 >= b.x1) {
+            return false;
+        }
+        put(x0, y0, x1, y1, b.x0, b.y0, b.x1, b.y1);
+        return true;
+    }
+    case SL_IMAGE:
+        put(x0, y0, x1, y1, x, y, x + class_num(c, "w"), y + class_num(c, "h"));
+        return true;
+    case SL_SCROLL:
+        put(x0, y0, x1, y1, x, y, x + slot_num(c, "w"), y + slot_num(c, "h"));
+        return true;
+    default:
+        break;
+    }
+#if SLATE_HAS_CONTROLS
+    if (SL_CTL(c) && c->ctl->ops) {   /* a Slate control: its size laid out (around its centre: ring, spinner) */
+        if (c->base == SL_PROGRESS_RING || c->base == SL_SPINNER) {
+            double hw = c->ctl->w / 2.0, hh = c->ctl->h / 2.0;
+            put(x0, y0, x1, y1, x - hw, y - hh, x + hw, y + hh);
+            return true;
+        }
+        put(x0, y0, x1, y1, x, y, x + c->ctl->w, y + c->ctl->h);
+        return true;
+    }
+#endif
+    if (sl_base_group(c->base) && c->base != SL_SCENE) {
+        if (slot_true(c, "clip") && slot_num(c, "w") > 0 && slot_num(c, "h") > 0) {
+            put(x0, y0, x1, y1, x, y, x + slot_num(c, "w"), y + slot_num(c, "h"));
+            return true;
+        }
+        int a0, b0, a1, b1;
+        if (!children_box(c, &a0, &b0, &a1, &b1)) {
+            return false;
+        }
+        put(x0, y0, x1, y1, x + a0, y + b0, x + a1, y + b1);
+        return true;
+    }
+    return false;   /* a user class that extends Element directly: no geometry known */
+}
+
+void sl_obj_extent(sl_obj_t *o, int *w, int *h)
+{
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    if (!children_box(o, &x0, &y0, &x1, &y1)) {
+        x1 = y1 = 0;
+    }
+    *w = x1 > 0 ? x1 : 0;
+    *h = y1 > 0 ? y1 : 0;
 }
 
 /* ---- constructors ---- */
@@ -1181,7 +1515,7 @@ PHP_METHOD(SlateElement, on)
     bool was = sl_touch_has_cb(o);
     sl_touch_set_cb(o, sl_touch_kind_of(type), fn);
     sl_touch_note(o);
-    if (!was && !slot_true(o, "touchable") && realized(o)) {
+    if (!was && !slot_true(o, "touchable") && realized(o) && (!SL_CTL(o) || sl_ctl_enabled(o))) {
         const sl_prop_t *p = find_prop_c(o, "touchable");
         slate_value_t v = slate_v_bool(true);
         if (p && !push_set(o, p, &v)) {
@@ -1247,10 +1581,10 @@ static bool animatable(const sl_obj_t *o, const sl_prop_t *p)
         return true;
     case SLATE_PROP_W:
     case SLATE_PROP_H:
-        return b == SL_GROUP || b == SL_SCROLL || b == SL_ROUNDRECT;   /* a Canvas's size is its buffer: not
-                                                                          animatable */
+        /* a Canvas's size is its buffer, a Slate control's its layout: not animatable */
+        return b == SL_GROUP || b == SL_SCROLL || b == SL_ROUNDRECT || b == SL_CONTROL;
     case SLATE_PROP_BLUR:
-        return b == SL_GROUP || b == SL_SCROLL;
+        return b == SL_GROUP || b == SL_SCROLL || sl_base_control(b);
     case SLATE_PROP_RADIUS:
         return b == SL_ROUNDRECT;
     case SLATE_PROP_BORDER:
@@ -1649,6 +1983,9 @@ static zend_type type_of(uint8_t t)
         return (zend_type)ZEND_TYPE_INIT_CODE(IS_DOUBLE, 0, 0);
     case PT_BOOL:
     case PT_TOUCH:
+#if SLATE_HAS_CONTROLS
+    case PT_ENABLED:
+#endif
         return (zend_type)ZEND_TYPE_INIT_CODE(_IS_BOOL, 0, 0);
     case PT_NCOLOR:
         return (zend_type)ZEND_TYPE_INIT_MASK(T_NUM | MAY_BE_NULL);
@@ -1691,26 +2028,25 @@ static void declare(zend_class_entry *ce, const sl_pdef_t *defs, int n)
     }
 }
 
-/* The property table of a base class: the common properties, then its own, with their slots. */
-static void table(sl_base_t b, const sl_pdef_t *defs, int n)
+/* The property table t of the class ce: the common properties, then its own, with their slots. */
+static void table(int t, zend_class_entry *ce, const sl_pdef_t *defs, int n)
 {
-    zend_class_entry *ce = s_base_ce[b];
     int k = 0;
     for (int pass = 0; pass < 2; pass++) {
         const sl_pdef_t *d = pass == 0 ? common_defs : defs;
-        int m = pass == 0 ? (b == SL_SCENE ? 0 : N(common_defs)) : n;
+        int m = pass == 0 ? (t == SL_SCENE ? 0 : N(common_defs)) : n;
         for (int i = 0; i < m && k < PROPS_MAX; i++) {
             zend_property_info *info = zend_hash_str_find_ptr(&ce->properties_info, d[i].name, strlen(d[i].name));
             if (!info) {
                 continue;
             }
-            s_props[b][k].def = &d[i];
-            s_props[b][k].name = zend_string_init_interned(d[i].name, strlen(d[i].name), 1);
-            s_props[b][k].offset = info->offset;
+            s_props[t][k].def = &d[i];
+            s_props[t][k].name = zend_string_init_interned(d[i].name, strlen(d[i].name), 1);
+            s_props[t][k].offset = info->offset;
             k++;
         }
     }
-    s_nprops[b] = k;
+    s_nprops[t] = k;
 }
 
 static zend_class_entry *leaf(const char *name, const zend_function_entry *methods, const sl_pdef_t *defs, int n,
@@ -1797,20 +2133,32 @@ void sl_elements_register(void)
     s_base_ce[SL_IMAGE] = sl_image_ce;
     s_base_ce[SL_SCROLL] = sl_scroll_ce;
 
-    table(SL_GROUP, group_defs, N(group_defs));
-    table(SL_ROUNDRECT, roundrect_defs, N(roundrect_defs));
-    table(SL_CIRCLE, circle_defs, N(circle_defs));
-    table(SL_ARC, arc_defs, N(arc_defs));
-    table(SL_LINE, line_defs, N(line_defs));
-    table(SL_TEXT, text_defs, N(text_defs));
-    table(SL_CANVAS, canvas_defs, N(canvas_defs));
-    table(SL_IMAGE, image_defs, N(image_defs));
-    table(SL_SCROLL, scroll_defs, N(scroll_defs));
+    table(SL_GROUP, s_base_ce[SL_GROUP], group_defs, N(group_defs));
+    table(SL_ROUNDRECT, s_base_ce[SL_ROUNDRECT], roundrect_defs, N(roundrect_defs));
+    table(SL_CIRCLE, s_base_ce[SL_CIRCLE], circle_defs, N(circle_defs));
+    table(SL_ARC, s_base_ce[SL_ARC], arc_defs, N(arc_defs));
+    table(SL_LINE, s_base_ce[SL_LINE], line_defs, N(line_defs));
+    table(SL_TEXT, s_base_ce[SL_TEXT], text_defs, N(text_defs));
+    table(SL_CANVAS, s_base_ce[SL_CANVAS], canvas_defs, N(canvas_defs));
+    table(SL_IMAGE, s_base_ce[SL_IMAGE], image_defs, N(image_defs));
+    table(SL_SCROLL, s_base_ce[SL_SCROLL], scroll_defs, N(scroll_defs));
 }
 
 void sl_elements_scene(zend_class_entry *scene_ce)
 {
     s_base_ce[SL_SCENE] = scene_ce;
     scene_ce->create_object = sl_obj_create;
-    table(SL_SCENE, NULL, 0);
+    table(SL_SCENE, scene_ce, NULL, 0);
 }
+
+#if SLATE_HAS_CONTROLS
+void sl_elements_control(int base, zend_class_entry *ce)
+{
+    s_base_ce[base] = ce;
+    ce->create_object = sl_obj_create;
+    if (base == SL_CONTROL) {
+        table(TAB_CONTROL, ce, control_defs, N(control_defs));
+        table(TAB_CTL, ce, ctl_defs, N(ctl_defs));   /* the same slots in every class that extends Control */
+    }
+}
+#endif

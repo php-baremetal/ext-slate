@@ -9,6 +9,8 @@
   - [Animations](./usage/animations.md)
   - [Scroll](./usage/scroll.md)
   - [Touch](./usage/touch.md)
+  - [Controls](./usage/controls.md)
+  - [Theme](./usage/theme.md)
   - [Effects and build options](./usage/effects-and-options.md)
   - [Performance](./usage/performance.md)
   - [Debug](./usage/debug.md)

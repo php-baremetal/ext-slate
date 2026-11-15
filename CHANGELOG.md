@@ -1,5 +1,153 @@
 # Changelog
 
+## 1.3.0
+
+- Added: themes. `final class Theme` holds the look of the controls: 14 colours (`$bg`, `$surface`, `$raised`,
+  `$well`, `$border`, `$borderStrong`, `$text`, `$textMuted`, `$textDim`, `$accent`, `$onAccent`, `$danger`,
+  `$info`, `$success`, `0xRRGGBB`), `$radius` (0..64, the radius of `Shape::Rounded`), `$small`, `$medium`, `$large`
+  (24..128, the heights of the sizes) and five fonts of the firmware (`$font`, `$fontSmall`, `$fontTitle`,
+  `$fontMono`, `$fontDisplay`), all `public readonly`, set by name in the constructor (the defaults are a neutral
+  dark theme). `Slate::theme(Theme $theme): static` sets it before the first `show()` (after it: `\Error` `the
+  theme is set before the first show()`); `Slate::$theme` (`public readonly Theme`) reads it, `new Theme()` until
+  `theme()`. A control reads the theme when it is made. The enums of the controls: `Size` (`Small`, `Medium`,
+  `Large`), `Variant` (`Primary`, `Secondary`, `Ghost`, `Danger`, `Outline`), `Shape` (`Pill`, `Rounded`) and
+  `ChoiceStyle` (`Segmented`, `Chips`, `List`, `Nav`). `\ValueError` `Baremetal\Slate\Theme::$<token> must be a
+  color, 0xRRGGBB`, `...::$radius must be between 0 and 64`, `...::$<small|medium|large> must be between 24 and 128`,
+  `...::$<font> must be a font of the firmware: unknown font '<name>' (available: ...)`.
+- Added: controls. `abstract class Control extends Group`: one PHP object whose parts live in the compositor without
+  a PHP object each; `public bool $touchable = true`, `public bool $enabled = true` (`false`: drawn at 0.4 times
+  `$opacity`, no new touch, a touch under way gets `Cancel`), `protected readonly Theme $theme` (the running Slate's
+  theme when it is made), `onChange(mixed $value): void` (empty) and `changed(?\Closure $fn): static` (notified for
+  the user's gestures only: method first, then the callback), `protected notify(mixed $value): void`, `protected
+  pressed(bool $down): void` (`true` at `Press`, `false` at `Release` and `Cancel`), `add()` / `remove()` for the
+  controls of your own (a class that extends `Control` directly). A control needs a running Slate when it is made
+  (`\Error` `<Class> needs a running Slate: create the Slate before its controls`); `add()` / `remove()` on Slate's
+  controls throw `\Error` `<Class>: a control builds its own parts`; their `$w` and `$h` read the size laid out and
+  cannot be written (`\Error` `Cannot modify <Class>::$w: the size of a control comes from its constructor and the
+  theme`). `class Button extends Control`: `new Button(int|float $x, int|float $y, string $text, Variant $variant =
+  Variant::Secondary, Size $size = Size::Medium, int $w = 0, Shape $shape = Shape::Rounded, ?string $icon = null)`,
+  `public string $text`, `public Variant $variant`, `public ?int $fill = null`, `public ?int $color = null`; the
+  height from the theme, the width given or the text plus paddings (16, 20, 24 px) and the icon (20 + 8 px), a square
+  with an icon and no text; the pressed look (the fill 12 % toward white in 80 ms; `Ghost` and `Outline`: the text
+  colour at 6 %); a monochrome icon (an image file as `Image::$src`, drawn in the text colour; one that does not
+  load stays empty, with `ImageFailed`). `\ValueError` `Baremetal\Slate\Button::$w must be between 0 and 32767`,
+  `...::$icon must be an absolute path ending in .sli or .png`, `...::$fill must be a color, 0xRRGGBB` (and
+  `$color`).
+- Added: `Toggle` (an on/off switch) and `Slider` (`extends Control`, not final). `new Toggle(int|float $x, int|float
+  $y, bool $on = false, Size $size = Size::Medium)`: a track (52 × 30, 62 × 36, 72 × 42) and a knob (24, 28, 34, 4 px
+  from the ends); on: `accent` track and `bg` knob, off: `borderStrong` and `textMuted`; a tap inverts `public bool
+  $on` (knob and colours slide in 250 ms) and notifies `onChange(bool)`; a write of `$on` from the code slides without
+  a notification; `public int $hitPad = 8`. `new Slider(int|float $x, int|float $y, int $w, int|float $min = 0,
+  int|float $max = 100, int|float $value = 0, int|float $step = 1, Size $size = Size::Medium)`: an area as high as the
+  size, a track 8 px high (`well`) filled to the value (`accent` or `public ?int $fill`), a knob of 24, 30, 34 px; the
+  press moves the knob under the finger, on the step, and it follows the finger; `onChange()` only once the finger is
+  past 8 px (or at the release), at most once per frame of the compositor; `onCommit(int|float $value): void` and
+  `committed(?\Closure $fn): static` at the release, always; in a vertical `Scroll` a vertical drag goes to the
+  `Scroll` (the slider gets `Cancel` and goes back to its value of before the press, no notification). Another
+  `Cancel` (`$enabled` false, another scene) does the same before any `onChange()`; after one, the value stays and
+  `onCommit()` runs. `public int|float $value`, `$min`, `$max`, `$step`: a write brings `$value` into the range and
+  onto the step (rounded to the decimals of `$step` and `$min`) without a notification; `$value` is an `int` when
+  `$min`, `$max` and `$step` are all `int`. `\ValueError` `Baremetal\Slate\Slider::$w must be between 0 and 32767`,
+  `...::$min must be less than $max`, `...::$step must be greater than 0`, `...::$<value|min|max|step> must be a
+  finite number`, `...::$fill must be a color, 0xRRGGBB`.
+- Added: `Choice` (`extends Control`, not final). `new Choice(int|float $x, int|float $y, array $labels, int|array
+  $selected = 0, ChoiceStyle $style = ChoiceStyle::Segmented, int $w = 0, Size $size = Size::Medium, bool $multi =
+  false, array $icons = [])`: one item (or several, `multi: true`) picked among the labels, in four styles:
+  `Segmented` (equal segments in a `well` container; selected `accent` + `onAccent`), `Chips` (pills 8 px apart that
+  wrap within `w > 0`; selected `accent`, the others `raised` with a `border`), `List` (rows `w` wide; selected
+  `accent` at 12 % with a border at 35 % and `accent` text) and `Nav` (equal parts of `w`, an icon above a
+  `fontSmall` label; selected `accent` with a 3 px bar that slides to it, the others `textDim`). `$icons`: one path
+  per label, monochrome icons drawn in the item's text colour (required for `Nav`). The colours slide in 200 ms; the
+  item under the finger has the pressed look (80 ms; a fill that is not opaque gets `text` at 6 % laid over it). A
+  tap selects an item and notifies `onChange(int)` (a tap on the selected one does nothing); with `multi` (pass `[]`
+  to start with none) each tap turns an item on or off and `onChange()` gets the sorted list.
+  `public int|array $selected`: a write from the code slides without a notification. `\ValueError`
+  `Baremetal\Slate\Choice::$labels must be a non-empty list of strings`, `...::$selected must be between 0 and
+  <n-1>` (`multi`: `...::$selected must be a list of indexes between 0 and <n-1>`), `...::$icons must be empty or hold
+  one path per label`, `...::$w must be between 0 and 32767`, `...: the List and Nav styles need w greater than 0`,
+  `...: the Nav style needs an icon per label`, `...::$icons must hold absolute paths ending in .sli or .png`.
+- Added: `SettingRow`, `Dialog`, `Scene::open()`, `Slate::toast()`. `new SettingRow(int|float $x, int|float $y, int
+  $w, string $label, string $sub = '', ?Element $control = null, string $value = '')`: a row of a settings list, 60
+  high (72 with `$sub`, at least the control + 16), the label (`font`) and the subtitle (`fontSmall`, `textMuted`) on
+  the left, `$value` (`fontMono`, `textMuted`) right-aligned, the control (a child of the row, with its own touches)
+  at the right, left of the value, and a divider in `border`; a `Slider` made with `w: 0` is stretched between the
+  label (at most 40 % of `$w`) and the value. `public string $label`, `$sub`, `$value` (a write lays the row out
+  again); `public bool $touchable = false` (touchable: the pressed look, `text` at 4 %, and `onTap()`). `new
+  Dialog(string $title = '', string $text = '', int $w = 460, bool $stack = false)`: a scrim (black at 88 %) that
+  takes every touch, and a panel `min($w, screen width - 32)` wide (radius 26, `surface`, `borderStrong`, a shadow
+  when shadows are built, padding 26) with the title (`fontTitle`), the text (`font`, `textMuted`; lines at `"\n"`
+  only), the content of `add()` and the buttons of `buttons(Button ...$b): static` (one row of equal widths, or a
+  column with `$stack`; the dialog sets their width and place), cut to the screen height - 32. `Scene::open(Dialog
+  $d): static` opens it above the scene (its shadow built first, then the scrim fades in and the panel, opaque,
+  rises 14 px, 300 ms);
+  `close(): void` plays it backwards, then the dialog leaves the scene, then `onClose(): void` and the callback of
+  `closed(?\Closure $fn): static`; `public bool $dismissable = false` (a tap on the scrim closes it). While a dialog
+  is open only the top one and what is in it take a new touch, from `open()` on (also in the first frames, while
+  the scrim is still clear); while it closes nothing in it takes a touch (a finger held on it gets `Cancel`), the
+  scrim still does; `$enabled = false` on a dialog leaves its scrim without touches but still blocks what is under
+  it; a dialog with `$visible = false` blocks nothing, and its close (or a close under way when it is hidden) ends
+  at once. A dialog stays
+  with its scene across `show()`; closed while its scene is not shown, or taken out with `Scene::remove()`, it goes
+  at once and still calls `onClose()`, as does one still closing when its scene is left; `Scene::open()` ends the
+  touch under way (`Cancel`); `add()` of a `Dialog` throws `\Error` `<Class> is opened with Scene::open(), not
+  added`; `Scene::add()` keeps the open dialogs on top. `Slate::toast(string $text, int
+  $ms = 2500): static`: a pill (48 high, `surface`, an `accent` dot, the text) above everything, also a transition,
+  in a top layer of the compositor; it rises and fades in (300 ms), stays `$ms`, fades out (300 ms); a new toast
+  replaces the one shown; it takes no touch; it is at most the screen's width - 64 (a longer text is cut).
+  `\ValueError` `Baremetal\Slate\SettingRow::$w must be between 1 and 32767` (and `Dialog::$w`),
+  `Baremetal\Slate\Dialog::$text must hold at most 100 lines`, `Baremetal\Slate\Slate::toast(): ms must be at least
+  500`; `\Error` `Baremetal\Slate\Dialog is already open`. The controls' animations
+  give no `TweenDone`; Slate's internal `HoldDue` now also wakes the PHP task at the end of a dialog's close (no
+  more watches of ext-events: with the controls built, a Slate without a touch device takes the one of `HoldDue`).
+- Added: `ProgressRing`, `ProgressBar`, `Spinner`, `StepList` (`extends Control`, not final; not touchable by
+  default, `public bool $touchable = false`). `new ProgressRing(int|float $cx, int|float $cy, int $r, float $value =
+  0.0, int $width = 12, bool $percent = false)`: a track in `well` and an arc in `accent` with round ends from the top
+  for `$value` x 360 degrees, sliding in 200 ms; `public float $value` (0..1, a finite value outside is brought into
+  the range), `public bool $spinning = false` (an arc of 25 % that turns, 900 ms a turn), `public ?int $color = null`;
+  `$percent` shows `round($value x 100)` (`fontDisplay`) and `%` (`font`, `accent`) in the middle. `new
+  ProgressBar(int|float $x, int|float $y, int $w, float $value = 0.0, int $h = 4)`: a track in `well` and a fill in
+  `accent` (radius `h / 2`) sliding in 200 ms; `public float $value`, `public bool $glow = false` (a shadow of the
+  fill's colour, blur 10; none when shadows are not built), `public ?int $color = null`. `new Spinner(int|float $cx,
+  int|float $cy, int $r = 12)`: an arc of 25 %, 3 px, turning (900 ms a turn) while it is shown; `public ?int $color
+  = null`. `new StepList(int|float $x, int|float $y, int $w, array $steps, int $active = 0)`: one row per step (48
+  high, 8 apart), done (a `success` circle with a check, `textMuted`), active (a spinner, an `accent` border, `text`),
+  to do (a `borderStrong` ring, `textDim`); `public int $active` (0..`count($steps)`; the steps that become done
+  pop), `public readonly array $steps` (at most 21). The turns and the pops give no `TweenDone`. `\ValueError`
+  `<Class>::$r must be between 1 and 32767` (`ProgressRing`, `Spinner`), `...::$width must be between 1 and 32767`,
+  `...::$w must be between 1 and 32767` (`ProgressBar`, `StepList`), `...::$h must be between 1 and 32767`,
+  `...::$value must be a finite number`, `...::$color must be a color, 0xRRGGBB`, `...::$steps must be a non-empty list
+  of strings`, `...::$steps must hold at most 21 steps`, `...::$active must be between 0 and <n>`.
+- Changed: a tween of an element with `$visible = false`, or inside a group with `$visible = false`, waits (its
+  time stopped, its `TweenDone` and the tweens chained after it too) and goes on from where it was when the element
+  is visible again, as one of a scene not shown does; only `$visible` counts (a fade-in from `$opacity` 0 runs). A
+  hidden `Spinner` no longer keeps the compositor waking at every refresh. A tween that draws nothing (its element
+  out of a `Scroll`'s view, or at `$opacity` 0) no longer makes the touch table be built again at every refresh.
+- Fixed: on a panel that refreshes top to bottom, a frame that changes more than half of the screen also races the
+  panel's refresh (no tearing) when its last band can still be written behind the refresh before the next TE pulse
+  (other refresh orders: as before). A `Scroll` whose view is just over half
+  of the screen (280 x 232 on the 360 x 360 panel) tore while it scrolled: rows looked cut or squeezed for one
+  refresh. A larger change that reaches the bottom of the scan (a whole screen) is sent as before.
+- Fixed: an element taken out of the scene (a `Dialog` that closes) kept its caches out of reach: they stayed in the
+  cache budget until it was freed, so a later shadow, blur or cached group could find no room (the second dialog of
+  the example was drawn without its shadow, and tried again at every frame). Such caches are still kept (a dialog
+  opened again builds nothing), but they make room first when a cache does not fit, before those of the scenes left.
+- Changed: a `Dialog`'s panel fades element by element: each of its parts is drawn with its own opacity times the
+  panel's (an internal flat group), instead of being composed apart as one image at every frame;
+  halfway through, texts and buttons look washed out and the panel's background shows through them. Its shadow is
+  blur 30 (was 80), and it is built before the opening starts (`SLATE_CMD_PREPARE`: the tweens pushed after it start
+  once it is built), so the first frame is not a long one and the animation skips no step after it. On the
+  360 x 360 example: frames of 34 to 49 ms during the 300 ms (were 93 to 101 ms), 7 to 9 of them (were 4 or 5), and
+  the first opening no longer has a frame of 160 to 173 ms: its shadow takes 31 to 36 ms before the animation
+  starts.
+- Changed: the blur of a shadow 385 to 512 px wide or high (was up to 384), such as the mask of a `Dialog` of the
+  default width on a 360 x 360 screen (388 px), takes the faster path that reads and writes the image once per
+  direction (about half the time with the image in PSRAM).
+- Added: the `slate-controls` build option (`bool`, default `true`). With `false` the theme, its enums, `Control`,
+  the controls, `Slate::theme()`, `Slate::$theme`, `Slate::toast()` and `Scene::open()` are not built.
+- Docs: `docs/usage/controls.md` and `docs/usage/theme.md` (new), `docs/usage/performance.md` (Controls: the touch
+  table, tinted icons, dialogs, latency, memory per control, firmware), `effects-and-options.md`, `overview.md`;
+  IDE stub. The `06-display/slate-controls` example shows the controls and a theme on the round 360 x 360 panel.
+
 ## 1.2.0
 
 - Added: touch on elements. An element takes the finger when `Element::$touchable` is `true` (`bool`, default

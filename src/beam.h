@@ -17,9 +17,13 @@
      than SLATE_BEAM_STALE periods);
    - the scan reaches line s between s/lines * P * SLATE_BEAM_ACTIVE_MIN_PCT / 100 and s/lines * P after the pulse
      (the blanking takes a part of the period: measured 4 % on an ST77916), give or take SLATE_BEAM_MARGIN_US;
-   - only frames that change at most SLATE_BEAM_AREA_MAX_PCT of the screen race the scan. A larger frame takes about
-     a refresh or more to send, so a refresh shows it partly drawn whatever the order (the edge between the bands
-     sent and those still to come): holding its bands back would only make it slower;
+   - only frames that change at most SLATE_BEAM_AREA_MAX_PCT of the screen race the scan, and, on a panel that scans
+     top-down (the order the compositor composes the bands in), larger ones whose last scan line, plus the write of a
+     band, comes before the next pulse (engine.c, races(): holding their bands back does not make them run into the
+     next refresh; with another order the first bands composed would be the last scanned, and holding them would hold
+     the rest). A larger frame that reaches the end of the scan takes about a
+     refresh or more to send, so a refresh shows it partly drawn whatever the order (the edge between the bands sent
+     and those still to come): holding its bands back would only make it slower;
    - a band's write lasts from its push until its done at most: fixed_us + bytes * ns_per_byte / 1000, measured on
      the bands already sent (slate_xfer_sample), the fixed part kept near the slowest bands. A band pushed while
      others are in flight starts when the driver gets to it (ready_us, an upper estimate). */

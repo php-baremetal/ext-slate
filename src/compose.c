@@ -61,6 +61,7 @@ typedef struct {
     slate_rect_t occ;       /* opaque interior cut by clip */
     bool skip;
     bool bars;              /* the scroll bars of e (a scroll drawn straight into the band), not e */
+    uint8_t fa;             /* the opacity of the flat groups above it (scene.h, SLATE_PROP_FLAT), 255: none */
 } item_t;
 
 static item_t *items;
@@ -85,6 +86,7 @@ typedef struct {
                                      not to the screen */
     int build_lost;               /* during that build: children drawn without their effect (no memory) */
     bool res_empty;               /* resolve_el found nothing to draw */
+    uint8_t fa;                   /* collect(): the opacity of the flat groups being walked (255: none) */
 } cx_t;
 
 /* The underlay (compose.h): the screen as the background colour and the bottom items that stay still (P, a prefix
@@ -230,9 +232,21 @@ static void pop_ops(cx_t *cx, ops_save_t s)
 
 /* ---- element facts ---- */
 
+/* Group g is composed apart for its opacity (below 1, and not flat: scene.h, SLATE_PROP_FLAT). */
+static inline bool fades_apart(const slate_el_t *g)
+{
+    return g->alpha != 255 && !(g->kind == SLATE_EL_GROUP && g->u.g.flat);
+}
+
 static bool offscreen(const slate_el_t *g)
 {
-    return g->alpha != 255 || g->cached || slate_el_has_shadow(g) || slate_el_blur(g) > 0;
+    return fades_apart(g) || g->cached || slate_el_has_shadow(g) || slate_el_blur(g) > 0;
+}
+
+/* An opacity times the flat groups' above an item. */
+static inline uint8_t fa_mul(uint8_t a, uint8_t fa)
+{
+    return fa == 255 ? a : (uint8_t)div255((unsigned)a * fa);
 }
 
 /* A scroll drawn through the image of its whole content (cache, no shadow or blur: those take the view's image). */
@@ -267,7 +281,7 @@ static int nest_depth(const slate_el_t *g)
         if (k->cached || slate_el_has_shadow(k) || slate_el_blur(k) > 0) {
             return NEST_ALL;
         }
-        int kd = nest_depth(k) + (k->alpha != 255);
+        int kd = nest_depth(k) + fades_apart(k);
         if (kd >= NEST_ALL) {
             return NEST_ALL;
         }
@@ -296,7 +310,7 @@ static size_t nest_need(const slate_el_t *g, size_t row)
         }
         size_t n;
         bool cache = k->cached || slate_el_has_shadow(k) || slate_el_blur(k) > 0;
-        if (!cache && k->alpha == 255) {
+        if (!cache && !fades_apart(k)) {
             n = nest_need(k, row);
         } else {
             slate_rect_t x = scroll_image(k) ? slate_el_scroll_area(k) : slate_el_screen_ext(k, 0, 0, true);
@@ -455,12 +469,20 @@ static void draw_canvas(cx_t *cx, slate_buf_t *buf, const slate_el_t *e, float x
     }
 }
 
-/* An image at its rounded position, times a, through the table of the buffer (an offscreen strip has its own). */
+/* An image at its rounded position, times a, through the table of the buffer (an offscreen strip has its own);
+   tinted: as a mask of the tint's colour, times the tint's alpha too. */
 static void draw_image(cx_t *cx, slate_buf_t *buf, const slate_el_t *e, float x, float y, slate_rect_t clip,
                        uint8_t a)
 {
     const slate_sli_t *im = e->u.image.sli;
-    if (im) {
+    if (!im) {
+        return;
+    }
+    uint32_t tint = e->u.image.tint;
+    if (tint >> 24) {
+        slate_sli_draw_tint_ops(cx->ops, buf, im, iround(x) - buf->ox, iround(y) - buf->oy,
+                                (uint8_t)div255((tint >> 24) * a), slate_rgb565(tint & 0xFFFFFF), to_buf(buf, clip));
+    } else {
         slate_sli_draw_ops(cx->ops, buf, im, iround(x) - buf->ox, iround(y) - buf->oy, a, to_buf(buf, clip));
     }
 }
@@ -555,6 +577,8 @@ static bool produce(cx_t *cx, slate_el_t *g, float pox, float poy, slate_rect_t 
     if (!mem) {
         return false;
     }
+    uint8_t fa = cx->fa;
+    cx->fa = 255;   /* inside the group's image its children have their own opacity (the group's goes on the image) */
     uint16_t *px = (uint16_t *)mem;
     uint8_t *a = mem + pxb;
     for (int y = R.y0; y < R.y1; y += k) {
@@ -567,6 +591,7 @@ static bool produce(cx_t *cx, slate_el_t *g, float pox, float poy, slate_rect_t 
         pop_ops(cx, s);
         sink(cx, &off, arg);
     }
+    cx->fa = fa;
     cx->ar_top = top;
     return true;
 }
@@ -915,13 +940,15 @@ __attribute__((noinline, cold)) static bool draw_scroll_image(cx_t *cx, slate_bu
     kids_origin(cx, e, it->pox, it->poy, &x, &y);
     slate_rect_t r = shift(c->crel, iround(x), iround(y));
     int w = r.x1 - r.x0;
-    cx->ops->copy_a(buf, r.x0 - buf->ox, r.y0 - buf->oy, c->px, c->a, w, r.y1 - r.y0, w, e->alpha, to_buf(buf, cc));
+    cx->ops->copy_a(buf, r.x0 - buf->ox, r.y0 - buf->oy, c->px, c->a, w, r.y1 - r.y0, w, fa_mul(e->alpha, it->fa),
+                    to_buf(buf, cc));
     return true;
 }
 
 static void draw_group_content(cx_t *cx, slate_buf_t *buf, const item_t *it, slate_rect_t cc)
 {
     slate_el_t *e = it->e;
+    uint8_t a = fa_mul(e->alpha, it->fa);
     if (scroll_image(e)) {
         if (draw_scroll_image(cx, buf, it, cc)) {
             return;
@@ -932,24 +959,30 @@ static void draw_group_content(cx_t *cx, slate_buf_t *buf, const item_t *it, sla
             float x, y;
             own_origin(e, it->pox, it->poy, &x, &y);
             if (slate_el_has_shadow(e)) {
-                draw_shadow_of(cx, buf, e, c, it->pox, it->poy, it->clip, e->alpha);
+                draw_shadow_of(cx, buf, e, c, it->pox, it->poy, it->clip, a);
             }
             slate_rect_t r = shift(c->crel, iround(x), iround(y));
             int w = r.x1 - r.x0;
-            cx->ops->copy_a(buf, r.x0 - buf->ox, r.y0 - buf->oy, c->px, c->a, w, r.y1 - r.y0, w, e->alpha,
+            cx->ops->copy_a(buf, r.x0 - buf->ox, r.y0 - buf->oy, c->px, c->a, w, r.y1 - r.y0, w, a,
                             to_buf(buf, it->clip));
             return;
         }
     }
-    if (e->alpha == 255) {
+    if (e->alpha == 255) {   /* (a cache that could not be made): its children, with the flat groups' opacity */
+        uint8_t fa = cx->fa;
+        cx->fa = it->fa;
         render(cx, buf, e, it->pox, it->poy, cc, true, false);
+        cx->fa = fa;
         return;
     }
     slate_rect_t R = slate_rect_and(slate_el_screen_ext(e, it->pox, it->poy, true), cc);
-    band_sink_t bs = { buf, it->clip, e->alpha };
+    band_sink_t bs = { buf, it->clip, a };
     if (!produce(cx, e, it->pox, it->poy, R, cc, sink_band, &bs)) {
-        cx->st->degraded++;   /* no scratch: drawn without the group opacity */
+        cx->st->degraded++;   /* no scratch: a flat fade instead (each child with the opacity, overlaps show through) */
+        uint8_t fa = cx->fa;
+        cx->fa = a;
         render(cx, buf, e, it->pox, it->poy, cc, true, false);
+        cx->fa = fa;
     }
 }
 
@@ -962,7 +995,7 @@ static void draw_group(cx_t *cx, slate_buf_t *buf, const item_t *it)
     }
     draw_group_content(cx, buf, it, cc);
     if (e->u.g.scroll && e->u.g.scroll->ind) {   /* over the content, with the group's opacity */
-        draw_bars(buf, e, it->pox, it->poy, cc, (uint8_t)div255((unsigned)e->u.g.scroll->ind * e->alpha));
+        draw_bars(buf, e, it->pox, it->poy, cc, (uint8_t)div255((unsigned)e->u.g.scroll->ind * fa_mul(e->alpha, it->fa)));
     }
 }
 
@@ -970,8 +1003,9 @@ static void draw_item(cx_t *cx, slate_buf_t *buf, const item_t *it)
 {
     slate_el_t *e = it->e;
     cx->st->drawn++;
+    uint8_t a = fa_mul(e->alpha, it->fa);
     if (it->bars) {
-        draw_bars(buf, e, it->pox, it->poy, it->clip, e->u.g.scroll->ind);
+        draw_bars(buf, e, it->pox, it->poy, it->clip, fa_mul(e->u.g.scroll->ind, it->fa));
         return;
     }
     if (e->kind == SLATE_EL_GROUP) {
@@ -984,7 +1018,7 @@ static void draw_item(cx_t *cx, slate_buf_t *buf, const item_t *it)
         const slate_cache_t *c = resolve(cx, e, it->pox, it->poy);
         slate_rect_t cl = it->clip, o = slate_rect_and(it->occ, cl);
         if (slate_rect_empty(o)) {
-            draw_shadow_of(cx, buf, e, c, it->pox, it->poy, cl, e->alpha);
+            draw_shadow_of(cx, buf, e, c, it->pox, it->poy, cl, a);
         } else {
             slate_rect_t part[4] = {
                 { cl.x0, cl.y0, cl.x1, o.y0 }, { cl.x0, o.y1, cl.x1, cl.y1 },   /* above, below */
@@ -992,17 +1026,17 @@ static void draw_item(cx_t *cx, slate_buf_t *buf, const item_t *it)
             };
             for (int k = 0; k < 4; k++) {
                 if (!slate_rect_empty(part[k])) {
-                    draw_shadow_of(cx, buf, e, c, it->pox, it->poy, part[k], e->alpha);
+                    draw_shadow_of(cx, buf, e, c, it->pox, it->poy, part[k], a);
                 }
             }
         }
     }
     if (e->kind == SLATE_EL_CANVAS) {
-        draw_canvas(cx, buf, e, it->pox + e->x, it->poy + e->y, it->clip, e->alpha);
+        draw_canvas(cx, buf, e, it->pox + e->x, it->poy + e->y, it->clip, a);
     } else if (e->kind == SLATE_EL_IMAGE) {
-        draw_image(cx, buf, e, it->pox + e->x, it->poy + e->y, it->clip, e->alpha);
+        draw_image(cx, buf, e, it->pox + e->x, it->poy + e->y, it->clip, a);
     } else {
-        draw_shape(buf, e, it->pox, it->poy, it->clip, e->alpha, false);
+        draw_shape(buf, e, it->pox, it->poy, it->clip, a, false);
     }
 }
 
@@ -1024,7 +1058,7 @@ static bool items_room(cx_t *cx)
 /* Lists e (flattening plain groups) as items, or draws them at once into direct. false: out of memory. */
 static bool collect(cx_t *cx, slate_el_t *e, float pox, float poy, slate_rect_t clip, slate_buf_t *direct)
 {
-    if (!e->visible || e->alpha == 0) {
+    if (!e->visible || fa_mul(e->alpha, cx->fa) == 0) {
         return true;
     }
     slate_el_place(e, &pox, &poy);
@@ -1041,13 +1075,19 @@ static bool collect(cx_t *cx, slate_el_t *e, float pox, float poy, slate_rect_t 
         if (e->u.g.scroll) {
             kids_origin(cx, e, pox, poy, &gx, &gy);
         }
-        for (slate_el_t *k = e->u.g.first; k; k = k->next) {
-            if (!collect(cx, k, gx, gy, cc, direct)) {
-                return false;
-            }
+        uint8_t fa = cx->fa;
+        cx->fa = fa_mul(e->alpha, fa);   /* a flat group with opacity (offscreen() false): its children take it */
+        bool ok = true;
+        for (slate_el_t *k = e->u.g.first; k && ok; k = k->next) {
+            ok = collect(cx, k, gx, gy, cc, direct);
+        }
+        cx->fa = fa;
+        if (!ok) {
+            return false;
         }
         if (e->u.g.scroll && e->u.g.scroll->ind) {   /* its bars, over its children */
-            item_t b = { e, pox, poy, cc, slate_rect_and(bars_box(e, pox, poy), cc), EMPTY, false, true };
+            item_t b = { e, pox, poy, cc, slate_rect_and(bars_box(e, pox, poy), cc), EMPTY, false, true,
+                         fa_mul(e->alpha, fa) };   /* a flat scroll's bars take its opacity too */
             if (slate_rect_empty(b.vis)) {
                 return true;
             }
@@ -1062,7 +1102,7 @@ static bool collect(cx_t *cx, slate_el_t *e, float pox, float poy, slate_rect_t 
         }
         return true;
     }
-    item_t it = { e, pox, poy, clip, vis, slate_rect_and(opaque_rect(e, pox, poy), clip), false, false };
+    item_t it = { e, pox, poy, clip, vis, slate_rect_and(opaque_rect(e, pox, poy), clip), false, false, cx->fa };
     if (slate_rect_empty(it.occ)) {
         it.occ = EMPTY;
     }
@@ -1181,7 +1221,7 @@ static bool cull_big(cx_t *cx, int from, int n, slate_rect_t clip, slate_rect_t 
                 break;
             }
         }
-        if (!it->skip && !slate_rect_empty(it->occ)) {
+        if (!it->skip && it->fa == 255 && !slate_rect_empty(it->occ)) {   /* under a flat fade: hides nothing */
             add_occluder(occ, &no, it->occ);
         }
     }
@@ -1487,7 +1527,7 @@ void slate_compose(slate_el_t *root, slate_dirty_t *d, const slate_target_t *t, 
     if (++frame_no == 0) {
         frame_no = 1;
     }
-    cx_t cx = { t, st, slate_gfx(), t->scratch, t->scratch ? t->scratch_bytes : 0, 0, 0, frame_no, false, -1, NULL, { 0, 0, 0, 0 }, 0, false };
+    cx_t cx = { t, st, slate_gfx(), t->scratch, t->scratch ? t->scratch_bytes : 0, 0, 0, frame_no, false, -1, NULL, { 0, 0, 0, 0 }, 0, false, 255 };
     alloc_t = t;
     slate_scene_tick();
     under_frame(&cx, root);
@@ -1533,6 +1573,63 @@ void slate_compose(slate_el_t *root, slate_dirty_t *d, const slate_target_t *t, 
             st->area += (uint32_t)(rw * n);
         }
     }
+    slate_raster_ops(prev);
+}
+
+/* ---- prepare ---- */
+
+/* The caches e (parent origin pox, poy, placed as collect() places it) and its subtree need, built as a frame would
+   build them: a group drawn through its own image (cache, shadow, blur, a cached scroll) builds it (its children are
+   in it); another group goes on with its children; a shape builds its shadow. $visible false: nothing under it;
+   $opacity is not looked at (a fade-in from 0 needs its images at its first visible frame). */
+static void prep(cx_t *cx, slate_el_t *e, float pox, float poy)
+{
+    if (!e->visible) {
+        return;
+    }
+    slate_el_place(e, &pox, &poy);
+    if (e->kind == SLATE_EL_GROUP) {
+        if (scroll_image(e)) {
+            resolve_scroll(cx, e, pox, poy);
+            return;
+        }
+        if (e->cached || slate_el_has_shadow(e) || slate_el_blur(e) > 0) {
+            resolve(cx, e, pox, poy);
+            return;
+        }
+        float gx = pox + e->x, gy = poy + e->y;
+        if (e->u.g.scroll) {
+            kids_origin(cx, e, pox, poy, &gx, &gy);
+        }
+        for (slate_el_t *k = e->u.g.first; k; k = k->next) {
+            prep(cx, k, gx, gy);
+        }
+        return;
+    }
+    if (slate_el_has_shadow(e)) {
+        resolve(cx, e, pox, poy);
+    }
+}
+
+void slate_compose_prepare(slate_el_t *el, const slate_target_t *t, slate_stats_t *st)
+{
+    slate_stats_t dummy;
+    if (!st) {
+        st = &dummy;
+    }
+    memset(st, 0, sizeof *st);
+    if (!el || !t) {
+        return;
+    }
+    if (++frame_no == 0) {
+        frame_no = 1;
+    }
+    cx_t cx = { t, st, slate_gfx(), t->scratch, t->scratch ? t->scratch_bytes : 0, 0, 0, frame_no, false, -1, NULL, { 0, 0, 0, 0 }, 0, false, 255 };
+    alloc_t = t;
+    float pox, poy;
+    slate_el_parent_origin(el, &pox, &poy);
+    const slate_gfx_ops_t *prev = slate_raster_ops(NULL);
+    prep(&cx, el, pox, poy);
     slate_raster_ops(prev);
 }
 

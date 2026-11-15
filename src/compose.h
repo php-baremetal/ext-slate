@@ -10,8 +10,9 @@
       continuously across frames (a frame starts with the buffer after the one the previous frame used last,
       which is the one the panel freed first);
    2. lists the elements that touch the band in z-order, flattening plain groups (opacity 1, no cache, shadow or
-      blur: their children draw straight into the band) and taking the other groups as one item (the list of the
-      whole screen is made once per frame and cut to each band);
+      blur: their children draw straight into the band) and flat groups (scene.h, SLATE_PROP_FLAT: their children
+      draw straight into the band with their opacity times the group's, and none of them occludes), and taking the
+      other groups as one item (the list of the whole screen is made once per frame and cut to each band);
    3. occlusion: walking the list from the top, an item whose visible part in the band (box cut by its clips)
       lies inside the opaque interior of an item above it is skipped and counted in `culled`; the background is
       skipped the same way. Opaque interior (only for elements whose e->opaque is true, cut by their clips):
@@ -27,10 +28,11 @@
       the semi-transparent runs and for every run below opacity 1; nothing until it is shown, scene.h), a group:
       - with cache, shadow or blur: its cached image (cache.h) copied with copy_a times its opacity, over its
         shadow (fill_mask of the blurred alpha); without cache memory it falls back to the next two cases;
-      - with opacity < 1: composed offscreen (RGB565 + A8, premultiplied) in strips taken from
-        target->scratch (internal RAM), each strip copy_a'd into the band with the group's opacity; when
-        scratch cannot hold a row the children are drawn straight into the band, opacity ignored, and
-        stats.degraded counts it (offscreen work never blends in cache memory);
+      - with opacity < 1 (and not flat: flat groups are flattened, step 2): composed offscreen (RGB565 + A8,
+        premultiplied) in strips taken from target->scratch (internal RAM), each strip copy_a'd into the band with
+        the group's opacity; when scratch cannot hold a row the children are drawn straight into the band each with
+        its own opacity times the group's, as in a flat group (overlaps show through), and stats.degraded counts it
+        (offscreen work never blends in cache memory);
       - otherwise its children are drawn straight into the band;
       a scroll (scene.h, "Scroll") is drawn as a group clipped to its view, its children shifted by its drawn
       position (those outside the view are not listed, as with any clip); with cache (and no shadow or blur) its
@@ -97,7 +99,7 @@
    into (children of a group composed offscreen count too); culled = items skipped by occlusion, likewise per band;
    cache_hit / cache_miss = per element and frame, when an element's cached images are used as they are / have
    to be built (or cannot be: allocation failure); area = pixels composed (sum of the bands); degraded = groups
-   drawn without their opacity for lack of scratch; aborted = 1 when the frame was not composed (band_buf NULL);
+   faded child by child (as flat ones) for lack of scratch; aborted = 1 when the frame was not composed (band_buf NULL);
    scratch_want = the most scratch the frame asked scratch_grow for (bytes, 0: none asked; see slate_target_t);
    scroll_nocache = cached scrolls composed directly because their content image could not be built (no cache memory,
    or no scratch to build it; per element and frame, also counted in cache_miss). */
@@ -139,8 +141,8 @@ typedef struct {
        group opacity and caches: a strip of a group needs (width * 3 + 3) & ~3 bytes per row, and each nesting
        level gets half of what is left (less when that would leave a level nested deeper without a row: then each
        level leaves a row for each one under it), so the minimum is 2 * (3 * w + 3) bytes; recommended 3 * w * rows (one
-       band's worth of strips, e.g. 43 KB for 360 x 40). Without it (NULL / too small) opacity groups are drawn
-       without their opacity and caches are not built. */
+       band's worth of strips, e.g. 43 KB for 360 x 40). Without it (NULL / too small) opacity groups are faded
+       child by child (as flat groups, compose.c) and caches are not built. */
     void *scratch;
     size_t scratch_bytes;
     uint16_t background;   /* RGB565 native, under everything */
@@ -159,6 +161,13 @@ typedef struct {
    (0, 0) for a real root) and empties d. emit and every target callback are called from this function only. */
 void slate_compose(slate_el_t *root, slate_dirty_t *d, const slate_target_t *t, slate_emit_fn emit, void *ctx,
                    slate_stats_t *st);
+
+/* Builds now the element caches (cache.h) that the next frame would build for el and its subtree (el on screen,
+   under root: its origin from its parents), with t's memory and scratch, as a frame does: what is stale and drawn
+   through a cache (a cached group, a shadow, a blur, a cached scroll's content), $visible false skipping a subtree
+   ($opacity is not looked at). Nothing is drawn or emitted; st counts the hits and misses (and scratch_want). The
+   next frame finds those images ready (the time of their building is out of it). */
+void slate_compose_prepare(slate_el_t *el, const slate_target_t *t, slate_stats_t *st);
 
 /* Turns the underlay on or off for the frames that follow (off by default; off keeps the one there is, unused). */
 void slate_compose_underlay(bool on);

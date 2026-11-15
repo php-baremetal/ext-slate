@@ -28,6 +28,8 @@ costs nothing: no frame is composed.
 - `Element::animate()`, `Element::ease()`, `Tween` and the event `TweenDone`: animations run by the compositor.
 - `Transition` and the event `TransitionDone`: page transitions of `Slate::show()` (fade, push, cover, uncover).
 - `Scroll` (a `Group` with a view the finger drags, with inertia, snapping and bars) and the event `ScrollEnded`.
+- `Theme` and the controls: `Button`, `Toggle`, `Slider`, `Choice`, `SettingRow`, `Dialog` (with `Scene::open()`),
+  `Slate::toast()`, `ProgressRing`, `ProgressBar`, `Spinner`, `StepList`, and `Control`, the base of a control of your own.
 - `Caps`, `Align`, `ImageError`, `Ease`, `Direction` and `ScrollAxis` (enums), `LinearGradient`, `RadialGradient`, `Shadow`.
 
 ## Requirements
@@ -163,8 +165,12 @@ Touch events reach `Scene::onTouch()` in the `event-driven` runtime, where ext-e
 - A `Scroll` takes the touches by itself, and a drag that starts on one of its touchable rows passes to it past
   8 px; the drag, the inertia, the spring past an edge and the snapping run in the compositor, and `ScrollEnded`
   comes when the content rests.
+- The controls are one PHP object each, their parts in the compositor, drawn with a theme set once before the
+  first `show()` (it does not change while the Slate runs). They notify only the user's gestures; a write from the
+  code is drawn without a notification. The `06-display/slate-controls` example shows them all.
 
 See [Scenes and pages](./usage/scenes.md), [Elements](./usage/elements.md), [Images](./usage/images.md),
-[Animations](./usage/animations.md), [Scroll](./usage/scroll.md),
+[Animations](./usage/animations.md), [Scroll](./usage/scroll.md), [Touch](./usage/touch.md),
+[Controls](./usage/controls.md), [Theme](./usage/theme.md),
 [Effects and build options](./usage/effects-and-options.md), [Performance](./usage/performance.md) and
 [Debug](./usage/debug.md).

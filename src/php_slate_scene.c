@@ -19,6 +19,10 @@
  * element takes while it is the active scene (not during a transition; php_slate_touch.c routes them). All four are
  * empty here.
  *
+ * Dialogs (slate-controls). open() adds a Dialog as the scene's last child, with its opening animation; while dialogs
+ * are open, add() puts them back on top of what it added (in their order), and remove() of an open one closes it at
+ * once (onClose(), closed()). A dialog stays with its scene when another one is shown (php_slate_ctl_dialog.c).
+ *
  * protected bool $keepCache = true: when the scene is left, its element caches stay for a return to it while there
  * is room (Slate::$keepScenes, Slate::$keptBudget; engine.h, Kept scenes); false: they go when it is left. Read by
  * the show() that leaves the scene.
@@ -45,6 +49,11 @@ PHP_METHOD(SlateScene, add)
         }
     }
     sl_children_add(sl_obj(Z_OBJ_P(ZEND_THIS)), args, argc);
+#if SLATE_HAS_CONTROLS
+    if (!EG(exception)) {
+        sl_dialog_raise(sl_obj(Z_OBJ_P(ZEND_THIS)));   /* the open dialogs stay on top (nothing when none is open) */
+    }
+#endif
     if (EG(exception)) {
         RETURN_THROWS();
     }
@@ -65,12 +74,50 @@ PHP_METHOD(SlateScene, remove)
             RETURN_THROWS();
         }
     }
-    sl_children_remove(sl_obj(Z_OBJ_P(ZEND_THIS)), args, argc);
+    sl_obj_t *so = sl_obj(Z_OBJ_P(ZEND_THIS));
+#if SLATE_HAS_CONTROLS
+    /* the open dialogs among them: closed at once after the removal (onClose(), closed()) */
+    uint32_t nd = 0;
+    sl_obj_t **dialogs = NULL;
+    for (uint32_t i = 0; i < argc; i++) {
+        sl_obj_t *c = sl_obj(Z_OBJ(args[i]));
+        if (c->parent == so && sl_dialog_is_open(c)) {
+            if (!dialogs) {
+                dialogs = emalloc(argc * sizeof *dialogs);
+            }
+            dialogs[nd++] = c;   /* alive: the caller's arguments hold them */
+        }
+    }
+#endif
+    sl_children_remove(so, args, argc);
+#if SLATE_HAS_CONTROLS
+    for (uint32_t i = 0; i < nd && !EG(exception); i++) {
+        sl_dialog_removed(dialogs[i]);
+    }
+    if (dialogs) {
+        efree(dialogs);
+    }
+#endif
     if (EG(exception)) {
         RETURN_THROWS();
     }
     RETURN_OBJ_COPY(Z_OBJ_P(ZEND_THIS));
 }
+
+#if SLATE_HAS_CONTROLS
+PHP_METHOD(SlateScene, open)
+{
+    zend_object *d;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJ_OF_CLASS(d, sl_dialog_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    sl_anim_flush();
+    if (!sl_dialog_open(sl_obj(Z_OBJ_P(ZEND_THIS)), sl_obj(d))) {
+        RETURN_THROWS();
+    }
+    RETURN_OBJ_COPY(Z_OBJ_P(ZEND_THIS));
+}
+#endif
 
 PHP_METHOD(SlateScene, build)
 {
@@ -100,6 +147,12 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_scene_children, 0, 0, IS_STATIC,
     ZEND_ARG_VARIADIC_OBJ_INFO(0, e, Baremetal\\Slate\\Element, 0)
 ZEND_END_ARG_INFO()
 
+#if SLATE_HAS_CONTROLS
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_scene_open, 0, 1, IS_STATIC, 0)
+    ZEND_ARG_OBJ_INFO(0, d, Baremetal\\Slate\\Dialog, 0)
+ZEND_END_ARG_INFO()
+#endif
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_scene_void, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
@@ -110,6 +163,9 @@ ZEND_END_ARG_INFO()
 static const zend_function_entry scene_methods[] = {
     PHP_ME(SlateScene, add, arginfo_scene_children, ZEND_ACC_PUBLIC)
     PHP_ME(SlateScene, remove, arginfo_scene_children, ZEND_ACC_PUBLIC)
+#if SLATE_HAS_CONTROLS
+    PHP_ME(SlateScene, open, arginfo_scene_open, ZEND_ACC_PUBLIC)
+#endif
     PHP_ME(SlateScene, build, arginfo_scene_void, ZEND_ACC_PROTECTED)
     PHP_ME(SlateScene, onEnter, arginfo_scene_void, ZEND_ACC_PUBLIC)
     PHP_ME(SlateScene, onLeave, arginfo_scene_void, ZEND_ACC_PUBLIC)

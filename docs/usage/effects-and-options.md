@@ -1,12 +1,12 @@
 ---
 eyebrow: 'ext-slate · PHP API'
-lede:    'Gradients, drop shadows and group blur, each built only when the slate-effects option lists it; slate-images chooses the image formats decoded on the board; slate-debug builds the profiler.'
+lede:    'Gradients, drop shadows and group blur, each built only when the slate-effects option lists it; slate-images chooses the image formats decoded on the board; slate-controls builds the theme and the controls; slate-debug builds the profiler.'
 see_also:
   - { href: './elements.md', meta: 'API' }
   - { href: './images.md', meta: 'API' }
   - { href: './performance.md', meta: 'API' }
   - { href: './debug.md', meta: 'API' }
-prev: { label: 'Touch', href: './touch.md' }
+prev: { label: 'Theme', href: './theme.md' }
 next: { label: 'Performance', href: './performance.md' }
 ---
 
@@ -71,6 +71,7 @@ Set in `extra.baremetal.options` of the project:
 | --- | --- | --- |
 | `slate-effects` | a list of `gradients`, `shadows`, `blur` | all three |
 | `slate-images` | a list of `png` | `png` |
+| `slate-controls` | `true` or `false` | `true` |
 | `slate-debug` | `true` or `false` | `false` |
 
 An effect that is not in `slate-effects` is not compiled into the firmware (it saves its code), and the PHP
@@ -88,6 +89,13 @@ decoded on the board too; without it the PNG decoder is not compiled (about 15 t
 `.png` path throws `\ValueError` `png is not built in: add it to slate-images in composer.json` (in `new Image`,
 a write of `$src` and `Images::preload()`). A project whose images are all assets can leave it out:
 `"slate-images": []`.
+
+`slate-controls` builds the [theme](./theme.md) and the [controls](./controls.md). With `false` they are not
+compiled, and their classes are absent: `Theme`, `Size`, `Variant`, `Shape`, `ChoiceStyle`, `Control`, `Button`,
+`Toggle`, `Slider`, `Choice`, `SettingRow`, `Dialog`, `ProgressRing`, `ProgressBar`, `Spinner`, `StepList`,
+`Slate::theme()`, `Slate::$theme`, `Slate::toast()` and `Scene::open()` do not exist. A project that draws only
+with the elements saves their code: about 54 KB of firmware on the esp32 SDK (see
+[Performance](./performance.md#controls)). The rest of Slate works the same.
 
 `slate-debug` builds the profiler: the frames per second on screen and a line of timings per second on the
 console (see [Debug](./debug.md)). Without it the profiler is not compiled.

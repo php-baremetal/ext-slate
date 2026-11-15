@@ -28,6 +28,15 @@
  * Kept scenes. $keepScenes (int >= 0, default 2) and $keptBudget (?int KB, default null) are the limits of the
  * caches the scenes left keep (engine.h, Kept scenes: slate_engine_set_keep, at start and at every write); a scene
  * left keeps them unless its Scene::$keepCache is false (read at the show() that leaves it: the SHOW's keep).
+ *
+ * Theme (slate-controls). $theme (public readonly Theme) is a Theme of the defaults from the start; theme() replaces
+ * it until the first show(). The controls read it when they are made (php_slate_control.c).
+ *
+ * Toasts (slate-controls). toast() shows a pill above everything in a top layer of the Slate (engine.h, Top layer):
+ * the layer (a GROUP made the top layer) is made at the first toast; each toast is a group of parts without a PHP
+ * object (tg: tbg, tdot, ttext) with ids of their own (sl_id_new()), faded up (t1) and, after $ms, out (t2, chained
+ * after t1): internal tweens (SL_TWEEN_CTL, no TweenDone). The end of t2 frees the toast (sl_ctl_wait), as does a new
+ * toast, which replaces the one shown at once: nothing stays in the layer, caches included, once a toast is over.
  */
 #include <limits.h>
 #include <stdint.h>
@@ -42,9 +51,11 @@
 
 #include "bm_board.h"
 #include "bm_input.h"
+#include "controls.h"
 #include "display_panel.h"
 #include "event_bus_php.h"
 #include "php_slate.h"
+#include "raster.h"
 #include "slate_config.h"
 
 sl_state_t sl_g;
@@ -59,6 +70,13 @@ typedef struct {
     slate_engine_t *engine;
     bool hook;                                   /* display_vsync_hook() set */
     bool touching;                               /* sl_touch_start() done */
+    int sw, sh;                                  /* the screen */
+#if SLATE_HAS_CONTROLS
+    bool shown;                                  /* show() was called (the theme is fixed from then on) */
+    uint32_t layer;                              /* the toasts' top layer (0: not made yet) */
+    uint32_t tg, tparts[3];                      /* the toast shown: its group and parts (0: none) */
+    uint32_t tend;                               /* its fade-out (t2), whose end frees it */
+#endif
     zend_class_entry *touch_ce[TOUCH_CLASSES];   /* the touch event classes watched */
     zend_object std;
 } sl_slate_t;
@@ -69,6 +87,9 @@ static sl_slate_t *slate_of(zend_object *o)
 }
 
 static zend_property_info *s_keep_pi, *s_budget_pi;   /* Slate::$keepScenes, Slate::$keptBudget */
+#if SLATE_HAS_CONTROLS
+static zend_property_info *s_theme_pi;                /* Slate::$theme */
+#endif
 
 /* The limits of the kept scenes to the engine: $keepScenes, and $keptBudget in bytes (null: none of its own; 0 KB:
    nothing kept). */
@@ -274,6 +295,12 @@ static void sl_stop(sl_slate_t *s)
                              err ? err : "the panel did not finish a band");
         }
         sl_anim_engine(NULL);   /* after the stop: the listener ran on the engine's task; no tween will end */
+        sl_due_stop();          /* HoldDue: no more Hold, no more ends of the controls' animations */
+#if SLATE_HAS_CONTROLS
+        sl_ctl_due_stop();      /* the waiters go (no PHP call); the toast with its engine */
+        s->layer = s->tg = s->tend = 0;
+        memset(s->tparts, 0, sizeof s->tparts);
+#endif
         display_release(s->display);
     }
     zend_object *o;
@@ -343,6 +370,8 @@ static bool sl_start(sl_slate_t *s, zend_object *display, zend_object *touch)
     GC_ADDREF(display);
     s->display = display;
     s->engine = e;
+    s->sw = ops->width;
+    s->sh = ops->height;
     s->hook = has_te;
     sl_g.engine = e;
     sl_g.slate = &s->std;
@@ -351,6 +380,16 @@ static bool sl_start(sl_slate_t *s, zend_object *display, zend_object *touch)
     }
     sl_idle_use(SL_IDLE_SLATE, true);
     sl_keep_apply(s);
+#if SLATE_HAS_CONTROLS
+    zval *th = OBJ_PROP(&s->std, s_theme_pi->offset);
+    zval_ptr_dtor(th);
+    sl_theme_default(th);   /* the neutral theme until theme() */
+    /* HoldDue: the ends of the controls' animations wake the PHP task through it (and the Hold, with a touch) */
+    if (!sl_due_start(touch != NULL)) {
+        sl_stop(s);
+        return false;
+    }
+#endif
     if (touch) {
         GC_ADDREF(touch);
         s->touch = touch;
@@ -386,6 +425,27 @@ zend_object *sl_shown_scene(void)
 {
     return sl_g.slate ? slate_of(sl_g.slate)->scene : NULL;
 }
+
+bool sl_screen(int *w, int *h)
+{
+    if (!sl_g.slate || !slate_of(sl_g.slate)->engine) {
+        return false;
+    }
+    *w = slate_of(sl_g.slate)->sw;
+    *h = slate_of(sl_g.slate)->sh;
+    return true;
+}
+
+#if SLATE_HAS_CONTROLS
+zend_object *sl_theme_current(void)
+{
+    if (!sl_g.slate) {
+        return NULL;
+    }
+    zval *th = OBJ_PROP(sl_g.slate, s_theme_pi->offset);
+    return Z_TYPE_P(th) == IS_OBJECT ? Z_OBJ_P(th) : NULL;
+}
+#endif
 
 static sl_slate_t *running(zval *this_ptr)
 {
@@ -572,6 +632,9 @@ PHP_METHOD(SlateSlate, show)
     if (!sl_trans_settle() || !s->engine) {
         RETURN_THROWS();
     }
+#if SLATE_HAS_CONTROLS
+    s->shown = true;   /* the theme is fixed from a show() that got this far */
+#endif
     if (s->scene == scene) {
         sl_deliver();
         return;
@@ -585,6 +648,12 @@ PHP_METHOD(SlateSlate, show)
     if (EG(exception) || !s->engine) {
         RETURN_THROWS();
     }
+#if SLATE_HAS_CONTROLS
+    /* the dialogs of the scene left that are closing end now (their animation would pause with the scene) */
+    if (s->scene && (!sl_dialog_leave(sl_obj(s->scene)) || !s->engine)) {
+        RETURN_THROWS();
+    }
+#endif
     if (trans && !sl_trans_reserve()) {
         RETURN_THROWS();   /* again: an onCancel() that ran a transition of its own used the node (else at once) */
     }
@@ -672,12 +741,229 @@ PHP_METHOD(SlateSlate, commit)
     }
 }
 
+#if SLATE_HAS_CONTROLS
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_slate_theme, 0, 1, IS_STATIC, 0)
+    ZEND_ARG_OBJ_INFO(0, theme, Baremetal\\Slate\\Theme, 0)
+ZEND_END_ARG_INFO()
+
+/* theme(): the theme of the controls made from now on, before the first show(). */
+PHP_METHOD(SlateSlate, theme)
+{
+    zend_object *theme;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_OBJ_OF_CLASS(theme, sl_theme_ce)
+    ZEND_PARSE_PARAMETERS_END();
+    sl_slate_t *s = running(ZEND_THIS);
+    if (!s) {
+        RETURN_THROWS();
+    }
+    if (s->shown) {
+        zend_throw_error(NULL, "the theme is set before the first show()");
+        RETURN_THROWS();
+    }
+    zval *slot = OBJ_PROP(&s->std, s_theme_pi->offset);
+    zval old;
+    ZVAL_COPY_VALUE(&old, slot);
+    ZVAL_OBJ_COPY(slot, theme);
+    zval_ptr_dtor(&old);
+    RETURN_OBJ_COPY(&s->std);
+}
+#endif
+
+#if SLATE_HAS_CONTROLS
+/* ---- toasts ---- */
+
+static bool cmd_new(uint32_t id, slate_el_kind_t kind)
+{
+    slate_cmd_t c = { .kind = SLATE_CMD_NEW, .id = id, .el = kind };
+    return sl_push(&c);
+}
+
+static bool cmd_set(uint32_t id, slate_prop_t prop, slate_value_t v)
+{
+    slate_cmd_t c = { .kind = SLATE_CMD_SET, .id = id, .prop = prop, .v = v };
+    return sl_push(&c);
+}
+
+static bool cmd_add(uint32_t id, uint32_t parent)
+{
+    slate_cmd_t c = { .kind = SLATE_CMD_ADD, .id = id, .parent = parent };
+    return sl_push(&c);
+}
+
+/* The toast shown goes: FREE of its parts and its group (its tweens stop with it); its waiter too. false with an
+   exception (what is left stays until the Slate stops). */
+static bool toast_drop(sl_slate_t *s)
+{
+    if (!s->tg) {
+        return true;
+    }
+    sl_ctl_unwait(s->tend);
+    uint32_t ids[4] = { s->tparts[0], s->tparts[1], s->tparts[2], s->tg };
+    s->tg = s->tend = 0;
+    memset(s->tparts, 0, sizeof s->tparts);
+    for (int i = 0; i < 4; i++) {
+        slate_cmd_t c = { .kind = SLATE_CMD_FREE, .id = ids[i] };
+        if (!sl_push(&c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The end of a toast's fade-out (sl_ctl_due_run): it goes. */
+static void toast_due(zend_object *obj, uint32_t id, bool stopped)
+{
+    (void)obj;
+    if (stopped || !sl_g.slate) {
+        return;   /* the Slate stopped: sl_stop() forgets the toast */
+    }
+    sl_slate_t *s = slate_of(sl_g.slate);
+    if (s->engine && s->tg && s->tend == id) {
+        s->tend = 0;   /* its waiter ran */
+        toast_drop(s);
+    }
+}
+
+static bool tween_group(uint32_t el, uint32_t id, uint32_t after, int ms, int delay, int n,
+                        const slate_tween_prop_t *props)
+{
+    slate_tween_spec_t spec;
+    memset(&spec, 0, sizeof spec);
+    spec.tween = id;
+    spec.after = after;
+    spec.ms = ms;
+    spec.delay_ms = delay;
+    spec.ease = SLATE_EASE_OUT_CUBIC;
+    spec.n = (uint8_t)n;
+    memcpy(spec.props, props, (size_t)n * sizeof *props);
+    slate_cmd_t c = { .kind = SLATE_CMD_TWEEN, .id = el, .data = &spec };
+    return sl_push(&c);
+}
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_slate_toast, 0, 1, IS_STATIC, 0)
+    ZEND_ARG_TYPE_INFO(0, text, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, ms, IS_LONG, 0, "2500")
+ZEND_END_ARG_INFO()
+
+/* toast(): a pill above everything for 300 + ms + 300 ms; a new one replaces the one shown at once. */
+PHP_METHOD(SlateSlate, toast)
+{
+    zend_string *text;
+    zend_long ms = 2500;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STR(text)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(ms)
+    ZEND_PARSE_PARAMETERS_END();
+    sl_slate_t *s = running(ZEND_THIS);
+    if (!s || !sl_check()) {
+        RETURN_THROWS();
+    }
+    if (ms < 500) {
+        zend_value_error("%s::toast(): ms must be at least 500", ZSTR_VAL(sl_slate_ce->name));
+        RETURN_THROWS();
+    }
+    if (ms > INT32_MAX - 1000) {
+        ms = INT32_MAX - 1000;   /* a delay the engine takes (and the waiter's time) */
+    }
+    sl_anim_flush();
+    zend_object *tho = sl_theme_current();
+    if (!tho) {
+        RETURN_THROWS();   /* never: a running Slate has its theme */
+    }
+    const sl_theme_t *th = sl_theme_of(tho);
+    const char *str = ZSTR_VAL(text);
+    int tw = 0, lh = 0;
+    if (th->font) {
+        slate_rect_t r = slate_text_bbox(0, 0, str, th->font, SLATE_ALIGN_LEFT, 0);
+        tw = r.x1 - r.x0;
+        lh = slate_text_bbox(0, 0, " ", th->font, SLATE_ALIGN_LEFT, 0).y1;
+    }
+    /* the pill at most the screen's width - 64: a longer text is cut (TEXT's max width) */
+    int tmax = s->sw - 64 - (SLATE_CTL_TOAST_PAD + SLATE_CTL_TOAST_DOT + SLATE_CTL_TOAST_GAP + SLATE_CTL_TOAST_PAD);
+    if (tmax < 1) {
+        tmax = 1;
+    }
+    if (tw > tmax) {
+        tw = tmax;
+    }
+    slate_ctl_box_t b = slate_ctl_toast(s->sw, s->sh, tw);
+    if (!s->layer) {
+        uint32_t layer = sl_id_new();
+        slate_cmd_t top = { .kind = SLATE_CMD_TOP, .id = layer };
+        if (!cmd_new(layer, SLATE_EL_GROUP) || !sl_push(&top)) {
+            RETURN_THROWS();
+        }
+        s->layer = layer;
+    }
+    if (!toast_drop(s)) {
+        RETURN_THROWS();
+    }
+    uint32_t tg = sl_id_new(), bg = sl_id_new(), dot = sl_id_new(), tx = sl_id_new();
+    /* recorded first: a refusal midway leaves them to the next toast_drop() */
+    s->tg = tg;
+    s->tparts[0] = bg;
+    s->tparts[1] = dot;
+    s->tparts[2] = tx;
+    const float h = SLATE_CTL_TOAST_H, dot_r = SLATE_CTL_TOAST_DOT / 2;
+    bool ok = cmd_new(tg, SLATE_EL_GROUP) && cmd_set(tg, SLATE_PROP_X, slate_v_num(b.x))
+              && cmd_set(tg, SLATE_PROP_Y, slate_v_num((float)(b.y + SLATE_CTL_DIALOG_RISE)))
+              && cmd_set(tg, SLATE_PROP_OPACITY, slate_v_num(0))
+              && cmd_new(bg, SLATE_EL_ROUNDRECT) && cmd_set(bg, SLATE_PROP_W, slate_v_num(b.w))
+              && cmd_set(bg, SLATE_PROP_H, slate_v_num(h)) && cmd_set(bg, SLATE_PROP_RADIUS, slate_v_num(h / 2))
+              && cmd_set(bg, SLATE_PROP_FILL, slate_v_color(sl_rgb(th->c[SL_T_SURFACE])))
+              && cmd_set(bg, SLATE_PROP_BORDER, slate_v_num(1))
+              && cmd_set(bg, SLATE_PROP_BORDER_COLOR, slate_v_color(sl_rgb(th->c[SL_T_BORDER_STRONG])))
+#if SLATE_HAS_SHADOWS
+              && cmd_set(bg, SLATE_PROP_SHADOW, slate_v_shadow(0, 10, sl_blur_radius(30), 0x80000000u))
+#endif
+              && cmd_new(dot, SLATE_EL_CIRCLE)
+              && cmd_set(dot, SLATE_PROP_X, slate_v_num(SLATE_CTL_TOAST_PAD + dot_r))
+              && cmd_set(dot, SLATE_PROP_Y, slate_v_num(h / 2)) && cmd_set(dot, SLATE_PROP_R, slate_v_num(dot_r))
+              && cmd_set(dot, SLATE_PROP_FILL, slate_v_color(sl_rgb(th->c[SL_T_ACCENT])))
+              && cmd_new(tx, SLATE_EL_TEXT)
+              && cmd_set(tx, SLATE_PROP_X,
+                         slate_v_num(SLATE_CTL_TOAST_PAD + SLATE_CTL_TOAST_DOT + SLATE_CTL_TOAST_GAP))
+              && cmd_set(tx, SLATE_PROP_Y, slate_v_num((float)((SLATE_CTL_TOAST_H - lh) / 2)))
+              && cmd_set(tx, SLATE_PROP_TEXT, slate_v_text(str)) && cmd_set(tx, SLATE_PROP_FONT, slate_v_font(th->font))
+              && cmd_set(tx, SLATE_PROP_MAX_WIDTH, slate_v_num((float)tmax))
+              && cmd_set(tx, SLATE_PROP_COLOR, slate_v_color(sl_rgb(th->c[SL_T_TEXT])))
+              && cmd_add(bg, tg) && cmd_add(dot, tg) && cmd_add(tx, tg) && cmd_add(tg, s->layer);
+    if (!ok) {
+        RETURN_THROWS();
+    }
+    uint32_t t1 = sl_tween_ctl_id(false), t2 = t1 ? sl_tween_ctl_id(true) : 0;
+    if (!t2) {
+        RETURN_THROWS();
+    }
+    slate_tween_prop_t up[2] = {
+        { .prop = SLATE_PROP_OPACITY, .type = SLATE_VAL_NUM, .to.num = 1 },
+        { .prop = SLATE_PROP_Y, .type = SLATE_VAL_NUM, .to.num = b.y },
+    };
+    slate_tween_prop_t out = { .prop = SLATE_PROP_OPACITY, .type = SLATE_VAL_NUM, .to.num = 0 };
+    if (!tween_group(tg, t1, 0, SLATE_CTL_DIALOG_MS, 0, 2, up)
+        || !tween_group(tg, t2, t1, SLATE_CTL_DIALOG_MS, (int)ms, 1, &out)) {
+        RETURN_THROWS();
+    }
+    s->tend = t2;
+    if (!sl_ctl_wait(t2, NULL, toast_due, SLATE_CTL_DIALOG_MS + (int)ms + SLATE_CTL_DIALOG_MS)) {
+        RETURN_THROWS();
+    }
+    RETURN_OBJ_COPY(&s->std);
+}
+#endif
+
 static const zend_function_entry slate_methods[] = {
     PHP_ME(SlateSlate, __construct, arginfo_slate_ctor, ZEND_ACC_PUBLIC)
     PHP_ME(SlateSlate, onboard, arginfo_slate_onboard, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     PHP_ME(SlateSlate, show, arginfo_slate_show, ZEND_ACC_PUBLIC)
     PHP_ME(SlateSlate, scene, arginfo_slate_scene, ZEND_ACC_PUBLIC)
     PHP_ME(SlateSlate, commit, arginfo_slate_commit, ZEND_ACC_PUBLIC)
+#if SLATE_HAS_CONTROLS
+    PHP_ME(SlateSlate, theme, arginfo_slate_theme, ZEND_ACC_PUBLIC)
+    PHP_ME(SlateSlate, toast, arginfo_slate_toast, ZEND_ACC_PUBLIC)
+#endif
     PHP_FE_END
 };
 
@@ -714,7 +1000,7 @@ static HashTable *slate_gc(zend_object *obj, zval **table, int *n)
         }
     }
     zend_get_gc_buffer_use(buf, table, n);
-    return zend_std_get_properties(obj);   /* $keepScenes, $keptBudget (no object in them) and dynamic ones */
+    return zend_std_get_properties(obj);   /* $keepScenes, $keptBudget, $theme and dynamic ones */
 }
 
 /* $keepScenes and $keptBudget: PHP's typed write, then the range (the old value back on a refusal), then the engine.
@@ -786,6 +1072,10 @@ PHP_MINIT_FUNCTION(slate)
     sl_anim_register();
     sl_scroll_register();
     sl_touch_register();
+#if SLATE_HAS_CONTROLS
+    sl_theme_register();
+    sl_controls_register();
+#endif
 
     memcpy(&slate_handlers, zend_get_std_object_handlers(), sizeof slate_handlers);
     slate_handlers.offset = XtOffsetOf(sl_slate_t, std);
@@ -810,6 +1100,14 @@ PHP_MINIT_FUNCTION(slate)
     ZVAL_NULL(&dv);
     s_budget_pi = zend_declare_typed_property(sl_slate_ce, zend_string_init_interned("keptBudget", 10, 1), &dv,
                                               ZEND_ACC_PUBLIC, NULL, (zend_type)ZEND_TYPE_INIT_CODE(IS_LONG, 1, 0));
+#if SLATE_HAS_CONTROLS
+    ZVAL_UNDEF(&dv);
+    static const char theme_cls[] = "Baremetal\\Slate\\Theme";
+    zend_string *theme_name = zend_string_init_interned(theme_cls, sizeof theme_cls - 1, 1);
+    s_theme_pi = zend_declare_typed_property(sl_slate_ce, zend_string_init_interned("theme", 5, 1), &dv,
+                                             ZEND_ACC_PUBLIC | ZEND_ACC_READONLY, NULL,
+                                             (zend_type)ZEND_TYPE_INIT_CLASS(theme_name, 0, 0));
+#endif
     return SUCCESS;
 }
 
@@ -839,6 +1137,7 @@ PHP_MINFO_FUNCTION(slate)
     php_info_print_table_row(2, "blur", SLATE_HAS_BLUR ? "built" : "not built");
     php_info_print_table_row(2, "png", SLATE_HAS_PNG ? "built" : "not built");
     php_info_print_table_row(2, "debug", SLATE_DEBUG ? "on" : "off");
+    php_info_print_table_row(2, "controls", SLATE_HAS_CONTROLS ? "built" : "not built");
     php_info_print_table_end();
 }
 
@@ -860,6 +1159,6 @@ zend_module_entry slate_module_entry = {
     NULL,
     PHP_RSHUTDOWN(slate),
     PHP_MINFO(slate),
-    "1.2.0",
+    "1.3.0",
     STANDARD_MODULE_PROPERTIES
 };

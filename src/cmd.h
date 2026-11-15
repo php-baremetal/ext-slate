@@ -52,6 +52,16 @@ typedef enum {
                             its mask moves there in a tween (mask 0: none, a SET jumps again) */
     SLATE_CMD_SCROLL,    /* id: a GROUP; data: a slate_scroll_cmd_t (required): a touch of a scroll, a jump, or its
                             set-up (engine.h, Scrolls) */
+    SLATE_CMD_TOP,       /* id: a GROUP (with no parent) that becomes the top layer, 0: none. It goes under the screen
+                            root above the scene shown (above both scenes of a transition), and stays above them
+                            through every SHOW and transition (under the slate-debug counter); the top layer it
+                            replaces is detached and stays alive; a TOP of the top layer itself changes nothing. A
+                            REMOVE of the top layer is refused (cmd_errors), a FREE detaches it first. Its elements
+                            are shown (their tweens run) and never in the hit table (engine.h, Top layer) */
+    SLATE_CMD_PREPARE,   /* id: an element on screen: the caches the next frame would build for it and its subtree
+                            are built when the command is applied (slate_compose_prepare), and the tweens that start
+                            after it in the batch take the time it ends as their start (engine.h, Tweens); not on
+                            screen: nothing */
 } slate_cmd_kind_t;
 
 #define SLATE_TWEEN_PROPS_MAX 12   /* properties of one tween (a ROUNDRECT animates 9) */

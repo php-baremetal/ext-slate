@@ -217,6 +217,9 @@ struct slate_engine {
     size_t keep_budget;            /* 0: none of its own */
     size_t kept_bytes;             /* their cache memory, counted when the list changes */
     uint32_t kept_dropped;
+    int64_t prep_us;               /* the end of a PREPARE of this wake-up (the start of the tweens pushed after it), 0 */
+    uint32_t orphan[SLATE_ORPHANS];  /* ids of elements taken out of the screen with their caches, oldest first */
+    int orphan_n;
     uint32_t reclaims;             /* reclaim requests served */
     sc_t *scs;                     /* the scrolls driven */
     int sc_run;                    /* scrolls that need ticks (shown, moving or bars fading) */
@@ -226,6 +229,7 @@ struct slate_engine {
     bool hit_due;                  /* the table is to build again (after the frame that comes, if one comes) */
     int64_t hit_retry_us;          /* after a build refused memory: the next try not before this (0: none due) */
     int hit_n;                     /* entries of the table published */
+    slate_el_t *top;               /* the top layer (engine.h, Top layer), NULL: none */
 #if SLATE_DEBUG
     slate_debug_t dbg;
     slate_el_t *ovl, *ovl_bg, *ovl_text;
@@ -285,10 +289,13 @@ static void ext_free(void *p)
 
 static bool kept_evict(slate_engine_t *e);
 static void kept_recount(slate_engine_t *e);
+static size_t orphan_bytes(slate_engine_t *e);
+static bool spare_evict(slate_engine_t *e);
 
 /* Element caches: external RAM, refused past the budget. Each block carries its size in front (8 bytes, so the
-   block stays 8-byte aligned). The caches of the scenes left go first, oldest first, when the block does not fit
-   (in the budget, or in external RAM) and would fit without them (engine.h, Kept scenes). */
+   block stays 8-byte aligned). The caches of the elements taken out of the screen, then those of the scenes left,
+   go first, oldest first, when the block does not fit (in the budget, or in external RAM) and would fit without them
+   (engine.h, Kept scenes). */
 static void *cache_alloc(void *ctx, size_t n)
 {
     slate_engine_t *e = ctx;
@@ -298,19 +305,20 @@ static void *cache_alloc(void *ctx, size_t n)
     }
     if (e->cache_bytes > budget - n) {
         kept_recount(e);   /* a write to a kept scene may have dropped caches since the list changed */
-        size_t kept = e->kept_bytes < e->cache_bytes ? e->kept_bytes : e->cache_bytes;
+        size_t kept = e->kept_bytes + orphan_bytes(e);
+        kept = kept < e->cache_bytes ? kept : e->cache_bytes;
         if (e->cache_bytes - kept > budget - n) {
             return NULL;   /* would not fit with every kept cache gone: they stay */
         }
         while (e->cache_bytes > budget - n) {
-            if (!kept_evict(e)) {
+            if (!spare_evict(e)) {
                 return NULL;
             }
         }
     }
     uint8_t *p;
     while (!(p = bm_hal_alloc(n + CACHE_HDR, BM_HAL_MEM_EXTERNAL_ONLY))) {   /* never internal RAM */
-        if (!kept_evict(e)) {
+        if (!spare_evict(e)) {
             return NULL;
         }
     }
@@ -744,6 +752,24 @@ static void dirty_all(slate_engine_t *e)
     e->scene_dirty = true;
 }
 
+/* A tween's values into el: the scene counts as changed only when they dirtied pixels. What a tween moves without
+   drawing (under a hidden or transparent ancestor, outside a clip) has no hit entry before or after the write, so
+   the hit table is not due for it (a spinner turning out of a scroll's view, a toast holding its value). */
+static void tw_write(slate_engine_t *e, slate_el_t *el, const slate_tween_prop_t *v, int n)
+{
+    if (!shown(e, el)) {
+        slate_tween_write(el, v, n, NULL, e->w, e->h);
+        return;
+    }
+    slate_dirty_t td;
+    td.n = 0;
+    slate_tween_write(el, v, n, &td, e->w, e->h);
+    for (int i = 0; i < td.n; i++) {
+        slate_dirty_add(&e->dirty, td.r[i], e->w, e->h);
+    }
+    e->scene_dirty |= td.n > 0;
+}
+
 /* ---- the hit table (engine.h, Touch) ---- */
 
 /* A change of el (a command): when touchables of the scene shown are in its subtree, the table is due again (the
@@ -850,6 +876,16 @@ static void overlay_top(slate_engine_t *e)
 }
 #endif
 
+/* The top layer back on top of the screen's children (after a scene went under the screen root), no dirty: the
+   caller dirties the screen. Then overlay_top() puts the FPS counter above it. */
+static void top_raise(slate_engine_t *e)
+{
+    if (e->top) {
+        slate_el_remove(e->top, NULL, e->w, e->h);
+        slate_el_add(e->screen, e->top, NULL, e->w, e->h);
+    }
+}
+
 static void scratch_drop(slate_engine_t *e);
 static void scratch_trim(slate_engine_t *e, size_t want, int64_t now);
 static void tw_forget(slate_engine_t *e, slate_el_t *el);
@@ -870,6 +906,7 @@ static int64_t pulse_us(const slate_engine_t *e);
 static int64_t batch_us(slate_engine_t *e)
 {
     int64_t t = e->apply_pulse && e->has_te ? pulse_us(e) : now_us();
+    t = t < e->prep_us ? e->prep_us : t;   /* after a PREPARE of this wake-up: the time it ended */
     return t < e->tw_last_us ? e->tw_last_us : t;
 }
 
@@ -977,6 +1014,109 @@ static bool kept_evict(slate_engine_t *e)
     return true;
 }
 
+/* Orphans (engine.h, Kept scenes): elements that REMOVE took out of the screen with their caches. They keep them, so
+   one put back (a dialog opened again) builds nothing; but no scene holds them, so they go first when a cache does
+   not fit. One that is back on screen, in a kept scene or in a transition, or freed, is no orphan any more. */
+static bool orphan_now(slate_engine_t *e, uint32_t id, slate_el_t **out)
+{
+    slate_el_t *el = map_find(e, id);
+    if (!el) {
+        return false;
+    }
+    const slate_el_t *r = el;
+    while (r->parent) {
+        r = r->parent;
+    }
+    *out = el;
+    return r != e->screen && r != e->scene && kept_find(e, r) < 0 && !(e->tr.on && (r == e->tr.p.from || r == e->tr.p.to));
+}
+
+static void orphan_note(slate_engine_t *e, slate_el_t *el, uint32_t id)
+{
+    if (!tree_bytes(el)) {
+        return;   /* nothing cached under it */
+    }
+    for (int i = 0; i < e->orphan_n; i++) {
+        if (e->orphan[i] == id) {
+            return;
+        }
+    }
+    if (e->orphan_n == SLATE_ORPHANS) {
+        orphan_bytes(e);   /* those that are no orphans any more leave first (moved, freed) */
+    }
+    if (e->orphan_n == SLATE_ORPHANS) {   /* still full: the oldest drops its caches now */
+        slate_el_t *old;
+        if (orphan_now(e, e->orphan[0], &old)) {
+            slate_cache_drop_tree(old);
+        }
+        e->orphan_n--;
+        memmove(&e->orphan[0], &e->orphan[1], (size_t)e->orphan_n * sizeof e->orphan[0]);
+    }
+    e->orphan[e->orphan_n++] = id;
+}
+
+/* Whether an ancestor of el is a listed orphan (its caches count with that one's). */
+static bool orphan_inside(slate_engine_t *e, const slate_el_t *el)
+{
+    for (const slate_el_t *a = el->parent; a; a = a->parent) {
+        for (int i = 0; i < e->orphan_n; i++) {
+            if (map_find(e, e->orphan[i]) == a) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* The cache memory of the orphans that still are (the others leave the list), each tree counted once. */
+static size_t orphan_bytes(slate_engine_t *e)
+{
+    int k = 0;
+    for (int i = 0; i < e->orphan_n; i++) {
+        slate_el_t *el;
+        if (orphan_now(e, e->orphan[i], &el)) {
+            e->orphan[k++] = e->orphan[i];
+        }
+    }
+    e->orphan_n = k;
+    size_t n = 0;
+    for (int i = 0; i < e->orphan_n; i++) {
+        slate_el_t *el = map_find(e, e->orphan[i]);
+        if (el && !orphan_inside(e, el)) {
+            n += tree_bytes(el);
+        }
+    }
+    return n;
+}
+
+/* An element added back (a move: REMOVE then ADD, Scene::add() raising the dialogs) is no orphan: off the list. */
+static void orphan_forget(slate_engine_t *e, uint32_t id)
+{
+    for (int i = 0; i < e->orphan_n; i++) {
+        if (e->orphan[i] == id) {
+            e->orphan_n--;
+            memmove(&e->orphan[i], &e->orphan[i + 1], (size_t)(e->orphan_n - i) * sizeof e->orphan[0]);
+            return;
+        }
+    }
+}
+
+/* The oldest orphan drops its caches, else the oldest kept scene; false when neither has any. */
+static bool spare_evict(slate_engine_t *e)
+{
+    while (e->orphan_n > 0) {
+        uint32_t id = e->orphan[0];
+        e->orphan_n--;
+        memmove(&e->orphan[0], &e->orphan[1], (size_t)e->orphan_n * sizeof e->orphan[0]);
+        slate_el_t *el;
+        if (orphan_now(e, id, &el) && tree_bytes(el)) {
+            slate_cache_drop_tree(el);
+            return true;
+        }
+    }
+    return kept_evict(e);
+}
+
 /* Within the limits: the oldest go. */
 static void kept_trim(slate_engine_t *e)
 {
@@ -1001,8 +1141,8 @@ static void keep_sync(slate_engine_t *e)
     }
     if (f & KEEP_RECLAIM) {   /* an image needs the memory: every kept cache goes, then the loader is told */
         uint32_t req = __atomic_load_n(&e->reclaim_req, __ATOMIC_SEQ_CST);   /* even */
-        uint32_t ans = req | (e->kept_n > 0 ? 1u : 0u);   /* bit 0: something was freed */
-        while (kept_evict(e)) {
+        uint32_t ans = req | (e->kept_n > 0 || orphan_bytes(e) > 0 ? 1u : 0u);   /* bit 0: something was freed */
+        while (spare_evict(e)) {
         }
         e->reclaims++;
         kept_publish(e);
@@ -1061,6 +1201,7 @@ static void tr_finish(slate_engine_t *e)
     slate_pair_end(&e->tr.p);
     e->tr.on = false;
     store(&e->tr_flag, 0);
+    top_raise(e);
 #if SLATE_DEBUG
     overlay_top(e);
 #endif
@@ -1160,6 +1301,7 @@ static bool apply_show(slate_engine_t *e, const slate_cmd_t *c)
             }
         }
         e->scene = s;
+        top_raise(e);   /* above the scene (above both layers of a transition) */
 #if SLATE_DEBUG
         overlay_top(e);
 #endif
@@ -1192,6 +1334,9 @@ static bool apply_free(slate_engine_t *e, uint32_t id)
         slate_el_remove(el, NULL, e->w, e->h);
         e->scene = NULL;
         dirty_all(e);
+    }
+    if (el == e->top) {
+        e->top = NULL;   /* detached below with the dirty of its box */
     }
     int ki = kept_top(e, el);
     if (ki >= 0) {   /* in a kept scene: the caches under it go first (its children leave without them) */
@@ -1358,7 +1503,7 @@ static void tw_kill(slate_engine_t *e, tw_t *en, bool to_end)
                 tw_from(c);
             }
             slate_tween_final(c->t, v, &n);
-            slate_tween_write(c->el, v, n, dirty_for(e, c->el), e->w, e->h);
+            tw_write(e, c->el, v, n);
         }
         c->dead = true;
         e->tw_live--;
@@ -1416,9 +1561,20 @@ static void tw_count(slate_engine_t *e)
     bm_hal_lock_exit(e->lock);
 }
 
+/* el or an ancestor has visible false. Only visible: an opacity of 0 does not count (a fade-in from 0 must run). */
+static bool unseen(const slate_el_t *el)
+{
+    for (; el; el = el->parent) {
+        if (!el->visible) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* After the batches that changed the scene's shape: a tween whose element had a REMOVE and has no parent now stops
-   (a REMOVE and an ADD in one batch move it); the tweens of elements no longer shown pause, those shown again
-   resume, at now. */
+   (a REMOVE and an ADD in one batch move it); the tweens of elements no longer shown (out of the screen, or visible
+   false on the element or an ancestor) pause, those shown again resume, at now. */
 static void tw_sync(slate_engine_t *e, int64_t now)
 {
     if (now < e->tw_last_us) {
@@ -1437,7 +1593,7 @@ static void tw_sync(slate_engine_t *e, int64_t now)
         if (en->dead) {
             continue;
         }
-        bool vis = shown(e, en->el);
+        bool vis = shown(e, en->el) && !unseen(en->el);
         if (!vis && !en->hidden) {
             slate_tween_pause(en->t, now);
             en->hidden = true;
@@ -1562,7 +1718,7 @@ static void tw_tick(slate_engine_t *e, int64_t now)
             int n;
             bool done = slate_tween_sample(c->t, now, v, &n);
             if (n > 0) {
-                slate_tween_write(c->el, v, n, dirty_for(e, c->el), e->w, e->h);
+                tw_write(e, c->el, v, n);
                 wrote = true;
             }
             if (!done) {
@@ -2281,6 +2437,51 @@ static bool apply_scroll(slate_engine_t *e, const slate_cmd_t *c)
     return true;
 }
 
+/* PREPARE: the caches of el (on screen) and its subtree built now (slate_compose_prepare); the tweens pushed after it
+   start once that is done (batch_us), so an animation does not lose its first steps to the frame that would have built
+   them. A panel that failed: nothing is built. */
+static bool apply_prepare(slate_engine_t *e, uint32_t id)
+{
+    slate_el_t *el = map_find(e, id);
+    if (!el) {
+        return false;
+    }
+    if (!shown(e, el) || failed(e)) {
+        return true;
+    }
+    slate_stats_t st;
+    slate_compose_prepare(el, &e->target, &st);
+    int64_t now = now_us();
+    scratch_trim(e, st.scratch_want, now);
+    e->prep_us = now;
+    return true;
+}
+
+/* TOP: the group id becomes the top layer (0: none); the one there was is detached (it stays alive). */
+static bool apply_top(slate_engine_t *e, uint32_t id)
+{
+    slate_el_t *el = id ? map_find(e, id) : NULL;
+    if (id && (!el || el->kind != SLATE_EL_GROUP || (el->parent && el != e->top))) {
+        return false;   /* unknown, not a group, or not free (the scene, a child, a root of a transition) */
+    }
+    if (el == e->top) {
+        return true;    /* the top layer already (or none, again) */
+    }
+    if (e->top) {
+        slate_el_remove(e->top, dirty_for(e, e->top), e->w, e->h);
+    }
+    e->top = el;
+    if (el) {
+        kept_take(e, el);   /* a kept root shown on top: no longer a scene left */
+        slate_el_add(e->screen, el, dirty_for(e, e->screen), e->w, e->h);
+#if SLATE_DEBUG
+        overlay_top(e);
+#endif
+    }
+    e->tw_check |= e->tws != NULL;   /* its tweens resume, those of the one detached pause */
+    return true;
+}
+
 static bool apply(slate_engine_t *e, const slate_cmd_t *c)
 {
     slate_el_t *el, *g;
@@ -2322,6 +2523,9 @@ static bool apply(slate_engine_t *e, const slate_cmd_t *c)
         } else {
             ok = el && slate_el_set(el, c->prop, &c->v, dirty_for(e, el), e->w, e->h);
         }
+        if (c->prop == SLATE_PROP_VISIBLE) {
+            e->tw_check |= e->tws != NULL;   /* the tweens under el pause (hidden) or resume (shown): tw_sync() */
+        }
         sc_t *sc;
         if (ok && c->prop == SLATE_PROP_SCROLL && e->scs && (sc = sc_of(e, el)) != NULL) {
             sc->tween = 0;   /* a new physics state (or none): what ran is forgotten */
@@ -2339,6 +2543,7 @@ static bool apply(slate_engine_t *e, const slate_cmd_t *c)
         if (!g || !el || !slate_el_add(g, el, dirty_for(e, g), e->w, e->h)) {
             return false;
         }
+        orphan_forget(e, c->id);
         hit_touch(e, el);
         kept_take(e, el);   /* a kept root inside a group: no longer a scene left */
         if (kept_top(e, g) >= 0) {   /* caches brought into a kept scene count in its bytes */
@@ -2347,8 +2552,8 @@ static bool apply(slate_engine_t *e, const slate_cmd_t *c)
         return true;
     case SLATE_CMD_REMOVE:
         el = map_find(e, c->id);
-        if (!el || el->parent == e->screen || el == e->scene || (e->tr.on && el == e->tr.p.from)) {
-            return false;   /* a scene root leaves the screen through SHOW */
+        if (!el || el->parent == e->screen || el == e->scene || el == e->top || (e->tr.on && el == e->tr.p.from)) {
+            return false;   /* a scene root leaves the screen through SHOW, the top layer through TOP */
         }
         hit_touch(e, el);
         bool in_kept = el->parent && kept_top(e, el) >= 0;
@@ -2359,6 +2564,8 @@ static bool apply(slate_engine_t *e, const slate_cmd_t *c)
         if (in_kept) {
             kept_recount(e);
             kept_publish(e);
+        } else {
+            orphan_note(e, el, c->id);
         }
         if (e->tws) {
             for (tw_t *en = e->tws; en && el->anim; en = en->next) {
@@ -2398,6 +2605,10 @@ static bool apply(slate_engine_t *e, const slate_cmd_t *c)
         return apply_ease(e, c);
     case SLATE_CMD_SCROLL:
         return apply_scroll(e, c);
+    case SLATE_CMD_TOP:
+        return apply_top(e, c->id);
+    case SLATE_CMD_PREPARE:
+        return apply_prepare(e, c->id);
     }
     return false;
 }
@@ -2479,6 +2690,7 @@ static void apply_all(slate_engine_t *e, bool pulse)
 #endif
         publish(e, batches, cmds, errors);
     }
+    e->prep_us = 0;   /* the clamp of batch_us is this wake-up's only */
 }
 
 /* Images that finished loading since the last look: the IMAGE elements whose image is READY now show it, and their
@@ -2619,15 +2831,37 @@ static void debug_print(slate_engine_t *e)
 
 /* ---- a frame ---- */
 
-/* The dirty set is small enough to race the scan (beam.h). */
-static bool races(const slate_engine_t *e)
+/* The frame that starts at t0 races the scan (beam.h), with the model of the pulses (frame_te_us, *period): when its
+   dirty set is at most SLATE_BEAM_AREA_MAX_PCT of the screen, or, larger, on a panel that scans top-down (the order
+   the bands are composed in), when its last band can still go behind the scan of the frame's refresh and be written
+   before the next pulse (racing does not make the frame run into the next refresh: a Scroll's view of 280 x 232 among
+   the first scanned rows of a 360 x 360 screen races, a whole screen does not). */
+static bool races(slate_engine_t *e, int64_t t0, uint32_t *period)
 {
-    uint64_t area = 0;
-    for (int i = 0; i < e->dirty.n; i++) {
-        area += (uint64_t)(e->dirty.r[i].x1 - e->dirty.r[i].x0) * (uint64_t)(e->dirty.r[i].y1 - e->dirty.r[i].y0);
+    if (!e->has_te || e->scan == DISPLAY_SCAN_UNKNOWN || !slate_beam_model(&e->te, t0, &e->frame_te_us, period)) {
+        return false;
     }
-    return e->has_te && e->scan != DISPLAY_SCAN_UNKNOWN
-           && area * 100 <= (uint64_t)e->w * (uint64_t)e->h * SLATE_BEAM_AREA_MAX_PCT;
+    uint64_t area = 0;
+    int last = 0, lines = 0;
+    for (int i = 0; i < e->dirty.n; i++) {
+        slate_rect_t r = e->dirty.r[i];
+        int a, b;
+        area += (uint64_t)(r.x1 - r.x0) * (uint64_t)(r.y1 - r.y0);
+        if (slate_beam_span(e->scan, e->w, e->h, r.x0, r.x1, r.y0, r.y1 - r.y0, &a, &b, &lines) && b > last) {
+            last = b;   /* the last scan line the frame writes */
+        }
+    }
+    if (area * 100 <= (uint64_t)e->w * (uint64_t)e->h * SLATE_BEAM_AREA_MAX_PCT) {
+        return true;
+    }
+    if (lines <= 0 || e->scan != DISPLAY_SCAN_TOP_DOWN) {
+        return false;   /* bands are composed top-down: only then does the compositor follow the scan, so that only
+                           the last band waits (another order would hold the first bands back and the rest after them) */
+    }
+    xfer_collect(e);
+    int64_t end = (int64_t)last * *period / lines + SLATE_BEAM_MARGIN_US
+                  + slate_xfer_us(&e->xfer, (uint32_t)e->w * (uint32_t)e->rows * 2);   /* a band at most */
+    return end + SLATE_BEAM_MARGIN_US < (int64_t)*period;
 }
 
 static void frame(slate_engine_t *e)
@@ -2636,7 +2870,7 @@ static void frame(slate_engine_t *e)
     int rects = e->dirty.n;
     int64_t t0 = now_us();
     uint32_t period;
-    e->race = races(e) && slate_beam_model(&e->te, t0, &e->frame_te_us, &period);
+    e->race = races(e, t0, &period);
     e->wait_acc_us = 0;
     e->frame_ok = e->frame_refused = 0;
     slate_stats_t st;

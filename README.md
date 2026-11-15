@@ -40,12 +40,17 @@ $slate->show($home = new Home());
 $home->temp->text = '93 °C';   // drawn at the next frame
 ```
 
+Controls drawn with a theme (buttons, toggles, sliders, choices, setting rows, dialogs, toasts, progress rings and
+bars, spinners, step lists) are in [Controls](docs/usage/controls.md) and [Theme](docs/usage/theme.md); the
+`06-display/slate-controls` example shows them all on the round panel of the Waveshare ESP32-S3-Touch-LCD-1.85B.
+
 ## Build options
 
 | Option | Values | Default |
 | --- | --- | --- |
 | `slate-effects` | set of `gradients`, `shadows`, `blur` | all three |
 | `slate-images` | set of `png` (formats decoded on the board; `.sli` always) | `png` |
+| `slate-controls` | `true` / `false` (the theme and the controls) | `true` |
 | `slate-debug` | `true` / `false` | `false` |
 
 ## Documentation
@@ -56,6 +61,9 @@ $home->temp->text = '93 °C';   // drawn at the next frame
 - [Images](docs/usage/images.md)
 - [Animations](docs/usage/animations.md)
 - [Scroll](docs/usage/scroll.md)
+- [Touch](docs/usage/touch.md)
+- [Controls](docs/usage/controls.md)
+- [Theme](docs/usage/theme.md)
 - [Effects and build options](docs/usage/effects-and-options.md)
 - [Performance](docs/usage/performance.md)
 - [Debug](docs/usage/debug.md)

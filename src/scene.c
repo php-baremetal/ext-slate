@@ -607,7 +607,8 @@ static void derive(slate_el_t *e)
         e->opaque = e->alpha == 255 && e->u.canvas.px != NULL;
         break;
     case SLATE_EL_IMAGE:
-        e->opaque = e->alpha == 255 && e->u.image.sli && e->u.image.sli->opaque;
+        e->opaque = e->alpha == 255 && e->u.image.sli && e->u.image.sli->opaque &&
+                    (e->u.image.tint == 0 || e->u.image.tint >> 24 == 255);
         break;
     default:
         e->opaque = false;
@@ -735,11 +736,11 @@ static unsigned prop_kinds(slate_prop_t p)
         return K(SLATE_EL_LINE);
     case SLATE_PROP_TEXT: case SLATE_PROP_FONT: case SLATE_PROP_ALIGN: case SLATE_PROP_MAX_WIDTH:
         return K(SLATE_EL_TEXT);
-    case SLATE_PROP_CLIP: case SLATE_PROP_CACHE: case SLATE_PROP_BLUR:
+    case SLATE_PROP_CLIP: case SLATE_PROP_CACHE: case SLATE_PROP_BLUR: case SLATE_PROP_FLAT:
         return K(SLATE_EL_GROUP);
     case SLATE_PROP_SHADOW:
         return K_SHAPE | K(SLATE_EL_GROUP);
-    case SLATE_PROP_IMAGE:
+    case SLATE_PROP_IMAGE: case SLATE_PROP_TINT:
         return K(SLATE_EL_IMAGE);
     case SLATE_PROP_SCROLL: case SLATE_PROP_SCROLL_X: case SLATE_PROP_SCROLL_Y: case SLATE_PROP_CONTENT_W:
     case SLATE_PROP_CONTENT_H: case SLATE_PROP_INDICATOR_A:
@@ -752,8 +753,9 @@ static bool type_ok(slate_prop_t p, slate_val_type_t t)
 {
     switch (p) {
     case SLATE_PROP_VISIBLE: case SLATE_PROP_CLIP: case SLATE_PROP_CACHE: case SLATE_PROP_TOUCHABLE:
+    case SLATE_PROP_FLAT:
         return t == SLATE_VAL_BOOL;
-    case SLATE_PROP_FILL: case SLATE_PROP_COLOR: case SLATE_PROP_BORDER_COLOR:
+    case SLATE_PROP_FILL: case SLATE_PROP_COLOR: case SLATE_PROP_BORDER_COLOR: case SLATE_PROP_TINT:
         return t == SLATE_VAL_PAINT || t == SLATE_VAL_COLOR;
     case SLATE_PROP_CAPS: case SLATE_PROP_ALIGN:
         return t == SLATE_VAL_ENUM;
@@ -831,6 +833,12 @@ bool slate_el_anim_get(const slate_el_t *e, slate_prop_t prop, slate_value_t *ou
             return false;
         }
         *out = slate_v_color(e->u.shape.border_argb);
+        return true;
+    case SLATE_PROP_TINT:
+        if (e->kind != SLATE_EL_IMAGE) {
+            return false;
+        }
+        *out = slate_v_color(e->u.image.tint);
         return true;
     case SLATE_PROP_COLOR:
         if (e->kind == SLATE_EL_ARC) {
@@ -1169,8 +1177,12 @@ bool slate_el_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slat
         e->hit_pad = (uint8_t)(n < 0 ? 0 : n > SLATE_HIT_PAD_MAX ? SLATE_HIT_PAD_MAX : n);
         return true;
     }
-    if (prop >= SLATE_PROP_SCROLL) {
+    switch (prop) {   /* a scroll's own properties (named, not by their place in slate_prop_t) */
+    case SLATE_PROP_SCROLL: case SLATE_PROP_SCROLL_X: case SLATE_PROP_SCROLL_Y: case SLATE_PROP_CONTENT_W:
+    case SLATE_PROP_CONTENT_H: case SLATE_PROP_INDICATOR_A:
         return scroll_set(e, prop, v, d, sw, sh);
+    default:
+        break;
     }
     float *f = num_field(e, prop);
     if (f && *f == v->v.num) {   /* unchanged: nothing to do (and nothing to redraw) */
@@ -1252,6 +1264,11 @@ bool slate_el_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slat
         changed = e->u.shape.border_argb != argb;
         e->u.shape.border_argb = argb;
         break;
+    case SLATE_PROP_TINT:   /* alpha 0: none, stored as 0 (any rgb) */
+        argb = argb >> 24 ? argb : 0;
+        changed = e->u.image.tint != argb;
+        e->u.image.tint = argb;
+        break;
     case SLATE_PROP_CAPS: {
         uint8_t c = v->v.e == SLATE_CAPS_ROUND ? SLATE_CAPS_ROUND : SLATE_CAPS_BUTT;
         uint8_t *dst = e->kind == SLATE_EL_ARC ? &e->u.arc.caps : &e->u.line.caps;
@@ -1308,6 +1325,10 @@ bool slate_el_set(slate_el_t *e, slate_prop_t prop, const slate_value_t *v, slat
     case SLATE_PROP_CACHE:
         changed = e->cached != v->v.b;
         e->cached = v->v.b;
+        break;
+    case SLATE_PROP_FLAT:
+        changed = e->u.g.flat != v->v.b;
+        e->u.g.flat = v->v.b;
         break;
     case SLATE_PROP_BLUR: {
         int b = iround(v->v.num);

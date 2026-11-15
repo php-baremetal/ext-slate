@@ -231,7 +231,7 @@ slate_cmd_result_t slate_cmd_push(slate_cmdbuf_t *b, const slate_cmd_t *c)
     slate_cmd_t *d = &bt->cmds[bt->n++];
     *d = *c;
     if (c->kind != SLATE_CMD_SHOW && c->kind != SLATE_CMD_PIXELS && !spec) {
-        d->data = NULL;
+        d->data = NULL;   /* none (NEW, SET, ADD, REMOVE, FREE, TWEEN_STOP, TOP: the id alone) */
     }
     if (text) {
         d->v.v.text = put(bt, c->v.v.text, text);

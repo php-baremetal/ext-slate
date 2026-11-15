@@ -8,7 +8,7 @@ see_also:
   - { href: 'package:php-baremetal/ext-input', meta: 'Extension', label: 'ext-input' }
   - { href: 'package:php-baremetal/ext-events', meta: 'Extension', label: 'ext-events' }
 prev: { label: 'Scroll', href: './scroll.md' }
-next: { label: 'Effects and build options', href: './effects-and-options.md' }
+next: { label: 'Controls', href: './controls.md' }
 ---
 
 # Touch
@@ -241,6 +241,7 @@ element, in external RAM), and PHP reads it without a lock at each `Pressed`.
 | `\ValueError` `Baremetal\Slate\<Class>::$holdMs must be between 0 and 10000` | A write of `$holdMs` out of range; the old value stays. |
 | `\ValueError` `Baremetal\Slate\<Class>::$<name> cannot be animated` | `animate()` or `ease()` of `$hitPad`, `$holdMs` or `$touchable`. |
 | `\TypeError` | `on()` or `off()` with something other than a `TouchType` (and a `\Closure` for `on()`), a value of the wrong type for a property. |
-| `\RuntimeException` `Slate: cannot take the touch: the table of ext-events' watches is full` | From `new Slate()` or `Slate::onboard()` with a touch device: other extensions took the eight watches ext-events keeps (Slate uses up to six: four for the touch events, one for `Hold`, one for `TransitionDone`). |
+| `\RuntimeException` `Slate: cannot take the touch: the table of ext-events' watches is full` | From `new Slate()` or `Slate::onboard()` with a touch device: other extensions took the eight watches ext-events keeps (Slate uses up to six: four for the touch events, one for `HoldDue` (the `Hold` of a touch and the ends of the controls' animations), one for `TransitionDone`). |
 | `\RuntimeException` `Slate: out of memory for the touch` | From `new Slate()` or `Slate::onboard()` with a touch device. |
-| `\RuntimeException` `Slate: cannot raise Baremetal\Slate\HoldDue: too many event sources` | From `new Slate()` or `Slate::onboard()` with a touch device: ext-events has no room for one more event class. |
+| `\RuntimeException` `Slate: cannot raise Baremetal\Slate\HoldDue: too many event sources` | From `new Slate()` or `Slate::onboard()` with a touch device (or, with the controls built, without one): ext-events has no room for one more event class. |
+| `\RuntimeException` `Slate: cannot start: the table of ext-events' watches is full` | From `new Slate()` or `Slate::onboard()` without a touch device, with the controls built: the watch of `HoldDue` (the ends of the controls' animations) found no room. |

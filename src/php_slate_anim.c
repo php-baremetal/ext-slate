@@ -20,6 +20,10 @@
  * A Tween has an id, unique in the request, that its TWEEN command carries. While it runs it holds a reference on
  * its element, and a registry holds a reference on it (so a Tween nobody keeps still gets its TweenDone).
  *
+ * Internal tweens (a control's parts, the toast) have ids with SL_TWEEN_CTL (php_slate.h) from a counter of their own:
+ * pull() never makes a TweenDone of them; those with SL_TWEEN_CTL_CB go to the controls' queue (sl_ctl_due) and wake
+ * the PHP task with one HoldDue.
+ *
  * Dones. When tweens end by themselves the engine queues their ids and calls our listener on its task, once per
  * queue that was empty. The listener (it never calls PHP) drains the queue: each id goes into a list of finished
  * tweens and gets a TweenDone event of ext-events whose 4 bytes of data are the id, and a wait() is woken. On the
@@ -158,14 +162,25 @@ static void pull(slate_engine_t *e)
         return;
     }
     uint32_t id;
-    bool any = false;
+    bool any = false, due = false;
     while (slate_engine_tween_done(e, &id)) {
+        if (id & SL_TWEEN_CTL) {
+            /* an internal tween (a control's, the toast's): no TweenDone; its end to the waiter that wants it */
+            if (id & SL_TWEEN_CTL_CB) {
+                sl_ctl_due(id);
+                due = true;
+            }
+            continue;
+        }
         queue_done(id);
         any = true;
     }
     if (any) {
         uint8_t t = 0;
         bm_hal_queue_send(s_wake, &t, 0);
+    }
+    if (due) {
+        sl_due_emit();
     }
 }
 
@@ -423,6 +438,20 @@ static bool lock_ready(void)
     return true;
 }
 
+static uint32_t s_ctl_next;   /* the internal tweens' counter (30 bits) */
+
+uint32_t sl_tween_ctl_id(bool cb)
+{
+    if (!lock_ready()) {
+        return 0;   /* pull() drains only with the lock */
+    }
+    s_ctl_next = (s_ctl_next + 1) & (SL_TWEEN_CTL_CB - 1);
+    if (s_ctl_next == 0) {
+        s_ctl_next = 1;
+    }
+    return SL_TWEEN_CTL | (cb ? SL_TWEEN_CTL_CB : 0) | s_ctl_next;
+}
+
 /* The first Tween of the request: the lock and the wake queue (once), the event class as a source of ext-events,
    the registries, the idle hook. false with an exception. */
 static bool ready(void)
@@ -634,8 +663,8 @@ bool sl_tween_make(zval *rv, sl_obj_t *el, slate_tween_spec_t *spec, zend_object
     sl_anim_flush();
     object_init_ex(rv, sl_tween_ce);
     sl_tween_t *t = tween_of(Z_OBJ_P(rv));
-    if (++s_next_id == 0) {
-        s_next_id = 1;
+    if (++s_next_id == 0 || s_next_id >= SL_TWEEN_CTL) {
+        s_next_id = 1;   /* a Tween's ids stay under SL_TWEEN_CTL (the internal ones) */
     }
     t->id = s_next_id;
     t->endless = spec->repeat < 0;
@@ -688,8 +717,8 @@ bool sl_tween_instant(zval *rv, sl_obj_t *el)
     sl_anim_flush();
     object_init_ex(rv, sl_tween_ce);
     sl_tween_t *t = tween_of(Z_OBJ_P(rv));
-    if (++s_next_id == 0) {
-        s_next_id = 1;
+    if (++s_next_id == 0 || s_next_id >= SL_TWEEN_CTL) {
+        s_next_id = 1;   /* a Tween's ids stay under SL_TWEEN_CTL (the internal ones) */
     }
     t->id = s_next_id;
     zend_hash_index_update_ptr(&s_all, t->id, t);

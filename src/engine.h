@@ -20,7 +20,10 @@
        the frame goes anyway (counted in te_fallbacks): a lost TE source slows Slate down, never freezes it;
      - without TE: at once, but at most one frame every 1000 / refresh_hz ms (16 ms when refresh_hz is 0).
    With TE and a driver that gives its refresh order (display_band_ops_t::scan), a frame that changes at most
-   SLATE_BEAM_AREA_MAX_PCT of the screen races the panel's scan (beam.h): before each push the band waits, when needed,
+   SLATE_BEAM_AREA_MAX_PCT of the screen races the panel's scan (beam.h), and so does a larger one, on a panel that
+   scans top-down (the order the bands are composed in), whose last scan line, plus the write of a band, comes before
+   the next pulse (racing does not make it run into the next refresh; a whole screen does not race): before each push
+   the band waits, when needed,
    until the panel's refresh is out of its way (on the HAL timer, or the queue's clock; a done ends the sleep early),
    so it is written wholly behind the refresh and does not tear. Every band of the frame goes behind the refresh that
    the frame's pulse started, so the whole frame shows in the next one (the same delay for every row: a moving element
@@ -70,13 +73,16 @@
 
    Tweens (tween.h). TWEEN, TWEEN_STOP and EASE commands (cmd.h) make, stop and set them up; the tweens live on the
    engine task only. A tween starts when its command is applied (its from values are the element's values then,
-   slate_el_anim_get), or, chained after another (`after`), at that one's exact end, from the values it left. At every
-   wake-up that gives a frame, after the batches and before the frame is composed, every running tween is sampled at
-   the frame's time: the time of the TE pulse that starts the frame (without TE, or at a TE fallback: the time the
-   frame starts), never the time spent computing, so a frame skipped leaves an animation on time. The values are
-   written with slate_el_set (slate_tween_write): dirty areas and caches as for a change from PHP. While a tween runs
-   the task asks for every pulse (without TE: a frame every period); without tweens or changes nothing goes (a
-   still screen gives no frame), and a scene without tweens costs no work per frame. Rules:
+   slate_el_anim_get: the TINT of an IMAGE is a colour like the others, per channel), or, chained after another
+   (`after`), at that one's exact end, from the values it left. After a PREPARE (cmd.h) it starts no earlier than the
+   time the PREPARE ended: the caches it built (a dialog's shadow) do not eat the first steps of the animations pushed
+   after it, whose first frame shows their start. At every wake-up that gives a frame, after the
+   batches and before the frame is composed, every running tween is sampled at the frame's time: the time of the TE
+   pulse that starts the frame (without TE, or at a TE fallback: the time the frame starts), never the time spent
+   computing, so a frame skipped leaves an animation on time. The values are written with slate_el_set
+   (slate_tween_write): dirty areas and caches as for a change from PHP. While a tween runs the task asks for every
+   pulse (without TE: a frame every period); without tweens or changes nothing goes (a still screen gives no frame),
+   and a scene without tweens costs no work per frame. Rules:
      - a tween whose element is not shown (not under the scene of the last SHOW) does not run: its time stands
        still from the SHOW that hid it (or its making) to the SHOW (or ADD) that shows it again. The pause and the
        resume take the ticks' time: the pulse whose wake-up applies the batch (else the time it is applied), never
@@ -137,6 +143,18 @@
        its done at once (with the listener), so the PHP side ends it;
      - with nothing running, a scene without a transition costs no work per frame (a flag).
 
+   Top layer (cmd.h, SLATE_CMD_TOP). One group (with no parent) may be the top layer: it goes under the screen root
+   above the scene shown and stays above it through every SHOW and transition (above both scenes of a transition,
+   in place: it does not move with them), under the slate-debug FPS counter. Its elements are shown (their tweens,
+   scrolls and eased SETs run, their changes give frames) and never in the hit table (the table is the scene's). A
+   TOP of another group detaches the one there was (it stays alive and can be the top layer again; its tweens pause
+   as for a scene left), TOP 0 detaches it; each change dirties the boxes concerned. A TOP of a group that has a
+   parent (the scene shown, a child, a root of a transition), of another kind or of an unknown id is refused
+   (counted in cmd_errors); a TOP of the top layer itself changes nothing. REMOVE of it is refused, FREE of it
+   detaches it first (no top layer then). A kept root (Kept scenes) that becomes the top layer leaves the list.
+   Without a top layer nothing is done for it (a pointer); with one, only a SHOW and the end of a transition move it
+   back on top (no work per frame).
+
    Kept scenes. A scene left (a SHOW at once, or the end of a transition) whose SHOW said keep (cmd.h: the PHP
    layer's Scene::$keepCache of the scene left) keeps its element caches (cached groups, shadows, blurs: the images
    it would build again when shown again) instead of dropping them, while there is room: the root goes to the end of
@@ -152,6 +170,10 @@
    by a transition to it); so does an ADD of it into a group (its caches go with it); FREE of a kept root, or of an
    element inside one, and REMOVE of an element from one, drop the caches under that element first (nothing cached
    leaves the list's reach); an ADD into a kept scene counts the caches brought in (the limits apply).
+   Orphans. An element that REMOVE takes out of the screen (a dialog that closes) keeps its caches too, so putting it
+   back builds nothing; the ids of the last SLATE_ORPHANS such elements are noted (an older one drops its caches when
+   a ninth comes), and when a cache allocation does not fit they drop their caches first, oldest first, before the
+   kept roots (so does a reclaim for an image). One that is back on screen, in a kept scene or freed is no orphan.
    Image memory is not part of the cache budget (Images): an image does not take room in it. But when the image
    loader runs out of memory for an image (images.h, Memory), it asks the engine for the kept caches: the loader
    task sets a flag and kicks the task (it never touches the caches itself), the task drops every kept cache at its
@@ -257,6 +279,7 @@
 #define SLATE_ENGINE_CORE BM_HAL_CORE_0
 #endif
 #define SLATE_CACHE_BUDGET_MAX (2u * 1024 * 1024)
+#define SLATE_ORPHANS 8                /* elements taken out of the screen whose caches are kept (Kept scenes) */
 #ifndef SLATE_DONE_TIMEOUT_MS
 #define SLATE_DONE_TIMEOUT_MS 2000     /* longest wait for a band's done (as ext-display's flush deadline) */
 #endif

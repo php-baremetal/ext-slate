@@ -49,4 +49,13 @@ void slate_sli_draw(slate_buf_t *b, const slate_sli_t *im, int x, int y, uint8_t
 void slate_sli_draw_ops(const slate_gfx_ops_t *g, slate_buf_t *b, const slate_sli_t *im, int x, int y, uint8_t a,
                         slate_rect_t clip);
 
+/* The image as a mask of rgb565 times a (0..255): its colours are not read, only where it is and its alpha. Empty
+   commands skipped; opaque ones (repeated or different) fill (fill_a when a < 255); semi-transparent ones fill_mask
+   with their alpha row times a. The same clipping and the same commands walked as slate_sli_draw_ops: no more work
+   than the plain draw. */
+void slate_sli_draw_tint_ops(const slate_gfx_ops_t *g, slate_buf_t *b, const slate_sli_t *im, int x, int y,
+                             uint8_t a, uint16_t rgb565, slate_rect_t clip);
+void slate_sli_draw_tint(slate_buf_t *b, const slate_sli_t *im, int x, int y, uint8_t a, uint16_t rgb565,
+                         slate_rect_t clip);
+
 #endif

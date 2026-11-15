@@ -41,6 +41,11 @@
  * is past the due time while the Hold is still owed (the timer late, its event lost) gets the Hold first. HoldDue has
  * no listener of its own.
  *
+ * HoldDue is Slate's one internal wake-up for its timers: the Hold, and the ends of the controls' animations (a
+ * Dialog's close, the toast: php_slate_control.c queues them from the tween listener and emits one HoldDue). Its
+ * source and its watch are set while a Slate runs with a touch device or with the controls built (sl_due_start), so
+ * Slate uses no watch more for the controls; the watch runs the controls' queue first, then the Hold.
+ *
  * Touch::$time is the touch event's $time (ext-events: ns on the base of hrtime(true), int or float as PHP integers
  * allow); a Hold's is its due time.
  *
@@ -98,13 +103,20 @@ static slate_hit_pub_t *s_pub;   /* the hit table of the running Slate (a refere
 static int s_depth;           /* handlers under way (element and scene ones) */
 static bool s_hold_armed;     /* the touch is due a Hold at s_hold_due */
 static int64_t s_hold_due;
-static bool s_watching;       /* the watch of HoldDue is set */
+static bool s_watching;       /* the watch of HoldDue is set (sl_due_start) */
 
 /* ---- shared with the timer's task ---- */
 
 static bm_hal_timer_t *s_timer;   /* created once, never freed */
-static uint16_t s_hold_tag;       /* atomic, with s_hold_on */
-static bool s_hold_on;            /* a Slate with a touch device runs: the timer may queue HoldDue (atomic) */
+static uint16_t s_due_tag;        /* atomic, with s_due_on */
+static bool s_due_on;             /* the watch of HoldDue is set: HoldDue may be queued (atomic) */
+
+void sl_due_emit(void)
+{
+    if (__atomic_load_n(&s_due_on, __ATOMIC_ACQUIRE)) {
+        bm_events_emit(__atomic_load_n(&s_due_tag, __ATOMIC_RELAXED), NULL);   /* dropped (a full pool): see callers */
+    }
+}
 
 static void hold_cb(void *arg)
 {
@@ -114,9 +126,7 @@ static void hold_cb(void *arg)
        is left of the new Hold. Only when that HoldDue is dropped too (a full pool) the Hold is late, until the next
        Moved or Released delivers it (hold_if_due). */
     bm_hal_timer_stop(s_timer);
-    if (__atomic_load_n(&s_hold_on, __ATOMIC_ACQUIRE)) {
-        bm_events_emit(__atomic_load_n(&s_hold_tag, __ATOMIC_RELAXED), NULL);   /* dropped (a full pool): no Hold */
-    }
+    sl_due_emit();
 }
 
 static void hold_start_us(int64_t us)
@@ -230,22 +240,28 @@ static bool contains(const slate_hit_t *h, int x, int y)
     return x >= h->x0 && x < h->x1 && y >= h->y0 && y < h->y1;
 }
 
-/* o can take a touch now, as PHP sees it: touchable (or with a callback), visible with its ancestors, in scene;
-   fresh (a new touch): not at opacity 0 either, itself or an ancestor. The hit table is the last frame's: an element
-   hidden, made transparent, made not touchable or removed since then is passed over. A capture under way ends for
-   the same causes but opacity (fresh false). */
+/* o can take a touch now, as PHP sees it: touchable (or with a callback), visible with its ancestors, in scene, not
+   a control that is not enabled nor inside one, not inside a Dialog that is closing; fresh (a new touch): not at
+   opacity 0 either, itself or an ancestor, and, while scene has an open visible Dialog, the top one or inside it
+   (the table may be a frame behind the dialog: what is under it is passed over all the same). The hit table is the last
+   frame's: an element hidden, made transparent, made not touchable, disabled or removed since then is passed over.
+   A capture under way ends for the same causes but opacity and the dialog on top (fresh false). */
 static bool can_take(sl_obj_t *o, zend_object *scene, bool fresh)
 {
     if (!sl_slot_true(o, "touchable") && !sl_touch_has_cb(o)) {
         return false;
     }
+    sl_obj_t *top = fresh ? sl_dialog_top(scene) : NULL;
+    bool in_top = top == NULL;
     sl_obj_t *a = o;
     for (; a && a->base != SL_SCENE; a = a->parent) {
-        if (!sl_slot_true(a, "visible") || (fresh && !(sl_slot_num(a, "opacity") > 0))) {
+        if (!sl_slot_true(a, "visible") || (fresh && !(sl_slot_num(a, "opacity") > 0))
+            || (SL_CTL(a) && !sl_ctl_enabled(a)) || (a != o && a->base == SL_DIALOG && sl_dialog_closing(a))) {
             return false;
         }
+        in_top |= a == top;
     }
-    return a && scene && &a->std == scene;
+    return in_top && a && scene && &a->std == scene;
 }
 
 /* The element on top at (x, y) among those alive in scene, *h its entry, *hi its index in the snapshot *hseq; NULL
@@ -322,8 +338,9 @@ static void set_time(zend_object *t, int64_t us)
 
 static void flush(void);
 
-/* The method of kind (when el's class overrides it), then its callback, with one Touch; then the queued Cancel when
-   no handler is under way. Nothing with an exception pending. */
+/* A control's hook (sl_ctl_touch: pressed(), its own behaviour), then the method of kind (when el's class overrides
+   it), then its callback, with one Touch; then the queued Cancel when no handler is under way. Nothing with an
+   exception pending. */
 static void deliver(zend_object *el, int kind, const sl_touch_t *p, int ox, int oy)
 {
     if (EG(exception)) {
@@ -341,12 +358,15 @@ static void deliver(zend_object *el, int kind, const sl_touch_t *p, int ox, int 
     set_time(t, p->t_us);
     GC_ADDREF(el);
     s_depth++;
-    zend_function *fn = zend_hash_str_find_ptr(&el->ce->function_table, method_names[kind],
-                                               strlen(method_names[kind]));
+    sl_obj_t *o = sl_obj(el);
+    if (SL_CTL(o)) {
+        sl_ctl_touch(o, kind, p, p->x - ox, p->y - oy);   /* an exception stops the rest */
+    }
+    zend_function *fn = EG(exception) ? NULL : zend_hash_str_find_ptr(&el->ce->function_table, method_names[kind],
+                                                                       strlen(method_names[kind]));
     if (fn && !(fn->type == ZEND_INTERNAL_FUNCTION && fn->common.scope == sl_element_ce)) {
         zend_call_known_instance_method_with_1_params(fn, el, NULL, &tz);
     }
-    sl_obj_t *o = sl_obj(el);
     if (!EG(exception) && o->tcb && Z_TYPE(o->tcb->fn[kind]) == IS_OBJECT) {
         zval cb, rv;
         ZVAL_COPY(&cb, &o->tcb->fn[kind]);   /* kept alive through the call (off() inside it) */
@@ -412,6 +432,17 @@ static void flush(void)
 void sl_touch_cancel_now(void)
 {
     cancel(true);
+}
+
+void sl_touch_cancel_held(void)
+{
+    sl_touch_state_t *st = &sl_touch_st;
+    if (st->owner == SL_OWN_ELEMENT || st->owner == SL_OWN_SCROLL) {
+        cancel(false);   /* after the handler under way, as sl_touch_recheck() */
+    } else if (st->owner == SL_OWN_SCENE) {
+        st->owner = SL_OWN_DEAD;   /* the rest of it (and its Gesture) reaches nobody */
+        st->taken = true;
+    }
 }
 
 void sl_touch_recheck(void)
@@ -704,6 +735,18 @@ void sl_touch_route(zend_object *event, zend_object *scene)
             sl_touch_capture(&o->std, &p, h.ox, h.oy);
             return;
         }
+        sl_obj_t *top = sl_dialog_top(scene);
+        if (top) {
+            /* nothing of the dialog in the table yet (its first frames): the press is the scrim's, nothing under it
+               gets it */
+            if (can_take(top, scene, true)) {
+                sl_touch_capture(&top->std, &p, (int)sl_slot_num(top, "x"), (int)sl_slot_num(top, "y"));
+            } else {
+                st->owner = SL_OWN_DEAD;
+                st->taken = true;   /* its Gesture (after the Released) does not reach Scene::onTouch() either */
+            }
+            return;
+        }
         st->owner = SL_OWN_SCENE;
         scene_touch(scene, event);
         return;
@@ -771,11 +814,15 @@ void sl_touch_route(zend_object *event, zend_object *scene)
     }
 }
 
-/* Slate's watch of HoldDue: the Hold of the touch, when it is still due one. */
+/* Slate's watch of HoldDue: the ends the controls wait for, then the Hold of the touch, when it is still due one. */
 static void watch_hold(zend_object *event, void *arg)
 {
     (void)event;
     (void)arg;
+    sl_ctl_due_run();   /* a Dialog's close, the toast's end (nothing without the controls) */
+    if (EG(exception)) {
+        return;
+    }
     sl_touch_state_t *st = &sl_touch_st;
     if (!s_hold_armed || st->owner != SL_OWN_ELEMENT) {
         return;   /* stopped meanwhile, or a HoldDue dispatched by a script */
@@ -799,6 +846,40 @@ static void watch_hold(zend_object *event, void *arg)
 
 /* ---- the Slate ---- */
 
+bool sl_due_start(bool touch)
+{
+    if (s_watching) {
+        return true;
+    }
+    uint16_t tag;
+    if (!bm_events_source_tag_ex(sl_hold_due_ce->name, true, &tag)) {   /* coalescing: one waits at most */
+        if (!EG(exception)) {
+            zend_throw_exception_ex(spl_ce_RuntimeException, 0, "Slate: cannot raise %s: too many event sources",
+                                    ZSTR_VAL(sl_hold_due_ce->name));
+        }
+        return false;
+    }
+    if (!bm_events_watch(sl_hold_due_ce, watch_hold, NULL)) {
+        zend_throw_exception(spl_ce_RuntimeException,
+                             touch ? "Slate: cannot take the touch: the table of ext-events' watches is full"
+                                   : "Slate: cannot start: the table of ext-events' watches is full", 0);
+        return false;
+    }
+    s_watching = true;
+    __atomic_store_n(&s_due_tag, tag, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_due_on, true, __ATOMIC_RELEASE);
+    return true;
+}
+
+void sl_due_stop(void)
+{
+    __atomic_store_n(&s_due_on, false, __ATOMIC_RELEASE);
+    if (s_watching) {
+        bm_events_unwatch(sl_hold_due_ce, watch_hold, NULL);
+        s_watching = false;
+    }
+}
+
 bool sl_touch_start(slate_engine_t *e)
 {
     if (!s_pub) {
@@ -816,34 +897,14 @@ bool sl_touch_start(slate_engine_t *e)
             return false;
         }
     }
-    uint16_t tag;
-    if (!bm_events_source_tag_ex(sl_hold_due_ce->name, true, &tag)) {   /* coalescing: one waits at most */
-        if (!EG(exception)) {
-            zend_throw_exception_ex(spl_ce_RuntimeException, 0, "Slate: cannot raise %s: too many event sources",
-                                    ZSTR_VAL(sl_hold_due_ce->name));
-        }
-        return false;
-    }
-    if (!bm_events_watch(sl_hold_due_ce, watch_hold, NULL)) {
-        zend_throw_exception(spl_ce_RuntimeException,
-                             "Slate: cannot take the touch: the table of ext-events' watches is full", 0);
-        return false;
-    }
-    s_watching = true;
-    __atomic_store_n(&s_hold_tag, tag, __ATOMIC_RELAXED);
-    __atomic_store_n(&s_hold_on, true, __ATOMIC_RELEASE);
-    return true;
+    /* the Hold's HoldDue: its source and its watch are sl_due_start()'s (php_slate.c starts them first) */
+    return sl_due_start(true);
 }
 
 void sl_touch_stop(slate_engine_t *e)
 {
     sl_touch_state_t *st = &sl_touch_st;
-    hold_stop();
-    __atomic_store_n(&s_hold_on, false, __ATOMIC_RELEASE);
-    if (s_watching) {
-        bm_events_unwatch(sl_hold_due_ce, watch_hold, NULL);
-        s_watching = false;
-    }
+    hold_stop();   /* the watch of HoldDue is sl_due_stop()'s (php_slate.c, after this) */
     zend_object *el = st->el;
     if (el && st->owner == SL_OWN_SCROLL) {
         sl_scroll_drop(sl_obj(el), false);   /* the engine stops with it */

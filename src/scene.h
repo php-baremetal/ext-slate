@@ -77,7 +77,10 @@
    and by slate_el_free) and the image's pixels once seen READY (u.image.sli: what the compositor draws). The
    image becomes READY in the loader task, at any moment: the element shows it only from slate_el_image_sync on
    (the engine calls it when images finished loading), which marks its box dirty, so a frame never shows an image
-   that its dirty set does not cover. slate_el_set of an image that is READY already shows it at once.
+   that its dirty set does not cover. slate_el_set of an image that is READY already shows it at once. TINT (argb,
+   alpha 0 = none, stored as 0) draws the image as a mask of one colour: each pixel the tint's rgb at the pixel's
+   alpha times the tint's alpha times the opacity (slate_sli_draw_tint); a change of it marks the box and the caches
+   as a change of colour does. A tinted image is opaque only when the image is and the tint's alpha is 255.
 
    Touch. TOUCHABLE and HIT_PAD (hit.h) change no pixel: their SET records nothing dirty, stamps nothing and marks no
    cache stale. Every GROUP counts the touchable elements of its subtree, itself included (u.g.touch_n, kept by
@@ -139,6 +142,8 @@ typedef enum {
     SLATE_PROP_TO,            /* NUM: ARC, degrees */
     SLATE_PROP_WIDTH,         /* NUM: ARC, LINE stroke width */
     SLATE_PROP_COLOR,         /* PAINT: ARC (gradient allowed), LINE and TEXT (argb only) */
+    SLATE_PROP_TINT,          /* COLOR: IMAGE only; argb, alpha 0 = none: the image is drawn as a mask of the colour
+                                 (a PAINT is accepted, its argb used) */
     SLATE_PROP_CAPS,          /* ENUM slate_caps_t: ARC, LINE */
     SLATE_PROP_X1,            /* NUM: LINE second end point */
     SLATE_PROP_Y1,            /* NUM */
@@ -160,6 +165,10 @@ typedef enum {
     SLATE_PROP_INDICATOR_A,   /* NUM: scroll only, alpha of the scroll bars, clamped to 0..1 */
     SLATE_PROP_TOUCHABLE,     /* BOOL: every kind (see "Touch" above) */
     SLATE_PROP_HIT_PAD,       /* NUM: every kind, px added to its hit box on each side, rounded, clamped to 0..64 */
+    SLATE_PROP_FLAT,          /* BOOL: GROUP (internal, no PHP property): with an opacity below 1 (and no cache, shadow
+                                 or blur) it is not composed apart: each of its elements is drawn with its own opacity
+                                 times the group's, as an item of its own (compose.h); overlapping elements show
+                                 through one another, and none of them hides what is under it */
 } slate_prop_t;
 
 typedef enum {
@@ -257,6 +266,7 @@ typedef struct {
     float w, h;                 /* clip box */
     slate_shadow_t shadow;
     int16_t blur;
+    bool flat;                  /* SLATE_PROP_FLAT (in the padding after blur: the group stays 40 bytes on the board) */
     uint32_t touch_n;           /* touchables in its subtree, itself included (see "Touch" above) */
     slate_scroll_el_t *scroll;  /* NULL: not a scroll */
 } slate_group_t;
@@ -274,6 +284,7 @@ typedef struct { uint16_t *px; int16_t w, h; } slate_canvas_t;   /* w x h RGB565
 typedef struct {
     struct slate_image *im;   /* a reference held; NULL: none */
     const slate_sli_t *sli;   /* im's pixels once seen READY (slate_el_image_sync); NULL: nothing drawn */
+    uint32_t tint;            /* argb, 0: none (the element stays 92 bytes: the union's largest is 40) */
 } slate_image_el_t;
 
 /* The fields are read by the compositor; change them only through the functions below. The struct is a common
@@ -305,6 +316,12 @@ struct slate_el {
         slate_image_el_t image;
     } u;
 };
+#if defined(__XTENSA__)
+/* 92 bytes per element on the ESP32-S3 (see the top of this file): a field more in the header makes every element of
+   every scene bigger; put a group's or a kind's own field in its part of the union. */
+_Static_assert(sizeof(slate_el_t) == 92, "slate_el_t is 92 bytes on the ESP32-S3");
+#endif
+
 
 /* Change clock. Every change of an element (slate_el_set, slate_el_add, slate_el_remove, slate_canvas_dirty, and the
    creation) stamps it with the current value: mod_self on the element changed (on a group, also when a child is
@@ -344,9 +361,9 @@ void slate_el_move(slate_el_t *e, const slate_value_t *x, const slate_value_t *y
    stored alpha / 255), W and H (ROUNDRECT, GROUP), BLUR (GROUP), RADIUS (ROUNDRECT), BORDER (ROUNDRECT, CIRCLE), R
    (CIRCLE, ARC), FROM and TO (ARC), WIDTH (ARC, LINE), X1 and Y1 (LINE), SCROLL_X and SCROLL_Y (a scroll: only the
    engine animates them, scrollTo); COLOR for FILL (ROUNDRECT, CIRCLE),
-   BORDER_COLOR (ROUNDRECT, CIRCLE) and COLOR (ARC, LINE, TEXT). false when e's kind does not animate prop (X, Y and
-   OPACITY are every kind's; a CANVAS's W and H are not animated, nor any other property) or the paint is a gradient
-   now. */
+   BORDER_COLOR (ROUNDRECT, CIRCLE), COLOR (ARC, LINE, TEXT) and TINT (IMAGE). false when e's kind does not animate
+   prop (X, Y and OPACITY are every kind's; a CANVAS's W and H are not animated, nor any other property) or the paint
+   is a gradient now. */
 bool slate_el_anim_get(const slate_el_t *e, slate_prop_t prop, slate_value_t *out);
 
 /* The touchable elements of e's subtree, e included (see "Touch" above). */

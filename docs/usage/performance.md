@@ -45,7 +45,12 @@ moving across the screen would then skip or repeat a step now and then. The cost
 between the pulse that starts a frame and the refresh that shows it.
 
 - It applies to frames that change at most half of the screen, which is where tearing shows (a moving pointer, a
-  dot, a gauge). A larger frame takes about a refresh or more to send, so a refresh shows it partly drawn whatever
+  dot, a gauge), and, on a panel that refreshes top to bottom (an ST77916 in its default orientation), to
+  larger ones that end early enough for their last band to be written before the next pulse: a `Scroll` view of
+  280 x 232 under the title of a 360 x 360 screen races (measured: no band written under the refresh while it
+  scrolls, 60 frames per second as before). On a panel turned upside down or on its side the bands are still composed
+  top to bottom, against its refresh, so a larger frame is sent as before. A larger frame that reaches the end
+  of the refresh (a whole screen) takes about a refresh or more to send, so a refresh shows it partly drawn whatever
   the order; it is sent as before, as fast as it is composed.
 - While a band waits for the refresh, the compositor draws the next band into the other band buffer; it sleeps
   only when both wait, and that counts as `wait` in the debug line. A frame whose last band is
@@ -332,6 +337,68 @@ the touch screen's, two rounds of each case:
   written) and an index of the touchable elements; about 3.6 KB for 50. The tables keep their largest size while
   the Slate runs: a scene with many touchable elements leaves that memory in use after it is left, until the
   Slate stops.
+
+## Controls
+
+A control is one PHP object, and its parts are elements of the compositor: it costs per frame what the same
+shapes and texts would cost drawn by hand, and nothing when it does not change. A control that turns (a `Spinner`,
+a spinning `ProgressRing`, the active step of a `StepList`) stops turning while it or a group it is in has
+`$visible = false`, and one turning out of a `Scroll`'s view draws nothing and does not make the touch table be
+built again. Measured on an ESP32-S3 at
+240 MHz with the 360 x 360 QSPI panel, on the pages of the `06-display/slate-controls` example, with touch events
+built by a timer and delivered through the same path as the touch screen's, two rounds of each case:
+
+| Scene | Touchable entries in the table | Building the table, average / longest | Frames |
+| --- | --- | --- | --- |
+| The settings list (six rows: four switches, a segmented choice, a slider, a touchable row) dragged | 6 | 0.26 to 0.40 / 0.9 ms | 60 per second, 8.3 to 10.8 ms (composing 5.2 to 10.4 ms) |
+| The same list with its rows four times over (25 touchable controls) dragged | 6 to 7 | 0.71 to 0.83 / 1.7 ms | 60 per second, 8.2 to 8.6 ms (composing 6.3 to 7.7 ms) |
+| The same, flung (inertia) | 5 to 7 | 0.54 to 0.78 / 1.9 ms | 7.3 to 8.3 ms |
+| The brew: a `ProgressRing` (radius 90), a `ProgressBar` with a glow, a `StepList` and a `Spinner` changing every frame | 3 | 0.25 to 0.30 / 0.5 ms | 60 per second, 11.0 to 11.2 ms (composing 3.6 to 5.2 ms) |
+| 50 icons 20 x 20 moving every frame, plain | none | | 60 per second, 10.9 ms (composing 6.6 to 6.7 ms) |
+| The same 50 icons tinted (`TINT`, as the controls draw them) | none | | 60 per second, 10.9 ms (composing 5.1 to 5.2 ms) |
+| A `Dialog` opening or closing (the scrim fading over the whole screen, the panel rising and fading element by element) | | | 34 to 49 ms a frame (37 to 45 on average, by dialog and direction), 7 to 9 frames in the 300 ms; at the first opening the shadow is built before the animation (31 to 36 ms), in no frame |
+
+- **The table grows with the touchable controls walked.** In a `Scroll` every touchable row and control is walked
+  after each frame of the motion, also the ones out of the view: about 30 µs each with the list of 25. It runs
+  after the frame, in the time the compositor would wait for the next refresh, so at 8 to 9 ms a frame the list
+  keeps 60 frames per second. Make a row touchable as a whole when its parts need no touch of their own, and keep
+  the touchable controls of a long list few.
+- **Tinted icons cost no more than plain ones.** The tint fills the icon's alpha with one colour and reads no
+  colours from the image: with 50 icons in motion it composed faster than the plain images.
+- **A dialog is the expensive moment.** Its scrim covers the whole screen at 88 % and fades, and its panel rises
+  over it with a large shadow while it fades, so every frame of the 300 ms of the opening and of the closing
+  composes the whole screen: 34 to 48 ms a frame for the language dialog (37 to 40 on average), 45 to 49 ms for the
+  power-off one (43 to 45 on average: its page has a disabled button, a group at 40 % composed apart, that a
+  translucent panel no longer hides), 7 to 9 frames. The panel fades element by element (each part with its own opacity times
+  the panel's); faded as one image composed apart it took 73 to 88 ms a frame, and kept opaque 31 to 42. The first
+  opening builds the shadow before the animation starts (31 to 36 ms, no frame is longer for it, and the animation
+  does not skip that time). Its memory (about 120 KB of PSRAM for each of the example's dialogs)
+  stays while the dialog is closed, so opening it again builds nothing, and is given back first when another cache
+  needs the room. The rest of the time an open dialog costs nothing.
+- **From the touch to the pressed look.** From the `$time` of the touch event to the first line of `pressed()` of a
+  `Button`, through Slate's routing and the button's own work on the PHP task: 0.66 ms (median, 0.63 to 1.2 ms) on
+  a still screen, 0.64 ms (0.62 to 1.8 ms) while a spinner turns. The look then shows at the next frame of the
+  compositor (at most one refresh, 16.7 ms, plus the composing of the button), easing in 80 ms. A callback of
+  `on(TouchType::Press)` runs after the button's look is sent: 1.5 to 1.6 ms. The time the touch controller takes
+  to report the finger comes before all of it.
+- **Memory per control**, PHP and external RAM (50 of each made and shown):
+
+  | Made with | PHP | Compositor, about |
+  | --- | --- | --- |
+  | `RoundRect` (for comparison) | 410 B | 60 B |
+  | `Text` (for comparison) | 434 B | 75 B |
+  | `Button` | 714 to 757 B | 250 B |
+  | `Toggle` | 618 B | 260 B |
+  | `Slider` | 730 B | 170 B |
+  | `Choice`, three segments | 762 B | 740 B |
+  | `SettingRow` with a `Toggle` | 1410 B | 650 B |
+
+  The compositor keeps about 92 bytes per part, plus the texts. Its figures are those of a second round: they move
+  with the pools of external RAM, and a first round, which grows the pools, gives more (up to three times). A list
+  of 25 rows with their controls takes an estimated 50 KB in all (25 times the `SettingRow` with a `Toggle`, PHP
+  and compositor).
+- **Firmware.** The controls and the theme take about 54 KB of flash (55 056 bytes: the same script built with
+  `slate-controls` at `true` and at `false`); see [Effects and build options](./effects-and-options.md#build-options).
 
 ## Measuring
 

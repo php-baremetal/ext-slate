@@ -1,5 +1,5 @@
 <?php
-// php-baremetal/ext-slate 1.2.0 — IDE helper, not loaded at runtime.
+// php-baremetal/ext-slate 1.3.0 — IDE helper, not loaded at runtime.
 
 namespace Baremetal\Slate {
     /**
@@ -30,6 +30,12 @@ namespace Baremetal\Slate {
          * @throws \ValueError When negative ("keptBudget must be 0 or more"); the old value stays.
          */
         public ?int $keptBudget = null;
+
+        /**
+         * The theme of the controls: a Theme with the default tokens until theme() sets another one. Read it to draw
+         * the rest of the screen with the same colours. Not built without slate-controls.
+         */
+        public readonly Theme $theme;
 
         /**
          * Takes the panel of $display and starts the compositor; with $touch, Slate routes its touch events to
@@ -85,6 +91,28 @@ namespace Baremetal\Slate {
          * @throws \RuntimeException When the compositor has failed.
          */
         public function commit(): void {}
+
+        /**
+         * Sets the theme of the controls, before the first show(). A control reads the theme when it is made: set the
+         * theme first, right after new Slate(). Not built without slate-controls.
+         *
+         * @throws \Error After the first show() ("the theme is set before the first show()").
+         */
+        public function theme(Theme $theme): static {}
+
+        /**
+         * Shows a toast: a pill above everything (the scene, its dialogs, a transition: it does not move with the
+         * scenes), 48 px high with a radius of 24, surface with a 1 px border in borderStrong and a shadow (when
+         * shadows are built), an accent dot of 8 px and $text in the theme's font and text colour; centred, its bottom
+         * edge at 1/6 of the screen's height from the bottom. It rises 14 px while it fades in (300 ms), stays $ms,
+         * fades out in 300 ms, then goes. A new toast replaces the one shown at once. It takes no touch. The theme is
+         * read at the call. Keep it short: the pill is at most the screen's width - 64 and a longer text is cut. Not
+         * built without slate-controls.
+         *
+         * @param int $ms How long it stays, between the fade in and the fade out, in ms (at least 500).
+         * @throws \ValueError When $ms is less than 500 ("Baremetal\Slate\Slate::toast(): ms must be at least 500").
+         */
+        public function toast(string $text, int $ms = 2500): static {}
     }
 
     /**
@@ -110,6 +138,20 @@ namespace Baremetal\Slate {
          * Takes elements out of the scene; they stay usable and can be added again.
          */
         public function remove(Element ...$e): static {}
+
+        /**
+         * Opens a dialog above the scene: above all its elements and the dialogs open already. The scrim fades in to
+         * black at 88 % and the panel rises 14 px while it fades in, element by element, in 300 ms (its shadow is built
+         * first, before the animation starts). The dialog stays with the scene: when
+         * another scene is shown it stays open, and shows again when the scene comes back. While dialogs are open,
+         * add() keeps them on top of what it adds; remove() of an open dialog closes it at once (onClose() and
+         * closed() still run). The touch under way ends: the element or Scroll that holds the finger gets Cancel, a
+         * touch of the scene reaches onTouch() no more. Not built without slate-controls.
+         *
+         * @throws \Error When the dialog is open (in this scene or another one, also while it closes) or belongs to
+         *     a group ("Baremetal\Slate\Dialog is already open", with the class of a subclass).
+         */
+        public function open(Dialog $d): static {}
 
         /**
          * Builds the scene's components; called once, before the scene is shown the first time.
@@ -195,13 +237,17 @@ namespace Baremetal\Slate {
          * share the time and the curve, and make one Tween; TweenDone follows when it ends by itself. A new
          * animate() of a property that is already moving takes it over from where it is.
          *
-         * Animatable: x, y and opacity of every element; Group w, h, blur; RoundRect w, h, radius, border, fill,
+         * Animatable: x, y and opacity of every element; Group (and a Control of your own) w, h, blur; Slate's
+         * controls blur; RoundRect w, h, radius, border, fill,
          * borderColor; Circle r, border, fill, borderColor; Arc r, from, to, width, color; Line x1, y1, width,
          * color; Text color. Colours move channel by channel; gradients and null (no fill, no border) are not
          * animated.
          *
          * Like every tween of an element that is not shown, the tween of an element Slate has not drawn yet (made
-         * in build(), or before add()) waits, and starts when the element is shown.
+         * in build(), or before add()) waits, and starts when the element is shown. A tween of an element with
+         * $visible = false, or inside a group with $visible = false, waits too (its time stopped, its TweenDone and
+         * the tweens chained after it too) and goes on from where it was when the element is visible again; only
+         * $visible counts (a fade-in from $opacity 0 runs).
          *
          * @param array<string, int|float|null> $props Property => final value, as a write of the property takes it.
          * @param int $ms One run, in milliseconds (at least 1).
@@ -313,7 +359,8 @@ namespace Baremetal\Slate {
     }
 
     /**
-     * @internal Slate's own: the Hold timer of a touch came due. Slate handles it; it has no use for a listener.
+     * @internal Slate's own: a timer of Slate came due (the Hold of a touch, the end of a control's animation). Slate
+     * handles it; it has no use for a listener.
      */
     final class HoldDue extends \Baremetal\Event
     {
@@ -1020,5 +1067,707 @@ namespace Baremetal\Slate {
          * @throws \ValueError When the shadows effect is not built in, or a value is out of range.
          */
         public function __construct(int $dx, int $dy, int $blur, int|float $color) {}
+    }
+
+    /**
+     * The look of the controls: colours, the radius of Shape::Rounded, the heights of the three sizes and the fonts.
+     * Pass the tokens by name; the ones left out keep the default (a neutral dark theme):
+     * new Theme(accent: 0xFFB347, radius: 14, font: 'dejavu-sans-16').
+     *
+     * Colours are 0xRRGGBB. Fonts are names of the firmware's fonts (extra.baremetal.fonts), as Text::$font:
+     * 'default', the font-dejavu package's 'dejavu-sans-12', 'dejavu-sans-16', 'dejavu-sans-24', and the fonts the
+     * project bakes. Not built without slate-controls.
+     */
+    final class Theme
+    {
+        /** The scene's background (Slate does not paint the scene: use it for a full-screen RoundRect). */
+        public readonly int $bg;
+
+        /** Panels: a dialog, a toast, raised rows. */
+        public readonly int $surface;
+
+        /** A Secondary button, a chip not chosen. */
+        public readonly int $raised;
+
+        /** Recesses: the track of a segmented control, the empty part of a slider. */
+        public readonly int $well;
+
+        /** Borders and dividers. */
+        public readonly int $border;
+
+        /** The border of a Secondary button. */
+        public readonly int $borderStrong;
+
+        /** The main text. */
+        public readonly int $text;
+
+        /** Secondary text, Ghost buttons, subtitles. */
+        public readonly int $textMuted;
+
+        /** Dimmed text. */
+        public readonly int $textDim;
+
+        /** The accent: a Primary button, an Outline button. */
+        public readonly int $accent;
+
+        /** Text on the accent and on danger. */
+        public readonly int $onAccent;
+
+        /** A Danger button. */
+        public readonly int $danger;
+
+        /** An informative colour, for the application's own use. */
+        public readonly int $info;
+
+        /** Done steps. */
+        public readonly int $success;
+
+        /** The radius of Shape::Rounded, 0..64. */
+        public readonly int $radius;
+
+        /** The height of Size::Small, 24..128. */
+        public readonly int $small;
+
+        /** The height of Size::Medium, 24..128. */
+        public readonly int $medium;
+
+        /** The height of Size::Large, 24..128. */
+        public readonly int $large;
+
+        /** The text of the controls. */
+        public readonly string $font;
+
+        /** Subtitles and small labels. */
+        public readonly string $fontSmall;
+
+        /** Titles (a dialog's). */
+        public readonly string $fontTitle;
+
+        /** Values (a setting row's, a slider's). */
+        public readonly string $fontMono;
+
+        /** A large number (the centre of a progress ring). */
+        public readonly string $fontDisplay;
+
+        /**
+         * @throws \ValueError For the first token out of range: a colour outside 0..0xFFFFFF
+         *     ("Baremetal\Slate\Theme::$<token> must be a color, 0xRRGGBB"), $radius outside 0..64
+         *     ("Baremetal\Slate\Theme::$radius must be between 0 and 64"), a height outside 24..128
+         *     ("Baremetal\Slate\Theme::$<small|medium|large> must be between 24 and 128"), a font the firmware does not
+         *     have ("Baremetal\Slate\Theme::$<font...> must be a font of the firmware: unknown font '<name>'
+         *     (available: <names>)").
+         */
+        public function __construct(int $bg = 0x0F1115, int $surface = 0x161A20, int $raised = 0x1C2129,
+                                    int $well = 0x111419, int $border = 0x262C35, int $borderStrong = 0x343B46,
+                                    int $text = 0xE8EAED, int $textMuted = 0xA0A7B2, int $textDim = 0x5C6370,
+                                    int $accent = 0x4C8DFF, int $onAccent = 0xFFFFFF, int $danger = 0xFF5D5D,
+                                    int $info = 0x5CC8FF, int $success = 0x4ADE80, int $radius = 12, int $small = 40,
+                                    int $medium = 48, int $large = 56, string $font = 'default',
+                                    string $fontSmall = 'default', string $fontTitle = 'default',
+                                    string $fontMono = 'default', string $fontDisplay = 'default') {}
+    }
+
+    /**
+     * The size of a control: its height comes from the theme ($small, $medium, $large).
+     */
+    enum Size
+    {
+        case Small;
+        case Medium;
+        case Large;
+    }
+
+    /**
+     * The colours of a Button.
+     */
+    enum Variant
+    {
+        /** Fill accent, text onAccent. */
+        case Primary;
+
+        /** Fill raised, a 1 px border borderStrong, text text. */
+        case Secondary;
+
+        /** No fill, text textMuted. */
+        case Ghost;
+
+        /** Fill danger, text onAccent. */
+        case Danger;
+
+        /** No fill, a 1 px border accent at 60 %, text accent. */
+        case Outline;
+    }
+
+    /**
+     * The corners of a control: Pill rounds them by half the height, Rounded by the theme's $radius.
+     */
+    enum Shape
+    {
+        case Pill;
+        case Rounded;
+    }
+
+    /**
+     * How a Choice shows its options.
+     */
+    enum ChoiceStyle
+    {
+        case Segmented;
+        case Chips;
+        case List;
+        case Nav;
+    }
+
+    /**
+     * The base of the controls. A control is one PHP object; its parts (a background, a text, an icon...) live in
+     * the compositor without a PHP object each, and the control takes the touch as a whole (its area is the union of
+     * its parts). It needs a running Slate when it is made, and reads the Slate's theme then.
+     *
+     * $enabled false draws the control at 0.4 times its $opacity (which keeps the value written) and stops it taking
+     * new touches; a touch under way gets Cancel.
+     *
+     * Slate's controls show a pressed look from Press to Release or Cancel (their fill 12 % toward white, in 80 ms);
+     * they notify onChange() and the callback of changed() for the user's gestures only: a change made by the code
+     * (a write of a property) is drawn but not notified.
+     *
+     * A control of your own extends Control directly, builds its parts with add() (RoundRect, Text, Image...), draws
+     * them with $this->theme, calls notify() for the user's gestures and overrides pressed() for its pressed look:
+     *
+     *     final class Beans extends Control {
+     *         public function __construct(int $x, int $y) {
+     *             parent::__construct($x, $y);
+     *             // add() the parts, with $this->theme's colours
+     *         }
+     *         public function onTap(Touch $t): void { $this->notify(intdiv($t->localX, 16) + 1); }
+     *         protected function pressed(bool $down): void { $this->opacity = $down ? 0.8 : 1.0; }
+     *     }
+     *
+     * Not built without slate-controls.
+     */
+    abstract class Control extends Group
+    {
+        /** A control takes touches by default. */
+        public bool $touchable = true;
+
+        /** false: drawn at 0.4 times $opacity, no new touch (a touch under way gets Cancel). */
+        public bool $enabled = true;
+
+        /** The running Slate's theme when the control was made. */
+        protected readonly Theme $theme;
+
+        /**
+         * @throws \Error Without a running Slate ("<Class> needs a running Slate: create the Slate before its
+         *     controls").
+         */
+        public function __construct(int|float $x = 0, int|float $y = 0) {}
+
+        /**
+         * The value changed by the user's gesture (empty here: override it). Runs before the callback of changed().
+         */
+        public function onChange(mixed $value): void {}
+
+        /**
+         * The callback of the user's changes (one: a new one replaces it; null removes it). It runs after onChange().
+         *
+         * @param (\Closure(mixed): void)|null $fn
+         */
+        public function changed(?\Closure $fn): static {}
+
+        /**
+         * Notifies a change made by the user: onChange($value), then the callback of changed(). An exception stops
+         * there.
+         */
+        protected function notify(mixed $value): void {}
+
+        /**
+         * true at Press, false at Release and Cancel (also when $enabled turns false during the touch). Empty here:
+         * a control of your own overrides it for its pressed look.
+         */
+        protected function pressed(bool $down): void {}
+
+        /**
+         * Adds parts to a control of your own (a class that extends Control directly).
+         *
+         * @throws \Error On Slate's controls ("<Class>: a control builds its own parts").
+         * @throws \LogicException When an element already belongs to a group, or would contain itself.
+         */
+        public function add(Element ...$e): static {}
+
+        /**
+         * Takes parts out of a control of your own.
+         *
+         * @throws \Error On Slate's controls ("<Class>: a control builds its own parts").
+         */
+        public function remove(Element ...$e): static {}
+    }
+
+    /**
+     * A push button: a text, an optional icon on its left, the colours of its variant. Its action is onTap() (or
+     * on(TouchType::Tap, ...)); it notifies no onChange().
+     *
+     * $w and $h (inherited) read the size laid out: $h from the theme ($size), $w the one given or, with w 0, the text
+     * plus a padding on each side (16, 20, 24 px for Small, Medium, Large) plus 20 + 8 px for the icon. No text and an
+     * icon: a square. Writing $w or $h throws \Error ("Cannot modify Baremetal\Slate\Button::$w: the size of a control
+     * comes from its constructor and the theme").
+     *
+     * The icon is an image file (as Image::$src), 20 x 20 px, drawn monochrome in the text colour: only its alpha
+     * counts. It loads as an Image does; an icon that does not load stays empty (ImageFailed with its path).
+     */
+    class Button extends Control
+    {
+        /** The text; a write lays the button out again (with w 0, its width). */
+        public string $text;
+
+        /** The colours. */
+        public Variant $variant;
+
+        /** The fill, 0xRRGGBB, in place of the variant's; null: the variant's. */
+        public ?int $fill = null;
+
+        /** The colour of the text and of the icon, 0xRRGGBB; null: the variant's. */
+        public ?int $color = null;
+
+        /**
+         * @param int $w The width; 0: from the content.
+         * @param string|null $icon An absolute path ending in .sli or .png, e.g. '/app/assets/icons/back.sli'.
+         * @throws \Error Without a running Slate ("Baremetal\Slate\Button needs a running Slate: create the Slate
+         *     before its controls").
+         * @throws \ValueError When $w is outside 0..32767 ("Baremetal\Slate\Button::$w must be between 0 and
+         *     32767"), $icon is not an absolute path ending in .sli or .png ("Baremetal\Slate\Button::$icon must be
+         *     an absolute path ending in .sli or .png") or is a .png while png is not built ("png is not built in:
+         *     add it to slate-images in composer.json"); a write of $fill or $color outside 0..0xFFFFFF
+         *     ("Baremetal\Slate\Button::$fill must be a color, 0xRRGGBB").
+         */
+        public function __construct(int|float $x, int|float $y, string $text, Variant $variant = Variant::Secondary,
+                                    Size $size = Size::Medium, int $w = 0, Shape $shape = Shape::Rounded,
+                                    ?string $icon = null) {}
+
+        /** The pressed look (call it from an override to keep it). */
+        protected function pressed(bool $down): void {}
+    }
+
+    /**
+     * An on/off switch: a track and a round knob. Small 52 x 30 with a knob of 24, Medium 62 x 36 / 28, Large 72 x 42
+     * / 34, the knob 4 px from the ends. On: the track accent, the knob bg; off: the track borderStrong, the knob
+     * textMuted; pressed: the track 12 % toward white. A tap inverts $on (knob and colours slide in 250 ms), then
+     * onChange(bool $on) and the callback of changed() run. $w and $h (inherited) read the size and cannot be written.
+     */
+    class Toggle extends Control
+    {
+        /** The state; a write from the code slides the toggle over, without onChange(). */
+        public bool $on = false;
+
+        /** 8 by default: the toggle takes a touch up to 8 px around its track. */
+        public int $hitPad = 8;
+
+        /**
+         * @throws \Error Without a running Slate ("Baremetal\Slate\Toggle needs a running Slate: create the Slate
+         *     before its controls").
+         */
+        public function __construct(int|float $x, int|float $y, bool $on = false, Size $size = Size::Medium) {}
+
+        /** The pressed look (call it from an override to keep it). */
+        protected function pressed(bool $down): void {}
+    }
+
+    /**
+     * A value picked along a track: an area as high as the size ($small, $medium, $large of the theme) and $w wide, a
+     * track 8 px high (well) filled up to the value (accent, or $fill), a knob of 24, 30 or 34 px (Small, Medium,
+     * Large) in text with a border of 5 px (accent, or $fill). The knob's centre runs from knob / 2 to $w - knob / 2;
+     * w 0 is allowed (no track, only the knob). $w and $h (inherited) read the size and cannot be written.
+     *
+     * The touch: a press moves the knob under the finger (on the step), then it follows the finger, also outside the
+     * area. onChange($value) runs only once the finger is past 8 px from the press and the touch is still the
+     * slider's, or at the release; at most once per frame of the compositor (a value held back goes out at a later
+     * move after a frame, or at the release) and only when the value changed. At the release: the value not notified
+     * yet, then onCommit($value) and the callback of committed(), always (also with the value of before the press).
+     *
+     * In a vertical Scroll: a horizontal drag stays the slider's; a vertical one goes to the Scroll at 8 px. The
+     * slider then gets Cancel and goes back to the value of before the press, with no onChange() and no onCommit().
+     * Another Cancel ($enabled false, another scene shown) does the same before any onChange() of the touch; after
+     * the drag has notified, the value stays: a value held back goes out, then onCommit() and committed() run, as at
+     * a release. A $value written by the code during the touch takes the place of the value of before the press.
+     *
+     * $value (and what onChange() and onCommit() receive) is an int when $min, $max and $step are all int, a float
+     * otherwise. A write of $value, $min, $max or $step brings $value into the range and onto the step (the last step
+     * at or below $max), without onChange().
+     */
+    class Slider extends Control
+    {
+        /** The value. */
+        public int|float $value;
+
+        /** The lower end of the range, less than $max. */
+        public int|float $min;
+
+        /** The upper end of the range. */
+        public int|float $max;
+
+        /** The step: the values are $min + k * $step. Greater than 0. */
+        public int|float $step;
+
+        /** The colour of the fill and of the knob's border, 0xRRGGBB; null: accent. */
+        public ?int $fill = null;
+
+        /**
+         * @param int $w The length of the area; 0: only the knob.
+         * @throws \Error Without a running Slate ("Baremetal\Slate\Slider needs a running Slate: create the Slate
+         *     before its controls").
+         * @throws \ValueError When $w is outside 0..32767 ("Baremetal\Slate\Slider::$w must be between 0 and
+         *     32767"), $min, $max, $value or $step is not finite ("Baremetal\Slate\Slider::$value must be a finite
+         *     number"), $min is not less than $max ("Baremetal\Slate\Slider::$min must be less than $max") or
+         *     $step is 0 or less ("Baremetal\Slate\Slider::$step must be greater than 0"); the same on a write
+         *     (the old value stays), and a write of $fill outside 0..0xFFFFFF ("Baremetal\Slate\Slider::$fill must
+         *     be a color, 0xRRGGBB").
+         */
+        public function __construct(int|float $x, int|float $y, int $w, int|float $min = 0, int|float $max = 100,
+                                    int|float $value = 0, int|float $step = 1, Size $size = Size::Medium) {}
+
+        /** The value at the release of a touch (always, also when it did not change). Empty: override it. */
+        public function onCommit(int|float $value): void {}
+
+        /**
+         * The callback of the release (one; a new one replaces it, null removes it). It runs after onCommit(), with
+         * the value.
+         */
+        public function committed(?\Closure $fn): static {}
+    }
+
+    /**
+     * One or more items picked among labels, in four styles (ChoiceStyle). Every item is as high as the size
+     * ($small, $medium, $large of the theme); its colours (fill, border, text and icon) slide in 200 ms.
+     *
+     * - Segmented: a well container (fill well, a 1 px border in border, radius the theme's + 4) with a padding of 4
+     *   and equal segments inside it (h - 8 high, the theme's radius). With w 0 each segment is as wide as the
+     *   widest label plus 2 paddings (16, 20, 24 for Small, Medium, Large; + 28 with icons); with w > 0 the segments
+     *   share w - 8 (the remainder to the first ones). Selected: accent and onAccent; the others transparent and
+     *   textMuted.
+     * - Chips: separate pills, 8 px apart, each as wide as its label plus 2 paddings (+ 28 with icons). With w 0 they
+     *   stay on one row; with w > 0 a chip that does not fit goes to the next row (rows 8 px apart). Selected: accent
+     *   and onAccent; the others raised, a 1 px border in border, textMuted.
+     * - List: rows w wide (w is required), one under the other, the label on the left. Selected: accent at 12 % with
+     *   a 1 px border of accent at 35 %, text accent; the others transparent and textMuted.
+     * - Nav: w (required) split in equal parts, an icon (24 x 24, required: one per label) above a label in
+     *   fontSmall, at least 5 px below the top. Selected: accent and an accent bar 3 px high at the top of the part
+     *   (inset 32 % each side), which slides to the selected part; the others textDim. Small and Medium are tight for
+     *   a bottom navigation: use Size::Large (or a theme with a taller $large).
+     *
+     * $icons: empty, or one path per label (as Image::$src, e.g. '/app/assets/icons/home.sli'). The icons are
+     * monochrome: drawn in the item's text colour (20 x 20 left of the label for Segmented, Chips and List).
+     *
+     * The touch: the item under the finger takes the pressed look in 80 ms (an opaque fill 12 % toward white; a fill
+     * that is not opaque gets the text colour at 6 % laid over it); a tap on it selects it. In Segmented, List and
+     * Nav a touch outside the items (the well's padding, a larger $hitPad) goes to the nearest item. Without $multi, $selected is an int and a tap on another
+     * item selects it and calls onChange(int $index), then the callback of changed(); a tap on the selected item does
+     * nothing. With $multi, $selected is the sorted list of the selected indexes and each tap turns an item on or
+     * off, then onChange(array $selected) runs. A write of $selected from the code slides the colours and calls no
+     * onChange(). $w and $h (inherited) read the size and cannot be written.
+     *
+     * The content is not clipped to $w (a chip wider than w, a label wider than its segment or part). At most 41
+     * items with icons, 63 without (127 parts per control).
+     */
+    class Choice extends Control
+    {
+        /**
+         * The selected index (int) or, with $multi, the sorted list of the selected indexes (an int written to a
+         * multi choice becomes a list of one). A write slides the colours, without onChange().
+         * @var int|int[]
+         */
+        public int|array $selected;
+
+        /**
+         * @param string[] $labels The items' labels: a non-empty list of strings.
+         * @param int|int[] $selected The selected index; with $multi a list of indexes (an int i is [i]).
+         * @param int $w The width; 0: from the labels (Segmented, Chips). Required for List and Nav.
+         * @param bool $multi Each tap turns an item on or off; $selected is a list. Without $selected item 0 starts
+         *     on: pass [] to start with none.
+         * @param string[] $icons Empty, or one absolute path ending in .sli or .png per label (required for Nav).
+         * @throws \Error Without a running Slate ("Baremetal\Slate\Choice needs a running Slate: create the Slate
+         *     before its controls"); more items than the parts allow ("Baremetal\Slate\Choice: too many parts").
+         * @throws \ValueError When $labels is not a non-empty list of strings ("Baremetal\Slate\Choice::$labels
+         *     must be a non-empty list of strings"); $selected is outside the labels ("Baremetal\Slate\Choice::
+         *     $selected must be between 0 and <n-1>", with $multi "... must be a list of indexes between 0 and
+         *     <n-1>"), also on a write (the old value stays); $icons is neither empty nor one per label
+         *     ("Baremetal\Slate\Choice::$icons must be empty or hold one path per label"); $w is outside 0..32767
+         *     ("Baremetal\Slate\Choice::$w must be between 0 and 32767"); List or Nav with w 0
+         *     ("Baremetal\Slate\Choice: the List and Nav styles need w greater than 0"); Nav without icons
+         *     ("Baremetal\Slate\Choice: the Nav style needs an icon per label"); an icon that is not an absolute
+         *     path ending in .sli or .png ("Baremetal\Slate\Choice::$icons must hold absolute paths ending in .sli
+         *     or .png") or a .png while png is not built ("png is not built in: add it to slate-images in
+         *     composer.json").
+         */
+        public function __construct(int|float $x, int|float $y, array $labels, int|array $selected = 0,
+                                    ChoiceStyle $style = ChoiceStyle::Segmented, int $w = 0,
+                                    Size $size = Size::Medium, bool $multi = false, array $icons = []) {}
+
+        /** The pressed look (call it from an override to keep it). */
+        protected function pressed(bool $down): void {}
+    }
+
+    /**
+     * A row of a settings list, $w wide: the label on the left (font, text) with $sub under it (fontSmall, textMuted),
+     * $value right-aligned at the right edge (fontMono, textMuted), $control at the right (left of the value, 12 px
+     * apart) and centred in the height, and a 1 px divider in border at the bottom. The height is 60 (72 with a
+     * subtitle), at least the control's height + 16. The texts and the control are centred in it.
+     *
+     * The control is any element (a Toggle, a Button, a Slider, a Choice, an Image...): it becomes a child of the row
+     * (it must not belong to a group), gets its own touches and is placed by the row (its $x and $y are written). A
+     * Slider made with w 0 is stretched instead: its track fills the space between the label (at most 40 % of $w) and
+     * the value, 12 px from each.
+     *
+     * The row itself is not touchable by default (a touch outside the control reaches what is under the row): with
+     * $touchable = true, or a callback of on(), it takes the touch, with a pressed look (the text colour at 4 %) and
+     * onTap(). $w and $h (inherited) read the size and cannot be written; add() and remove() throw.
+     */
+    class SettingRow extends Control
+    {
+        /** The label; a write redraws the row and places the control again. */
+        public string $label;
+
+        /** The subtitle under the label ('': none, the row 60 high); a write redraws the row. */
+        public string $sub;
+
+        /** The value shown at the right ('': none); a write redraws the row and places the control again. */
+        public string $value;
+
+        /** false by default: only the control takes the touch. */
+        public bool $touchable = false;
+
+        /**
+         * @param int $w The width, 1..32767.
+         * @param Element|null $control The control at the right (a child of the row), or null.
+         * @throws \Error Without a running Slate ("Baremetal\Slate\SettingRow needs a running Slate: create the
+         *     Slate before its controls").
+         * @throws \ValueError When $w is outside 1..32767 ("Baremetal\Slate\SettingRow::$w must be between 1 and
+         *     32767").
+         * @throws \LogicException When $control already belongs to a group or a scene.
+         */
+        public function __construct(int|float $x, int|float $y, int $w, string $label, string $sub = '',
+                                    ?Element $control = null, string $value = '') {}
+
+        /** The pressed look (call it from an override to keep it). */
+        protected function pressed(bool $down): void {}
+    }
+
+    /**
+     * A modal dialog, opened above a scene with Scene::open() and closed with close(). A scrim covers the screen in
+     * black at 88 % and takes every touch (nothing under it gets one, nor Scene::onTouch()). On it, a panel centred
+     * on the screen, min($w, screen width - 32) wide: radius 26, surface, a 1 px border in borderStrong, a shadow
+     * (0, 30, blur 30, black at 60 %; none when shadows are not built), a padding of 26. From the top, 12 px apart:
+     * the title (fontTitle, text), the text (font, textMuted; one line per "\n", no automatic wrapping), the content
+     * (the elements of add(), whose coordinates start at the content's top-left; as wide as the panel minus the
+     * paddings) and the buttons of buttons() (one row of equal widths, or with $stack a column at full width; the
+     * dialog gives each its width and place). The panel's height comes from what it holds and is cut to the screen
+     * height - 32: put a long content in a Scroll of your own, and keep the text to a few lines (the buttons come
+     * last and a long text pushes them under the cut). A dialog is shown only with Scene::open(): add() of a Dialog
+     * to a scene or a group throws \Error ("Baremetal\Slate\Dialog is opened with Scene::open(), not added").
+     *
+     * Opening and closing animate in 300 ms (the scrim fades, the panel moves 14 px and fades, each of its parts with
+     * the panel's opacity: halfway, texts and buttons look washed out); after the closing
+     * animation the dialog leaves its scene, then onClose() and the callback of closed() run. A dialog whose scene is
+     * not shown closes at once. $w and $h (inherited) read the screen's size and cannot be written.
+     *
+     * While dialogs are open only the top one (the last opened) and what is in it take a new touch, from the moment
+     * Scene::open() returns (also in the first frames, while the scrim is still clear). While a dialog closes nothing
+     * in it takes a touch (a finger held on its content gets Cancel); its scrim still does. $enabled = false dims it
+     * and its scrim takes no touch (no dismiss), but it still blocks what is under it. With $visible = false an open
+     * dialog blocks nothing (what is under it and Scene::onTouch() take touches; the open dialog below it is the top
+     * one), and its close ends at once, without the animation.
+     */
+    class Dialog extends Control
+    {
+        /** A tap on the scrim (outside the panel) closes the dialog. */
+        public bool $dismissable = false;
+
+        /**
+         * @param string $title The title ('': none).
+         * @param string $text The text ('': none), lines separated by "\n" (at most 100).
+         * @param int $w The panel's width, 1..32767 (cut to the screen width - 32).
+         * @param bool $stack The buttons in a column at full width, instead of one row.
+         * @throws \Error Without a running Slate ("Baremetal\Slate\Dialog needs a running Slate: create the Slate
+         *     before its controls").
+         * @throws \ValueError When $w is outside 1..32767 ("Baremetal\Slate\Dialog::$w must be between 1 and
+         *     32767"), or $text has more than 100 lines.
+         */
+        public function __construct(string $title = '', string $text = '', int $w = 460, bool $stack = false) {}
+
+        /**
+         * The buttons at the bottom of the panel, in order (they replace the ones given before). The dialog sets
+         * their width and their place; their taps are theirs (call close() from one).
+         *
+         * @throws \LogicException When a button already belongs to a group or a scene.
+         * @throws \ValueError With more than 100 buttons ("Baremetal\Slate\Dialog::buttons(): at most 100 buttons").
+         */
+        public function buttons(Button ...$b): static {}
+
+        /**
+         * Adds elements to the content, under the text (coordinates from the content's top-left); the panel is laid
+         * out again.
+         *
+         * @throws \LogicException When an element already belongs to a group or a scene.
+         */
+        public function add(Element ...$e): static {}
+
+        /** Takes elements out of the content (or buttons out of the buttons); the panel is laid out again. */
+        public function remove(Element ...$e): static {}
+
+        /**
+         * Closes the dialog: the closing animation, then the dialog leaves its scene, then onClose() and closed().
+         * While it closes nothing in it takes a touch: a second tap on one of its buttons runs nothing and a finger
+         * held on its content gets Cancel (the scrim still takes touches until it leaves). When its scene is not
+         * shown, or its $visible is false, it goes at once, and so does a dialog still closing when another scene is
+         * shown or when it is hidden. Nothing for a dialog that is not open (or is closing). A dialog closing when
+         * the Slate stops leaves its scene without onClose() and closed().
+         */
+        public function close(): void {}
+
+        /** Called when the dialog has closed (after the animation). Empty: override it. */
+        public function onClose(): void {}
+
+        /** The callback of the close (one; a new one replaces it, null removes it). It runs after onClose(). */
+        public function closed(?\Closure $fn): static {}
+    }
+
+    /**
+     * A ring that shows a progress: a full track in well and an arc in accent (or $color) with round ends, from the
+     * top (-90 degrees) clockwise for $value x 360 degrees. The stroke is $width wide, centred on the circle of radius
+     * $r around ($cx, $cy). A write of $value slides the arc in 200 ms.
+     *
+     * With $percent the number round($value x 100) (fontDisplay, text) and a "%" (font, accent) are centred in the
+     * ring. With $spinning the ring is indeterminate: an arc of 25 % turns for ever (a turn in 900 ms, without
+     * TweenDone; it runs only while the ring is shown), $value is kept but not drawn and the percent is hidden; back
+     * to false, the arc shows the value again at once.
+     *
+     * $x and $y are the centre; $w and $h (inherited) read the size, 2 $r + $width, and cannot be written. $clip has
+     * no effect on it ($cache works). Not touchable by default; add() and remove() throw.
+     */
+    class ProgressRing extends Control
+    {
+        /** The progress, 0..1 (a finite value outside is brought into the range); a write slides the arc. */
+        public float $value;
+
+        /** Indeterminate: a turning arc instead of the value. */
+        public bool $spinning = false;
+
+        /** The arc's colour, 0xRRGGBB (null: the theme's accent). */
+        public ?int $color = null;
+
+        /** false by default: a display, the touch reaches what is under it. */
+        public bool $touchable = false;
+
+        /**
+         * @param int|float $cx The centre.
+         * @param int $r The radius of the ring (the stroke's centre line), 1..32767.
+         * @param float $value 0..1.
+         * @param int $width The stroke's width, 1..32767.
+         * @param bool $percent The percent in the middle.
+         * @throws \Error Without a running Slate ("Baremetal\Slate\ProgressRing needs a running Slate: create the
+         *     Slate before its controls").
+         * @throws \ValueError When $r or $width is outside 1..32767 ("Baremetal\Slate\ProgressRing::$r must be between
+         *     1 and 32767"), or $value is not finite ("Baremetal\Slate\ProgressRing::$value must be a finite
+         *     number"; a write of $value too).
+         */
+        public function __construct(int|float $cx, int|float $cy, int $r, float $value = 0.0, int $width = 12,
+                                    bool $percent = false) {}
+    }
+
+    /**
+     * A bar that shows a progress: a track w x h in well and a fill in accent (or $color), $value x w wide, both with
+     * the radius h / 2. A write of $value slides the fill in 200 ms. With $glow the fill has a shadow of its colour
+     * (0, 0, blur 10); a firmware built without shadows draws none.
+     *
+     * $x and $y are the top-left; $w and $h (inherited) read the size and cannot be written. Not touchable by
+     * default; add() and remove() throw.
+     */
+    class ProgressBar extends Control
+    {
+        /** The progress, 0..1 (a finite value outside is brought into the range); a write slides the fill. */
+        public float $value;
+
+        /** A glow around the fill (none when shadows are not built). */
+        public bool $glow = false;
+
+        /** The fill's colour, 0xRRGGBB (null: the theme's accent). */
+        public ?int $color = null;
+
+        /** false by default: a display, the touch reaches what is under it. */
+        public bool $touchable = false;
+
+        /**
+         * @param int $w The width, 1..32767.
+         * @param float $value 0..1.
+         * @param int $h The height, 1..32767.
+         * @throws \Error Without a running Slate ("Baremetal\Slate\ProgressBar needs a running Slate: create the
+         *     Slate before its controls").
+         * @throws \ValueError When $w or $h is outside 1..32767 ("Baremetal\Slate\ProgressBar::$w must be between 1
+         *     and 32767"), or $value is not finite ("Baremetal\Slate\ProgressBar::$value must be a finite number"; a
+         *     write of $value too).
+         */
+        public function __construct(int|float $x, int|float $y, int $w, float $value = 0.0, int $h = 4) {}
+    }
+
+    /**
+     * A busy indicator: an arc of 25 %, 3 px wide with round ends, in accent (or $color), on the circle of radius $r
+     * around ($cx, $cy), turning for ever (a turn in 900 ms, without TweenDone). It turns only while it is shown (its
+     * scene shown, its $visible and its groups' true) and costs nothing when it is not; while it turns only its own
+     * small area is drawn again.
+     *
+     * $x and $y are the centre; $w and $h (inherited) read the size, 2 $r + 3, and cannot be written. $clip has no
+     * effect on it ($cache works). Not touchable by default; add() and remove() throw.
+     */
+    class Spinner extends Control
+    {
+        /** The arc's colour, 0xRRGGBB (null: the theme's accent). */
+        public ?int $color = null;
+
+        /** false by default: a display, the touch reaches what is under it. */
+        public bool $touchable = false;
+
+        /**
+         * @param int $r The radius, 1..32767.
+         * @throws \Error Without a running Slate ("Baremetal\Slate\Spinner needs a running Slate: create the Slate
+         *     before its controls").
+         * @throws \ValueError When $r is outside 1..32767 ("Baremetal\Slate\Spinner::$r must be between 1 and
+         *     32767").
+         */
+        public function __construct(int|float $cx, int|float $cy, int $r = 12) {}
+    }
+
+    /**
+     * The steps of a process, one row each (48 high, 8 apart, radius 14), with a circle of 24 px at the left and the
+     * step's text (font) at x 48:
+     *   - a step done (before $active): the circle in success at 15 % with a check in success, the text textMuted;
+     *   - the active step ($active): a small spinner in the circle, the row's border in accent, the text text;
+     *   - a step to do: a 2 px ring in borderStrong, the text textDim.
+     * A write of $active moves on (the colours fade in 200 ms) and the steps that become done pop (their circle
+     * from 40 % to 108 % and back to 100 % in 400 ms, without TweenDone); $active = count($steps): all done.
+     *
+     * $x and $y are the top-left; $w and $h (inherited) read the size (w x 56 count($steps) - 8) and cannot be
+     * written. Not touchable by default; add() and remove() throw.
+     */
+    class StepList extends Control
+    {
+        /** The active step, 0..count($steps) (count($steps): all done). */
+        public int $active;
+
+        /** The texts of the steps. */
+        public readonly array $steps;
+
+        /** false by default: a display, the touch reaches what is under it. */
+        public bool $touchable = false;
+
+        /**
+         * @param int $w The width, 1..32767.
+         * @param string[] $steps The texts of the steps, a non-empty list (at most 21).
+         * @param int $active 0..count($steps).
+         * @throws \Error Without a running Slate ("Baremetal\Slate\StepList needs a running Slate: create the Slate
+         *     before its controls").
+         * @throws \ValueError When $w is outside 1..32767 ("Baremetal\Slate\StepList::$w must be between 1 and
+         *     32767"), $steps is not a non-empty list of strings ("Baremetal\Slate\StepList::$steps must be a
+         *     non-empty list of strings") or holds more than 21 ("... must hold at most 21 steps"), or $active is
+         *     outside 0..count($steps) ("Baremetal\Slate\StepList::$active must be between 0 and <n>"; a write of
+         *     $active too).
+         */
+        public function __construct(int|float $x, int|float $y, int $w, array $steps, int $active = 0) {}
     }
 }

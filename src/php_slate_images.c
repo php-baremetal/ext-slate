@@ -643,6 +643,29 @@ static slate_image_t *get(zend_string *path)
     return im;
 }
 
+struct slate_image *sl_image_acquire(zend_string *path)
+{
+    return ready() ? get(path) : NULL;
+}
+
+bool sl_image_icon_ok(const char *cls, const char *prop, zend_string *path)
+{
+    switch (path_check(path)) {
+    case PATH_OK:
+        return true;
+    case PATH_NO_PNG:
+        png_not_built();
+        return false;
+    default:
+        if (strcmp(prop, "icons") == 0) {   /* a list of them (Choice::$icons) */
+            zend_value_error("%s::$icons must hold absolute paths ending in .sli or .png", cls);
+        } else {
+            zend_value_error("%s::$%s must be an absolute path ending in .sli or .png", cls, prop);
+        }
+        return false;
+    }
+}
+
 bool sl_image_bind(sl_obj_t *o, zend_string *path)
 {
     if (!ready()) {

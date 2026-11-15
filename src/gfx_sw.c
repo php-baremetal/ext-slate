@@ -1009,7 +1009,8 @@ static void vpass_a(const uint8_t *src, uint8_t *dst, int w, int h, int r)
     }
 }
 
-#define BLUR_LINE 384   /* longest line the fused passes take (buffers of it on the stack) */
+#define BLUR_LINE 512   /* longest line the fused passes take (buffers of it on the stack: 3 KB): a dialog's shadow on a
+                           360-wide screen, its panel up to 328 px plus 3 radii of blur 10 on each side, is 388 */
 
 /* The alpha-only blur with the three passes of each direction done one line at a time in buffers on the stack,
    so the image (often in external RAM) is read and written once per direction instead of three times. Each pass

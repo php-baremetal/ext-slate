@@ -203,3 +203,62 @@ void slate_sli_draw_ops(const slate_gfx_ops_t *g, slate_buf_t *b, const slate_sl
         }
     }
 }
+
+void slate_sli_draw_tint(slate_buf_t *b, const slate_sli_t *im, int x, int y, uint8_t a, uint16_t rgb565,
+                         slate_rect_t clip)
+{
+    slate_sli_draw_tint_ops(slate_gfx(), b, im, x, y, a, rgb565, clip);
+}
+
+/* The walk of slate_sli_draw_ops, with the colours skipped instead of read. */
+void slate_sli_draw_tint_ops(const slate_gfx_ops_t *g, slate_buf_t *b, const slate_sli_t *im, int x, int y,
+                             uint8_t a, uint16_t rgb565, slate_rect_t clip)
+{
+    if (a == 0) {
+        return;
+    }
+    int64_t wx1 = (int64_t)x + im->w, wy1 = (int64_t)y + im->h;
+    int bx1 = imin(clip.x1, b->w), by1 = imin(clip.y1, b->h);
+    int cx0 = imax(imax(clip.x0, 0), x), cy0 = imax(imax(clip.y0, 0), y);
+    int cx1 = wx1 < bx1 ? (int)wx1 : bx1, cy1 = wy1 < by1 ? (int)wy1 : by1;
+    if (cx0 >= cx1 || cy0 >= cy1) {
+        return;
+    }
+    const uint8_t *tab = im->data + SLI_HEADER, *d = tab + 4 * (size_t)im->h;
+    for (int Y = cy0; Y < cy1; Y++) {
+        const uint8_t *p = d + rd32(tab + 4 * (size_t)(Y - y));
+        int px = x;
+        while (px < cx1) {
+            unsigned cmd = *p++, n = cmd & 63;
+            if (n == 0) {
+                n = rd16(p);
+                p += 2;
+            }
+            int e = px + (int)n;
+            unsigned k = cmd >> 6;
+            if (k == K_REPEAT) {
+                p += 2;
+            } else if (k != K_EMPTY) {
+                p += (uintptr_t)p & 1;   /* even from the data start (open) */
+                p += 2 * (size_t)n;      /* the colours: not read */
+            }
+            if (k != K_EMPTY && e > cx0) {
+                int r0 = imax(px, cx0);
+                slate_rect_t r = { r0, Y, imin(e, cx1), Y + 1 };
+                if (k != K_SEMI) {   /* opaque: repeated or different alike */
+                    if (a == 255) {
+                        g->fill(b, r, rgb565);
+                    } else {
+                        g->fill_a(b, r, rgb565, a);
+                    }
+                } else {             /* the alpha row, from the first pixel drawn */
+                    g->fill_mask(b, r, rgb565, a, p + (r0 - px), (int)n);
+                }
+            }
+            if (k == K_SEMI) {
+                p += n;   /* the alpha row */
+            }
+            px = e;
+        }
+    }
+}

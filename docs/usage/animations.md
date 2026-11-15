@@ -133,6 +133,10 @@ to an eased `fill` jumps. Returns the element.
 
 - Only while the element is shown: a tween of an element whose scene is not the one shown waits, with its time
   stopped, and goes on from where it was when the scene is shown again (time spent away does not count).
+- An element with `$visible = false`, or inside a group with `$visible = false`, is not shown either: its tween
+  waits the same way (its `TweenDone` and the tweens chained after it too) and goes on when it is visible again. A
+  turning spinner hidden this way costs nothing. Only `$visible` counts: an element at `$opacity = 0` is shown, so
+  a fade-in from 0 runs.
 - An element Slate has not drawn yet (made in `build()`, or not added yet) is not shown either: its tween waits
   and starts when the element is shown, from the values it had before `animate()`. An intro animation can be
   written in `build()`; a `then()` after such a tween waits for it.
@@ -144,7 +148,8 @@ to an eased `fill` jumps. Returns the element.
   `repeat: -1`) has its tweens stopped too, so the element, its `Tween` and the compositor's copy go.
 - When the Slate stops, every running tween is stopped (a waiting one waits for the next Slate).
 - A tween on an element that is never shown stays pending until the script ends (in an event-driven script, forever), and keeps the element and its `Tween` alive: `stop()` it if the element may never be shown.
-- `wait()` of a tween that waits (its scene not shown) waits for it, up to its timeout.
+- `wait()` of a tween that waits (its scene not shown, or the element not visible) waits for it, up to its
+  timeout.
 - A screen with tweens running composes a frame at each refresh of the panel; when the last one ends, the screen
   is still again and no frame is composed.
 - During a page transition the tweens of both scenes run; at its end those of the scene left wait.
@@ -214,5 +219,5 @@ Everything is checked before anything changes: on an error no property is writte
 | `\TypeError` | A value of the wrong type (PHP's own message for typed properties). |
 | `\ValueError` | `Baremetal\Slate\Tween::wait(): Argument #1 ($timeout_ms) must be greater than or equal to 0`. |
 | `\RuntimeException` | `Slate: cannot animate: the table of ext-events' idle hooks is full` (from `show()` with a transition: `Slate: cannot run a transition: ...`): other extensions took the four hooks ext-events keeps (Slate uses one, for the Slate, its images, its animations and its transitions). |
-| `\RuntimeException` | `Slate: cannot run a transition: the table of ext-events' watches is full` (from `show()` with a transition): other extensions took the eight watches ext-events keeps (Slate uses up to six: four for the touch, one for `Hold`, one for `TransitionDone`). `Slate: out of memory for the transition`: see [Scenes, Transitions](./scenes.md#transitions). |
+| `\RuntimeException` | `Slate: cannot run a transition: the table of ext-events' watches is full` (from `show()` with a transition): other extensions took the eight watches ext-events keeps (Slate uses up to six: four for the touch, one for `HoldDue` (the `Hold` of a touch and the ends of the controls' animations), one for `TransitionDone`). `Slate: out of memory for the transition`: see [Scenes, Transitions](./scenes.md#transitions). |
 | `\Error` | `new Tween()` (a `Tween` comes from `animate()` and `then()`), a write of `$done`, `clone` of a `Tween`; `new Transition()` and `clone` of a `Transition` (it comes from `fade()`, `push()`, `cover()`, `uncover()`). |
